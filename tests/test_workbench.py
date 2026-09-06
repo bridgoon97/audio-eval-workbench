@@ -381,7 +381,12 @@ def test_atomic_batch_retry_and_freeze(env):
     assert a.get(f"/api/tasks/{t}").json()["samples"] == []
     response = send(demo_wav(1, 0))
     assert response.status_code == 200, response.text
-    assert send(demo_wav(1, 0)).json()["reused"] is True
+    import time
+
+    time.sleep(1.05)  # 跨秒重试，防止 WAV 的可变时间戳破坏幂等性。
+    retry = send(demo_wav(1, 0))
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["reused"] is True
     assert len(a.get(f"/api/tasks/{t}").json()["samples"]) == 1
     assert send(demo_wav(2, 0)).status_code == 409
     manifest["request_id"] = "b" * 32
@@ -455,3 +460,18 @@ def test_remove_all_unannotated_tracks_resets_length(env):
         ).status_code
         == 200
     )
+
+
+def test_anonymous_wav_is_deterministic_and_preserves_float_samples():
+    import time
+
+    original = demo_wav(1, 0)
+    first, meta = decode_audio(original)
+    time.sleep(1.05)
+    second, retry_meta = decode_audio(original)
+    assert first == second
+    assert meta == retry_meta
+    decoded, sr = sf.read(io.BytesIO(first), dtype="float32")
+    reference, _ = sf.read(io.BytesIO(original), dtype="float32")
+    assert sr == 16000
+    np.testing.assert_array_equal(decoded, reference)

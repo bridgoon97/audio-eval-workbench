@@ -532,7 +532,10 @@ def create_app(
                     identical = all(
                         a["name"] == b.name
                         and a["version"] == b.version
-                        and json.loads(a["meta"]) == m
+                        and all(
+                            json.loads(a["meta"])[key] == m[key]
+                            for key in ("sha256", "channel")
+                        )
                         for a, (b, _, m) in zip(old_tracks, decoded)
                     )
                 if identical:

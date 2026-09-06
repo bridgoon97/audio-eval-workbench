@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import struct
 
 import numpy as np
 import soundfile as sf
@@ -24,9 +25,19 @@ def decode_audio(raw: bytes, channel: int = 0):
     x = x[:, channel]
     if not np.isfinite(x).all():
         raise ValueError("音频含 NaN 或 Inf，无法导入")
-    out = io.BytesIO()
-    sf.write(out, x, sr, format="WAV", subtype="FLOAT")
-    asset = out.getvalue()
+    # 显式编码单通道 IEEE float WAV，避免编码器 PEAK 块写入当前时间。
+    # fact 块保存帧数；只含固定格式信息与原始浮点采样，输出可重复。
+    payload = x.astype("<f4").tobytes()
+    chunks = (
+        b"fmt "
+        + struct.pack("<IHHIIHH", 16, 3, 1, sr, sr * 4, 4, 32)
+        + b"fact"
+        + struct.pack("<II", 4, len(x))
+        + b"data"
+        + struct.pack("<I", len(payload))
+        + payload
+    )
+    asset = b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks
     return asset, {
         "sha256": hashlib.sha256(raw).hexdigest(),
         "asset_sha256": hashlib.sha256(asset).hexdigest(),
