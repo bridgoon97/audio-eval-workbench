@@ -13,6 +13,10 @@ from .app import create_app
 
 
 def main():
+    # Windows 重定向输出可能采用 cp1252；中文启动提示必须可编码。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(description="听鉴 · 音频算法评测工作台")
     parser.add_argument(
         "--data",

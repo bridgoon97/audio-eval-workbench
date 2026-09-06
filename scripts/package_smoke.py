@@ -8,6 +8,10 @@ import time
 import urllib.request
 from pathlib import Path
 
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
 name = "audio-eval.exe" if sys.platform == "win32" else "audio-eval"
 with tempfile.TemporaryDirectory(prefix="audio-eval-package-") as data:
     process = subprocess.Popen(
