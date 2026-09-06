@@ -1,0 +1,41 @@
+name: 验证与跨平台打包
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    name: 测试与打包（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: uv sync --locked
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: uv run --locked pytest -q
+      - run: npx playwright install chromium
+      - run: npx playwright test
+      - run: uv run --locked python scripts/package.py
+      - run: uv run --locked python scripts/package_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audio-eval-${{ matrix.os }}
+          path: release/audio-eval/
+          retention-days: 14
