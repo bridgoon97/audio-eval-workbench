@@ -351,3 +351,107 @@ def test_explicit_https_proxy_origin_and_cookie(tmp_path):
         ).status_code
         == 403
     )
+
+
+def test_atomic_batch_retry_and_freeze(env):
+    import json
+
+    app, a, _ = env
+    t = a.post("/api/tasks", json={"title": "批量任务"}).json()["id"]
+    manifest = {
+        "request_id": "a" * 32,
+        "name": "车内/001.wav",
+        "tracks": [
+            {"name": "自研", "version": "abc"},
+            {"name": "竞品", "version": "未知"},
+        ],
+    }
+
+    def send(second):
+        return a.post(
+            f"/api/tasks/{t}/import-sample",
+            data={"manifest": json.dumps(manifest)},
+            files=[
+                ("files", ("001.wav", demo_wav(0, 0), "audio/wav")),
+                ("files", ("001.wav", second, "audio/wav")),
+            ],
+        )
+
+    assert send("坏音频".encode()).status_code == 422
+    assert a.get(f"/api/tasks/{t}").json()["samples"] == []
+    response = send(demo_wav(1, 0))
+    assert response.status_code == 200, response.text
+    assert send(demo_wav(1, 0)).json()["reused"] is True
+    assert len(a.get(f"/api/tasks/{t}").json()["samples"]) == 1
+    assert send(demo_wav(2, 0)).status_code == 409
+    manifest["request_id"] = "b" * 32
+    assert send(demo_wav(1, 0)).status_code == 409
+    outsider, _ = reviewer(app, a, "无权限")
+    assert (
+        outsider.post(
+            f"/api/tasks/{t}/import-sample",
+            data={"manifest": json.dumps(manifest)},
+            files=[("files", ("x.wav", b"x"))],
+        ).status_code
+        == 403
+    )
+    publish(a, t)
+    assert send(demo_wav(1, 0)).status_code == 409
+
+
+def test_draft_candidate_management_preserves_evidence(env):
+    _, a, _ = env
+    t, s, tracks = task(a, "development")
+    assert (
+        a.patch(
+            f"/api/tracks/{tracks[0]}", json={"name": "更新名称", "version": "新证据"}
+        ).status_code
+        == 200
+    )
+    assert (
+        next(
+            tr
+            for tr in a.get(f"/api/samples/{s}").json()["tracks"]
+            if tr["id"] == tracks[0]
+        )["name"]
+        == "更新名称"
+    )
+    assert (
+        a.post(
+            f"/api/samples/{s}/comments",
+            json={"track_id": tracks[0], "start": 0, "end": 160, "body": "保留依据"},
+        ).status_code
+        == 200
+    )
+    assert a.delete(f"/api/tracks/{tracks[0]}").status_code == 409
+    assert a.delete(f"/api/tracks/{tracks[1]}").status_code == 200
+    assert len(a.get(f"/api/samples/{s}").json()["tracks"]) == 1
+    a.post(
+        f"/api/samples/{s}/tracks",
+        data={"name": "补充版本"},
+        files={"file": ("a.wav", demo_wav(1, 0))},
+    )
+    publish(a, t)
+    assert (
+        a.patch(f"/api/tracks/{tracks[0]}", json={"name": "禁止修改"}).status_code
+        == 409
+    )
+    assert a.delete(f"/api/tracks/{tracks[0]}").status_code == 409
+
+
+def test_remove_all_unannotated_tracks_resets_length(env):
+    _, a, _ = env
+    _, s, tracks = task(a, "development")
+    for track_id in tracks:
+        assert a.delete(f"/api/tracks/{track_id}").status_code == 200
+    assert a.get(f"/api/samples/{s}").json()["samples"] == 0
+    raw = io.BytesIO()
+    sf.write(raw, np.zeros(16000), 16000, format="WAV")
+    assert (
+        a.post(
+            f"/api/samples/{s}/tracks",
+            data={"name": "新的短片段"},
+            files={"file": ("a.wav", raw.getvalue())},
+        ).status_code
+        == 200
+    )

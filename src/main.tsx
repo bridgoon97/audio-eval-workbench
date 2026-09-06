@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, type Analysis, type Sample, type Task, type User } from './types';
+import { BatchImport } from './BatchImport';
 import { Waveform } from './Waveform';
 import './style.css';
 
@@ -126,6 +127,10 @@ function App() {
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState('');
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [editTrack, setEditTrack] = useState<{ id: string; name: string; version: string } | null>(
+    null,
+  );
   const [members, setMembers] = useState<User[]>([]);
   const [report, setReport] = useState<any>(null);
   const [dark, setDark] = useState(localStorage.getItem('theme') === 'dark');
@@ -602,7 +607,7 @@ function App() {
               </div>
             )}
             <div className="dashboard-footer">
-              <span>听鉴 0.1 · 本地优先</span>
+              <span>听鉴 0.2 · 本地优先</span>
               {user.role === 'admin' && (
                 <>
                   <button
@@ -656,6 +661,7 @@ function App() {
               <div className="actions">
                 {user.role === 'admin' && task.status === 'draft' && (
                   <>
+                    <button onClick={() => setModal('batch')}>批量导入</button>
                     <button onClick={() => setModal('sample')}>
                       <Plus size={17} />
                       添加片段
@@ -794,6 +800,18 @@ function App() {
                               {selected === i && <span className="listening">当前试听</span>}
                             </button>
                             <span className="track-version">{tr.version}</span>
+                            {user.role === 'admin' && task.status === 'draft' && (
+                              <button
+                                className="text-button"
+                                aria-label={`管理候选 ${tr.name}`}
+                                onClick={() => {
+                                  setEditTrack(tr);
+                                  setModal('edit-track');
+                                }}
+                              >
+                                管理
+                              </button>
+                            )}
                           </div>
                           <div className="wave-container">
                             <Waveform
@@ -1139,6 +1157,8 @@ function App() {
           title={
             {
               new: '新建评测任务',
+              batch: '按版本目录批量导入',
+              'edit-track': '管理草稿候选',
               sample: '添加音频片段',
               track: '导入候选版本',
               publish: '发布独立评测',
@@ -1148,8 +1168,64 @@ function App() {
               report: '评测结果',
             }[modal] || ''
           }
-          onClose={() => setModal('')}
+          onClose={() => {
+            if (!batchBusy && !busy) setModal('');
+          }}
         >
+          {modal === 'batch' && task && (
+            <BatchImport
+              taskId={task.id}
+              existing={task.samples?.map((s) => s.name) || []}
+              onBusy={setBatchBusy}
+              onDone={async () => {
+                await openTask(task.id);
+                setTasks(await api('/tasks'));
+              }}
+            />
+          )}
+          {modal === 'edit-track' && editTrack && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const data = Object.fromEntries(new FormData(e.currentTarget));
+                void run(async () => {
+                  await api('/tracks/' + editTrack.id, 'PATCH', data);
+                  await refreshSample();
+                  setModal('');
+                });
+              }}
+            >
+              <p className="muted">
+                修改名称和版本证据不会改变音频。有标注的候选不能删除；发布后候选冻结。
+              </p>
+              <label>
+                版本名称
+                <input name="name" required maxLength={120} defaultValue={editTrack.name} />
+              </label>
+              <label>
+                版本证据
+                <input name="version" maxLength={200} defaultValue={editTrack.version} />
+              </label>
+              <button className="primary full" disabled={busy}>
+                保存修改
+              </button>
+              <button
+                type="button"
+                className="full"
+                disabled={busy}
+                onClick={() => {
+                  if (window.confirm('删除这个草稿候选？无法通过界面恢复，有标注的候选会保留。'))
+                    void run(async () => {
+                      await api('/tracks/' + editTrack.id, 'DELETE');
+                      await refreshSample();
+                      setModal('');
+                    });
+                }}
+              >
+                删除这个候选
+              </button>
+            </form>
+          )}
           {modal === 'new' && (
             <form
               onSubmit={(e) => {

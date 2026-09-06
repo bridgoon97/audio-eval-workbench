@@ -51,6 +51,11 @@ class SampleInput(BaseModel):
     provenance: str = "PRIVATE local verification"
 
 
+class TrackInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    version: str = Field(default="未知", max_length=200)
+
+
 class PublishInput(BaseModel):
     users: list[str] = Field(default_factory=list)
     alignment_confirmed: bool = False
@@ -182,7 +187,7 @@ def create_app(
         with connect(database) as db:
             return {
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
-                "version": "0.1.0",
+                "version": "0.2.0",
             }
 
     @app.post("/api/setup")
@@ -418,6 +423,153 @@ def create_app(
                 "UPDATE samples SET samples=? WHERE id=?", (meta["samples"], sample_id)
             )
         return {"id": track_id, "meta": meta}
+
+    @app.patch("/api/tracks/{track_id}")
+    def edit_track(track_id: str, body: TrackInput, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            tr = db.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
+            if not tr:
+                raise HTTPException(404, "候选不存在")
+            _, t = sample_access(db, tr["sample_id"], u, True)
+            if t["status"] != "draft":
+                raise HTTPException(409, "已发布任务不可修改候选")
+            if not body.name.strip():
+                raise HTTPException(422, "版本名称不能为空")
+            db.execute(
+                "UPDATE tracks SET name=?,version=? WHERE id=?",
+                (body.name.strip(), body.version, track_id),
+            )
+        return {"ok": True}
+
+    @app.delete("/api/tracks/{track_id}")
+    def delete_track(track_id: str, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            tr = db.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
+            if not tr:
+                raise HTTPException(404, "候选不存在")
+            _, t = sample_access(db, tr["sample_id"], u, True)
+            if t["status"] != "draft":
+                raise HTTPException(409, "已发布任务不可删除候选")
+            if db.execute(
+                "SELECT 1 FROM comments WHERE track_id=? OR (sample_id=? AND track_id IS NULL)",
+                (track_id, tr["sample_id"]),
+            ).fetchone():
+                raise HTTPException(409, "候选已有标注，保留其音频依据；请创建新片段")
+            db.execute("DELETE FROM aliases WHERE sample_id=?", (tr["sample_id"],))
+            db.execute("DELETE FROM tracks WHERE id=?", (track_id,))
+            if not db.execute(
+                "SELECT 1 FROM tracks WHERE sample_id=?", (tr["sample_id"],)
+            ).fetchone():
+                db.execute(
+                    "UPDATE samples SET samples=0 WHERE id=?", (tr["sample_id"],)
+                )
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id}/import-sample")
+    def import_sample(
+        task_id: str,
+        request: Request,
+        files: Annotated[list[UploadFile], File()],
+        manifest: str = Form(...),
+    ):
+        # 每个片段独立原子提交；同一请求重试不会生成重复题目。
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            t = task_access(db, task_id, u, True)
+            if t["status"] != "draft":
+                raise HTTPException(409, "已发布任务不可导入")
+            try:
+                data = json.loads(manifest)
+                sample = SampleInput.model_validate(data)
+                request_id = data["request_id"]
+                if (
+                    not isinstance(request_id, str)
+                    or len(request_id) != 32
+                    or any(c not in "0123456789abcdef" for c in request_id)
+                ):
+                    raise ValueError("无效导入编号")
+                candidates = data["tracks"]
+                if not 2 <= len(files) <= 6 or len(candidates) != len(files):
+                    raise ValueError("每个片段需要 2–6 个对应候选")
+                if sample.provenance not in (
+                    "PUBLIC reproducible",
+                    "DECLASSIFIED real-device",
+                    "PRIVATE local verification",
+                ):
+                    raise ValueError("请选择数据来源级别")
+                decoded = []
+                for file, candidate in zip(files, candidates):
+                    track = TrackInput.model_validate(candidate)
+                    if not track.name.strip():
+                        raise ValueError("版本名称不能为空")
+                    raw = file.file.read(32 * 1024 * 1024 + 1)
+                    if len(raw) > 32 * 1024 * 1024:
+                        raise ValueError("每个 WAV 最大 32 MB")
+                    wav, meta = decode_audio(raw, int(candidate.get("channel", 0)))
+                    decoded.append((track, wav, meta))
+                if len({meta["samples"] for _, _, meta in decoded}) != 1:
+                    raise ValueError("候选长度不一致；请在外部确认时间对齐后重试")
+            except (ValueError, TypeError, KeyError) as exc:
+                raise HTTPException(422, "导入失败：" + str(exc))
+            old = db.execute(
+                "SELECT * FROM samples WHERE id=?", (request_id,)
+            ).fetchone()
+            if old:
+                old_tracks = db.execute(
+                    "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid",
+                    (request_id,),
+                ).fetchall()
+                identical = (
+                    old["task_id"] == task_id
+                    and old["name"] == sample.name
+                    and old["scene"] == sample.scene
+                    and old["provenance"] == sample.provenance
+                    and len(old_tracks) == len(decoded)
+                )
+                if identical:
+                    identical = all(
+                        a["name"] == b.name
+                        and a["version"] == b.version
+                        and json.loads(a["meta"]) == m
+                        for a, (b, _, m) in zip(old_tracks, decoded)
+                    )
+                if identical:
+                    return {"id": request_id, "reused": True}
+                raise HTTPException(409, "导入编号已使用且内容不同，请重新预览")
+            if db.execute(
+                "SELECT 1 FROM samples WHERE task_id=? AND name=?",
+                (task_id, sample.name),
+            ).fetchone():
+                raise HTTPException(409, "同名片段已存在，请更名后重新预览")
+            db.execute(
+                "INSERT INTO samples VALUES(?,?,?,?,?,?)",
+                (
+                    request_id,
+                    task_id,
+                    sample.name,
+                    sample.scene,
+                    sample.provenance,
+                    decoded[0][2]["samples"],
+                ),
+            )
+            for track, wav, meta in decoded:
+                path = assets / (meta["asset_sha256"] + ".wav")
+                if not path.exists():
+                    path.write_bytes(wav)
+                db.execute(
+                    "INSERT INTO tracks VALUES(?,?,?,?,?,?)",
+                    (
+                        uid(),
+                        request_id,
+                        track.name,
+                        track.version,
+                        path.name,
+                        json.dumps(meta),
+                    ),
+                )
+        return {"id": request_id, "reused": False}
 
     @app.post("/api/tasks/{task_id}/publish")
     def publish(task_id: str, body: PublishInput, request: Request):

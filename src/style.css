@@ -1633,3 +1633,83 @@ kbd {
     overflow: visible;
   }
 }
+
+/* 批量预览保留列对齐，窄屏改为单列。 */
+.modal:has(.batch-import) {
+  width: min(960px, calc(100vw - 32px));
+}
+.batch-import fieldset {
+  border: 0;
+  padding: 0;
+  min-width: 0;
+}
+.batch-versions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+.batch-version {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  background: var(--bg);
+}
+.batch-version .upload-zone {
+  padding: 12px;
+}
+.batch-preview {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.batch-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.batch-preview th,
+.batch-preview td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.batch-preview th {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+}
+.batch-import .actions {
+  margin: 14px 0;
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .batch-versions {
+    grid-template-columns: 1fr;
+  }
+}
+
+.batch-version {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.modal .batch-version label {
+  margin-bottom: 0;
+  min-width: 0;
+}
+.batch-version input[type='file'] {
+  max-width: 100%;
+  font-size: 11px;
+}
+.batch-version .upload-zone {
+  margin: 0;
+  gap: 6px;
+  padding: 8px;
+}
+@media (max-width: 600px) {
+  .batch-version {
+    grid-template-columns: 1fr;
+  }
+}
