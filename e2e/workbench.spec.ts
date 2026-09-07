@@ -470,3 +470,184 @@ test('草稿信息可修正、发布后增补成员、评论按楼层回复', as
     await second.close();
   }
 });
+
+test('关闭任务后复盘：参与进度、分歧定位、标签口径与导出', async ({ page, browser }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  for (const name of ['复盘甲', '复盘乙']) {
+    await page.request.post('/api/users', {
+      data: { name, password: 'review-flow-password', role: 'reviewer' },
+    });
+  }
+  const users = await (await page.request.get('/api/users')).json();
+  const id = (name: string) => users.find((user: { name: string }) => user.name === name).id;
+
+  // 合成 1 秒 16 kHz PCM WAV，不使用任何真实录音。
+  const wav = Buffer.alloc(44 + 32000);
+  wav.write('RIFF', 0);
+  wav.writeUInt32LE(wav.length - 8, 4);
+  wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(16000, 24);
+  wav.writeUInt32LE(32000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write('data', 36);
+  wav.writeUInt32LE(32000, 40);
+
+  const created = await (
+    await page.request.post('/api/tasks', {
+      data: { title: '复盘验收任务', kind: '算法版本', mode: 'development' },
+    })
+  ).json();
+  const samples: { name: string; id: string; tracks: string[] }[] = [];
+  for (const name of ['有分歧片段', '一致片段']) {
+    const sample = await (
+      await page.request.post(`/api/tasks/${created.id}/samples`, {
+        data: { name, scene: '复盘场景', provenance: 'PUBLIC reproducible' },
+      })
+    ).json();
+    const tracks: string[] = [];
+    for (const suffix of ['A', 'B']) {
+      const track = await (
+        await page.request.post(`/api/samples/${sample.id}/tracks`, {
+          multipart: {
+            name: `候选${suffix}`,
+            version: 'v1',
+            file: { name: 'clip.wav', mimeType: 'audio/wav', buffer: wav },
+          },
+        })
+      ).json();
+      tracks.push(track.id);
+    }
+    samples.push({ name, id: sample.id, tracks });
+  }
+  await page.request.post(`/api/tasks/${created.id}/publish`, {
+    data: { users: [id('复盘甲'), id('复盘乙')], alignment_confirmed: true },
+  });
+
+  // 管理员（页面会话）独立提交：片段一留标签评论并投候选A，片段二投候选A。
+  // 复盘甲全程不提交，用于验证未提交名单。
+  await page.request.post(`/api/samples/${samples[0].id}/comments`, {
+    data: { start: 0, end: 100, body: '字尾残噪明显', tag: '残噪' },
+  });
+  await page.request.post(`/api/samples/${samples[0].id}/rating`, {
+    data: { choice: samples[0].tracks[0] },
+  });
+  await page.request.post(`/api/samples/${samples[1].id}/rating`, {
+    data: { choice: samples[1].tracks[0] },
+  });
+
+  // 复盘乙通过 API 提交：片段一投候选B（制造分歧），片段二投候选A（保持一致），
+  // 并用“听感”标签回复评论——回复不应计入标签汇总。
+  const second = await browser.newContext();
+  try {
+    const api = second.request;
+    const base = 'http://127.0.0.1:8877';
+    expect(
+      (
+        await api.post(`${base}/api/login`, {
+          data: { name: '复盘乙', password: 'review-flow-password' },
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await api.post(`${base}/api/samples/${samples[0].id}/rating`, {
+          data: { choice: samples[0].tracks[1] },
+        })
+      ).status(),
+    ).toBe(200);
+    expect(
+      (
+        await api.post(`${base}/api/samples/${samples[1].id}/rating`, {
+          data: { choice: samples[1].tracks[0] },
+        })
+      ).status(),
+    ).toBe(200);
+    const detail = await api.get(`${base}/api/samples/${samples[0].id}`);
+    expect(detail.status()).toBe(200);
+    const comments = (await detail.json()).comments as { id: string }[];
+    expect(comments.length).toBeGreaterThan(0);
+    expect(
+      (
+        await api.post(`${base}/api/samples/${samples[0].id}/comments`, {
+          data: {
+            start: 0,
+            end: 100,
+            body: '回复：同意有残噪',
+            tag: '听感',
+            parent: comments[0].id,
+          },
+        })
+      ).status(),
+    ).toBe(200);
+  } finally {
+    await second.close();
+  }
+
+  await page.request.post(`/api/tasks/${created.id}/close`);
+  await page.goto('/');
+  await page.locator('.task-card').filter({ hasText: '复盘验收任务' }).click();
+  await page.getByRole('button', { name: '查看结果' }).click();
+
+  const progress = page.locator('.progress-numbers span');
+  await expect(progress.nth(0)).toHaveText('总参与者3');
+  await expect(progress.nth(1)).toHaveText('已提交2');
+  await expect(progress.nth(2)).toHaveText('未提交1');
+  await expect(page.locator('.review-progress')).toContainText('已提交：复盘乙、浏览器测试');
+  await expect(page.locator('.review-progress')).toContainText('未提交：复盘甲');
+
+  const disputed = page.locator('.review-sample').filter({ hasText: '有分歧片段' });
+  const consistent = page.locator('.review-sample').filter({ hasText: '一致片段' });
+  await expect(disputed.locator('.diff-badge')).toHaveText('存在分歧');
+  await expect(consistent.locator('.diff-badge')).toHaveCount(0);
+  await expect(disputed).toContainText('2 人已提交（分母）');
+  await expect(consistent).toContainText('2 人已提交（分母）');
+  await expect(disputed.locator('.result-row').filter({ hasText: '候选A' })).toContainText(
+    '50.0%（1/2）',
+  );
+  await expect(consistent.locator('.result-row').filter({ hasText: '候选A' })).toContainText(
+    '100.0%（2/2）',
+  );
+  await expect(disputed.locator('.result-row').filter({ hasText: '无明显差异' })).toContainText(
+    '0.0%（0/2）',
+  );
+
+  // 分歧跳回：回到片段试听区并能看到评论楼层。
+  await disputed.getByRole('button', { name: '回到此片段试听与标注' }).click();
+  await expect(page.locator('.tracks-heading h2')).toHaveText('有分歧片段');
+  await expect(page.getByText('字尾残噪明显', { exact: true })).toBeVisible();
+
+  // 标签定位：只统计根评论（回复的“听感”不出现），点击定位回片段。
+  await page.getByRole('button', { name: '查看结果' }).click();
+  const tagSummary = page.locator('.tag-summary');
+  await expect(tagSummary).toHaveCount(1);
+  await expect(tagSummary).toContainText('残噪');
+  await expect(tagSummary).toContainText('1 条');
+  await tagSummary.getByRole('button', { name: '有分歧片段' }).click();
+  await expect(page.locator('.tracks-heading h2')).toHaveText('有分歧片段');
+
+  // 重新打开结果弹窗，下载 CSV：UTF-8 BOM、中文表头与片段名可直接被中文 Excel 识别。
+  await page.getByRole('button', { name: '查看结果' }).click();
+  await expect(page.locator('.report-exports')).toBeVisible();
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('link', { name: '结果 CSV（Excel）' }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('evaluation-results.csv');
+  const raw = fs.readFileSync((await download.path())!);
+  expect([...raw.subarray(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+  const text = raw.toString('utf8');
+  expect(text).toContain('有分歧片段');
+  expect(text).toContain('残噪');
+  expect(text).toContain('存在分歧');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  expect(errors).toEqual([]);
+});

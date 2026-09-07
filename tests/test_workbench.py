@@ -1,6 +1,8 @@
 """验证真实输出、任务冻结、匿名边界和多人持久化。"""
 
+import csv
 import io
+import json
 import sqlite3
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -71,6 +73,21 @@ def publish(admin, t, users=None):
         json={"users": users or [], "alignment_confirmed": True},
     )
     assert response.status_code == 200, response.text
+
+
+def sample_with_tracks(admin, t, name):
+    """一个片段两个候选；名称可预测，便于断言与身份泄露检查。"""
+    s = admin.post(f"/api/tasks/{t}/samples", json={"name": name}).json()["id"]
+    tracks = []
+    for i, suffix in enumerate("甲乙"):
+        r = admin.post(
+            f"/api/samples/{s}/tracks",
+            data={"name": f"{name}候选{suffix}", "version": "v"},
+            files={"file": ("x.wav", demo_wav(i, 0), "audio/wav")},
+        )
+        assert r.status_code == 200, r.text
+        tracks.append(r.json()["id"])
+    return s, tracks
 
 
 def test_setup_key_and_single_initialization(tmp_path):
@@ -759,3 +776,202 @@ def test_nested_replies_keep_exact_parent(env):
     by_id = {comment["id"]: comment for comment in comments}
     assert by_id[reply]["parent"] == root
     assert by_id[nested]["parent"] == reply
+
+
+def test_progress_and_vote_summary_rules(env):
+    """参与进度、票数分母、幂等提交与分歧分类的可证伪规则。"""
+    app, a, root = env
+    first, first_id = reviewer(app, a, "参与者一")
+    second, second_id = reviewer(app, a, "参与者二")
+    third, third_id = reviewer(app, a, "参与者三")
+    t = a.post("/api/tasks", json={"title": "进度与汇总规则", "mode": "development"}).json()["id"]
+    s1, tracks1 = sample_with_tracks(a, t, "片段一")
+    s2, tracks2 = sample_with_tracks(a, t, "片段二")
+    s3, tracks3 = sample_with_tracks(a, t, "片段三")
+    publish(a, t, [first_id, second_id, third_id])
+    owner_id = a.get("/api/me").json()["id"]
+
+    # 幂等重复提交不增加票数；只评论不算提交。
+    assert first.post(f"/api/samples/{s1}/rating", json={"choice": tracks1[0]}).status_code == 200
+    assert first.post(f"/api/samples/{s1}/rating", json={"choice": tracks1[0]}).status_code == 200
+    assert second.post(f"/api/samples/{s1}/rating", json={"choice": "tie"}).status_code == 200
+    assert (
+        third.post(
+            f"/api/samples/{s1}/comments", json={"start": 0, "end": 100, "body": "只评论"}
+        ).status_code
+        == 200
+    )
+    # 不同片段提交数不同：片段二两人一致，片段三仅一人。
+    assert first.post(f"/api/samples/{s2}/rating", json={"choice": tracks2[0]}).status_code == 200
+    assert second.post(f"/api/samples/{s2}/rating", json={"choice": tracks2[0]}).status_code == 200
+    assert first.post(f"/api/samples/{s3}/rating", json={"choice": tracks3[0]}).status_code == 200
+
+    assert a.post(f"/api/tasks/{t}/close").status_code == 200
+    report = a.get(f"/api/tasks/{t}/report").json()
+    progress = report["参与进度"]
+    # 发布时负责人自动进入成员表，因此按“被要求评分”计入未提交，不漏算也不重复算。
+    assert progress["总参与者"] == 4
+    assert progress["已提交"] == 2 and progress["未提交"] == 2
+    assert set(progress["已提交名单"]) == {"参与者一", "参与者二"}
+    assert set(progress["未提交名单"]) == {"参与者三", "组织者"}
+    assert {m["名称"]: m["已提交片段数"] for m in progress["成员"]} == {
+        "参与者一": 3,
+        "参与者二": 2,
+        "参与者三": 0,
+        "组织者": 0,
+    }
+
+    views = {s["id"]: s for s in report["样本"]}
+    assert views[s1]["分母"] == 2 and views[s2]["分母"] == 2 and views[s3]["分母"] == 1
+    assert {v["ID"]: v["票数"] for v in views[s1]["票数"]} == {
+        tracks1[0]: 1,
+        tracks1[1]: 0,
+        "tie": 1,
+    }
+    assert views[s1]["分歧"] is True
+    assert views[s2]["分歧"] is False
+    assert views[s3]["分歧"] is False
+
+    # 故意改变一票：分歧分类随之变化（两个方向都验证）。
+    with sqlite3.connect(root / "workbench.sqlite3") as db:
+        db.execute(
+            "UPDATE ratings SET choice=? WHERE sample_id=? AND user_id=?",
+            (tracks1[0], s1, second_id),
+        )
+    views = {s["id"]: s for s in a.get(f"/api/tasks/{t}/report").json()["样本"]}
+    assert views[s1]["分歧"] is False
+    with sqlite3.connect(root / "workbench.sqlite3") as db:
+        db.execute(
+            "UPDATE ratings SET choice=? WHERE sample_id=? AND user_id=?",
+            ("tie", s2, second_id),
+        )
+    views = {s["id"]: s for s in a.get(f"/api/tasks/{t}/report").json()["样本"]}
+    assert views[s2]["分歧"] is True
+
+    # 进度只依据成员表：负责人被移出成员表后不得被补记为缺失或参与者。
+    with sqlite3.connect(root / "workbench.sqlite3") as db:
+        db.execute("DELETE FROM members WHERE task_id=? AND user_id=?", (t, owner_id))
+    progress = a.get(f"/api/tasks/{t}/report").json()["参与进度"]
+    assert progress["总参与者"] == 3
+    assert owner_id not in [m["ID"] for m in progress["成员"]]
+    assert "组织者" not in progress["未提交名单"]
+
+
+def test_active_blind_summary_and_exports_stay_sealed(env):
+    """active 盲评任务对任何人都拒绝汇总与导出，关闭后按既有规则揭晓。"""
+    app, a, _ = env
+    member, member_id = reviewer(app, a, "盲评成员")
+    outsider, _ = reviewer(app, a, "局外人")
+    t, s, tracks = task(a)
+    publish(a, t, [member_id])
+    member.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
+    member.post(f"/api/samples/{s}/comments", json={"start": 0, "end": 100, "body": "盲评中"})
+    for path in ("report", "export", "export.csv", "export.md"):
+        sealed = a.get(f"/api/tasks/{t}/{path}")
+        assert sealed.status_code == 403
+        assert "秘密" not in sealed.text
+        assert member.get(f"/api/tasks/{t}/{path}").status_code == 403
+        assert outsider.get(f"/api/tasks/{t}/{path}").status_code == 403
+        assert TestClient(app).get(f"/api/tasks/{t}/{path}").status_code == 401
+    a.post(f"/api/tasks/{t}/close")
+    # 关闭后成员可查看汇总（既有规则），导出仍仅限任务管理者。
+    assert member.get(f"/api/tasks/{t}/report").status_code == 200
+    assert "秘密算法" in member.get(f"/api/tasks/{t}/report").text
+    for path in ("export", "export.csv", "export.md"):
+        assert member.get(f"/api/tasks/{t}/{path}").status_code == 403
+        assert outsider.get(f"/api/tasks/{t}/{path}").status_code == 403
+    assert outsider.get(f"/api/tasks/{t}/report").status_code == 403
+
+
+def test_tag_summary_counts_root_comments_only_and_locates_samples(env):
+    """标签只统计根评论，回复不计入；汇总携带片段定位信息。"""
+    app, a, _ = env
+    member, member_id = reviewer(app, a, "标签员")
+    t = a.post("/api/tasks", json={"title": "标签口径", "mode": "development"}).json()["id"]
+    s1, _ = sample_with_tracks(a, t, "室内")
+    s2, _ = sample_with_tracks(a, t, "车内")
+    publish(a, t, [member_id])
+    root = member.post(
+        f"/api/samples/{s1}/comments",
+        json={"start": 0, "end": 100, "body": "残噪明显", "tag": "残噪"},
+    ).json()["id"]
+    member.post(
+        f"/api/samples/{s1}/comments",
+        json={"start": 0, "end": 100, "body": "回复也提标签", "tag": "听感", "parent": root},
+    )
+    member.post(
+        f"/api/samples/{s2}/comments",
+        json={"start": 0, "end": 100, "body": "车内同样残噪", "tag": "残噪"},
+    )
+    a.post(f"/api/tasks/{t}/close")
+    tags = {x["标签"]: x for x in a.get(f"/api/tasks/{t}/report").json()["标签汇总"]}
+    assert tags["残噪"]["根评论数"] == 2
+    assert "听感" not in tags
+    assert [part["ID"] for part in tags["残噪"]["片段"]] == [s1, s2]
+    assert tags["残噪"]["片段"][0]["名称"] == "室内"
+
+
+def test_export_formats_content_and_compatibility(env):
+    """JSON/CSV/Markdown 三种导出内容断言与旧字段兼容。"""
+    app, a, _ = env
+    first, first_id = reviewer(app, a, "导出甲")
+    second, second_id = reviewer(app, a, "导出乙")
+    t = a.post("/api/tasks", json={"title": "导出内容验收", "mode": "blind"}).json()["id"]
+    s1, tracks1 = sample_with_tracks(a, t, "室内")
+    s2, tracks2 = sample_with_tracks(a, t, "车内")
+    publish(a, t, [first_id, second_id])
+    first.post(f"/api/samples/{s1}/rating", json={"choice": tracks1[0], "reason": "更干净"})
+    second.post(f"/api/samples/{s1}/rating", json={"choice": "tie"})
+    first.post(f"/api/samples/{s2}/rating", json={"choice": tracks2[1]})
+    first.post(
+        f"/api/samples/{s1}/comments",
+        json={"start": 0, "end": 100, "body": "残噪", "tag": "残噪"},
+    )
+    a.post(f"/api/tasks/{t}/close")
+
+    payload = a.get(f"/api/tasks/{t}/export")
+    assert payload.status_code == 200
+    data = json.loads(payload.text)
+    assert data["任务"]["id"] == t
+    assert data["任务"]["title"] == "导出内容验收"
+    assert data["任务"]["status"] == "closed" and data["任务"]["mode"] == "blind"
+    assert data["生成时间"]
+    progress = data["参与进度"]
+    assert (progress["总参与者"], progress["已提交"], progress["未提交"]) == (3, 2, 1)
+    indoor = next(s for s in data["样本"] if s["id"] == s1)
+    outdoor = next(s for s in data["样本"] if s["id"] == s2)
+    assert indoor["分母"] == 2 and outdoor["分母"] == 1
+    assert {v["ID"]: v["票数"] for v in indoor["票数"]} == {
+        tracks1[0]: 1,
+        tracks1[1]: 0,
+        "tie": 1,
+    }
+    assert indoor["分歧"] is True and outdoor["分歧"] is False
+    assert data["标签汇总"][0]["标签"] == "残噪"
+    assert data["标签汇总"][0]["片段"][0]["ID"] == s1
+    # 旧字段保持兼容：旧入口/旧数据仍可读取。
+    assert data["播放口径"] and isinstance(indoor["ratings"], list)
+    assert "室内候选甲" in payload.text
+
+    raw = a.get(f"/api/tasks/{t}/export.csv").content
+    assert raw[:3] == b"\xef\xbb\xbf" and b"\r\n" in raw
+    rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"))))
+    assert rows[0][:3] == ["部分", "条目ID", "片段ID"]
+    assert {"任务信息", "参与进度", "逐片段偏好", "问题标签"} <= {row[0] for row in rows}
+    indoor_rows = [row for row in rows if row[0] == "逐片段偏好" and row[3] == "室内"]
+    assert any(row[4] == "无明显差异" and row[6] == "1" and row[7] == "2" for row in indoor_rows)
+    assert any(row[4] == "室内候选甲" and row[8] == "50.0%（1/2）" for row in indoor_rows)
+    assert any(row[9].startswith("存在分歧") for row in indoor_rows)
+    assert any(row[4] == "总参与者" and row[6] == "3" for row in rows)
+    assert any(row[4] == "组织者" and row[6] == "0" and row[9] == "未提交" for row in rows)
+    assert any(row[4] == "导出乙" and row[6] == "1" and row[9] == "已提交" for row in rows)
+    assert any(row[5] == "残噪" and row[6] == "1" and s1 in row[9] for row in rows)
+
+    markdown = a.get(f"/api/tasks/{t}/export.md").text
+    assert "# 听鉴结果报告 · 导出内容验收" in markdown
+    assert "closed" in markdown and "blind" in markdown
+    assert "有效提交人数（分母）：2" in markdown
+    assert "50.0%（1/2）" in markdown
+    assert "仅统计根评论" in markdown and "描述性提示" in markdown
+    assert "未提交 1 人" in markdown
+    assert tracks1[0] in markdown and s1 in markdown

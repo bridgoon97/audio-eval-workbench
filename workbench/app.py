@@ -1,5 +1,6 @@
 """局域网协作 API。音频、匿名映射和评论始终经过授权检查。"""
 
+import csv
 import hashlib
 import io
 import json
@@ -28,6 +29,274 @@ def uid():
 
 def now():
     return datetime.now(UTC).isoformat()
+
+
+STATUS_NAMES = {"draft": "准备中", "active": "评测进行中", "closed": "已揭晓"}
+MODE_NAMES = {"development": "开发诊断", "blind": "隐藏版本评测"}
+CSV_HEADER = ["部分", "条目ID", "片段ID", "片段名称", "条目", "标签", "数值", "分母", "百分比", "说明"]
+
+
+def share_text(count, denominator):
+    """百分比必须写明分母；没有有效提交时不呈现百分比。"""
+    if not denominator:
+        return "—"
+    return f"{100 * count / denominator:.1f}%（{count}/{denominator}）"
+
+
+def task_summary(db, task_id):
+    """复盘汇总。口径固定：
+    - 参与名单只来自 members 表；负责人只有在成员表里才计入，不会被额外补记为缺失。
+    - “已提交”指该成员在本任务提交过至少一个片段的偏好；评论和回复不算提交。
+    - 每个片段的分母是该片段的有效提交人数（ratings 每人每片段至多一行）。
+    - 分歧＝同一片段出现两种及以上不同偏好，仅描述，不做显著性判断。
+    - 标签只统计根评论，回复楼层不计入。
+    """
+    members = db.execute(
+        "SELECT u.id AS id, u.name AS name FROM members m JOIN users u ON u.id=m.user_id "
+        "WHERE m.task_id=? ORDER BY u.name, u.id",
+        (task_id,),
+    ).fetchall()
+    samples = db.execute(
+        "SELECT id, name FROM samples WHERE task_id=? ORDER BY rowid", (task_id,)
+    ).fetchall()
+    rated: dict[str, set[str]] = {}
+    choices: dict[str, list[str]] = {}
+    for row in db.execute(
+        "SELECT r.sample_id, r.user_id, r.choice FROM ratings r "
+        "JOIN samples s ON s.id=r.sample_id WHERE s.task_id=?",
+        (task_id,),
+    ):
+        choices.setdefault(row["sample_id"], []).append(row["choice"])
+        rated.setdefault(row["user_id"], set()).add(row["sample_id"])
+    done = [m for m in members if rated.get(m["id"])]
+    missed = [m for m in members if not rated.get(m["id"])]
+    progress = {
+        "总参与者": len(members),
+        "已提交": len(done),
+        "未提交": len(missed),
+        "已提交名单": [m["name"] for m in done],
+        "未提交名单": [m["name"] for m in missed],
+        "成员": [
+            {
+                "ID": m["id"],
+                "名称": m["name"],
+                "已提交片段数": len(rated.get(m["id"], ())),
+            }
+            for m in members
+        ],
+    }
+    per_sample = {}
+    for sample in samples:
+        picked = choices.get(sample["id"], [])
+        counts: dict[str, int] = {}
+        for choice in picked:
+            counts[choice] = counts.get(choice, 0) + 1
+        votes = [
+            {
+                "ID": track["id"],
+                "名称": track["name"],
+                "票数": counts.get(track["id"], 0),
+            }
+            for track in db.execute(
+                "SELECT id, name FROM tracks WHERE sample_id=? ORDER BY rowid",
+                (sample["id"],),
+            )
+        ]
+        votes.append({"ID": "tie", "名称": "无明显差异", "票数": counts.get("tie", 0)})
+        per_sample[sample["id"]] = {
+            "分母": len(picked),
+            "票数": votes,
+            "分歧": len(set(picked)) >= 2,
+        }
+    raw_tags: dict[str, dict[str, int]] = {}
+    for row in db.execute(
+        "SELECT c.tag, c.sample_id FROM comments c JOIN samples s ON s.id=c.sample_id "
+        "WHERE s.task_id=? AND c.parent IS NULL ORDER BY c.created, c.id",
+        (task_id,),
+    ):
+        per_tag = raw_tags.setdefault(row["tag"], {})
+        per_tag[row["sample_id"]] = per_tag.get(row["sample_id"], 0) + 1
+    names = {sample["id"]: sample["name"] for sample in samples}
+    tags = [
+        {
+            "标签": tag,
+            "根评论数": sum(per_sample_tag.values()),
+            "片段": [
+                {"ID": sample_id, "名称": names.get(sample_id, ""), "根评论数": count}
+                for sample_id, count in per_sample_tag.items()
+            ],
+        }
+        for tag, per_sample_tag in raw_tags.items()
+    ]
+    return {"参与进度": progress, "逐片段": per_sample, "标签汇总": tags}
+
+
+def results_csv(value) -> bytes:
+    """UTF-8 BOM + CRLF，中文 Windows Excel 可直接打开；单一文件分四部分。"""
+    task = value["任务"]
+    samples = value["样本"]
+    progress = value["参与进度"]
+    rows = [CSV_HEADER]
+    rows += [
+        ["任务信息", "", "", "", label, "", text, "", "", ""]
+        for label, text in (
+            ("任务ID", task["id"]),
+            ("任务名称", task["title"]),
+            ("任务状态", STATUS_NAMES.get(task["status"], task["status"])),
+            ("评测模式", MODE_NAMES.get(task["mode"], task["mode"])),
+            ("比较类型", task["kind"]),
+            ("生成时间", value["生成时间"]),
+        )
+    ]
+    rows += [
+        ["参与进度", "", "", "", label, "", progress[key], "", "", note]
+        for label, key, note in (
+            ("总参与者", "总参与者", "名单来自任务成员表"),
+            ("已提交人数", "已提交", "提交过至少一个片段的偏好"),
+            ("未提交人数", "未提交", "评论不算提交"),
+        )
+    ]
+    for member in progress["成员"]:
+        rows.append(
+            [
+                "参与进度",
+                member["ID"],
+                "",
+                "",
+                member["名称"],
+                "",
+                member["已提交片段数"],
+                len(samples),
+                share_text(member["已提交片段数"], len(samples)) if samples else "—",
+                "已提交" if member["已提交片段数"] else "未提交",
+            ]
+        )
+    for sample in samples:
+        if not sample["分母"]:
+            note = "该片段暂无提交"
+        elif sample["分歧"]:
+            note = "存在分歧：出现两种及以上不同偏好"
+        else:
+            note = "无分歧"
+        for vote in sample["票数"]:
+            rows.append(
+                [
+                    "逐片段偏好",
+                    vote["ID"],
+                    sample["id"],
+                    sample["name"],
+                    vote["名称"],
+                    "",
+                    vote["票数"],
+                    sample["分母"],
+                    share_text(vote["票数"], sample["分母"]),
+                    note,
+                ]
+            )
+    for tag in value["标签汇总"]:
+        location = "；".join(
+            f"{part['名称']}（ID：{part['ID']}，{part['根评论数']} 条）" for part in tag["片段"]
+        )
+        rows.append(
+            [
+                "问题标签",
+                "",
+                "",
+                "",
+                tag["标签"],
+                tag["标签"],
+                tag["根评论数"],
+                "",
+                "",
+                f"涉及片段：{location}；仅统计根评论，回复不计入",
+            ]
+        )
+    buffer = io.StringIO(newline="")
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
+
+
+def md_cell(text):
+    return str(text).replace("|", "\\|").replace("\n", " ")
+
+
+def results_markdown(value) -> str:
+    task = value["任务"]
+    progress = value["参与进度"]
+    total = len(value["样本"])
+    lines = [
+        f"# 听鉴结果报告 · {task['title']}",
+        "",
+        f"- 任务 ID：`{task['id']}`",
+        f"- 状态：{STATUS_NAMES.get(task['status'], task['status'])}（{task['status']}）",
+        f"- 模式：{MODE_NAMES.get(task['mode'], task['mode'])}（{task['mode']}）",
+        f"- 比较类型：{task['kind']}",
+        f"- 生成时间：{value['生成时间']}",
+        "",
+        (
+            "> 分母口径：每个片段的百分比以该片段的有效提交人数为分母，每人每片段至多一票；"
+            "评论、回复和未提交者不计入票数。分歧只是“同一片段出现两种及以上不同偏好”的描述性提示，"
+            "不代表统计显著，也不说明算法优劣。"
+        ),
+        "",
+        "## 参与进度",
+        "",
+        (
+            f"- 总参与者 {progress['总参与者']} 人；已提交 {progress['已提交']} 人；"
+            f"未提交 {progress['未提交']} 人。"
+        ),
+        f"- 已提交：{'、'.join(progress['已提交名单']) or '—'}",
+        f"- 未提交：{'、'.join(progress['未提交名单']) or '—'}",
+        "",
+        "| 成员 | 已提交片段 | 状态 |",
+        "| --- | --- | --- |",
+    ]
+    for member in progress["成员"]:
+        state = "已提交" if member["已提交片段数"] else "未提交"
+        lines.append(
+            f"| {md_cell(member['名称'])} | {member['已提交片段数']}/{total} | {state} |"
+        )
+    lines += ["", "## 逐片段偏好", ""]
+    for sample in value["样本"]:
+        distinct = len({vote["ID"] for vote in sample["票数"] if vote["票数"]})
+        if not sample["分母"]:
+            hint = "该片段暂无提交。"
+        elif sample["分歧"]:
+            hint = f"**存在分歧**：出现 {distinct} 种不同偏好（描述性提示）。"
+        else:
+            hint = "各提交者偏好一致。"
+        lines += [
+            f"### {sample['name']}",
+            "",
+            (
+                f"场景：{sample['scene'] or '场景未填写'} ｜ "
+                f"有效提交人数（分母）：{sample['分母']} ｜ {hint}"
+            ),
+            "",
+            "| 选项 | 票数 | 占比 | 选项 ID |",
+            "| --- | --- | --- | --- |",
+        ]
+        for vote in sample["票数"]:
+            option_id = "—" if vote["ID"] == "tie" else f"`{vote['ID']}`"
+            lines.append(
+                f"| {md_cell(vote['名称'])} | {vote['票数']} | "
+                f"{share_text(vote['票数'], sample['分母'])} | {option_id} |"
+            )
+        lines.append("")
+    lines += ["## 问题标签汇总", "", "仅统计根评论，回复楼层不计入。", ""]
+    if value["标签汇总"]:
+        lines += ["| 标签 | 根评论数 | 涉及片段 |", "| --- | --- | --- |"]
+        for tag in value["标签汇总"]:
+            location = "；".join(
+                f"{md_cell(part['名称'])}（`{part['ID']}`，{part['根评论数']} 条）"
+                for part in tag["片段"]
+            )
+            lines.append(f"| {md_cell(tag['标签'])} | {tag['根评论数']} | {location} |")
+    else:
+        lines.append("暂无根评论标签。")
+    lines += ["", "## 口径与边界", "", f"- {value['播放口径']}", f"- {value['解释边界']}", ""]
+    return "\n".join(lines)
 
 
 class Login(BaseModel):
@@ -966,11 +1235,13 @@ def create_app(
             t = task_access(db, task_id, u)
             if t["status"] != "closed":
                 raise HTTPException(403, "任务关闭并揭晓后才能查看汇总")
+            summary = task_summary(db, task_id)
             samples = []
             for row in db.execute(
                 "SELECT * FROM samples WHERE task_id=?", (task_id,)
             ).fetchall():
                 s = dict(row)
+                s.update(summary["逐片段"][s["id"]])
                 s["tracks"] = [
                     {
                         "id": tr["id"],
@@ -998,8 +1269,11 @@ def create_app(
                 ]
                 samples.append(s)
             return {
-                "任务": t,
+                "任务": dict(t),
                 "样本": samples,
+                "参与进度": summary["参与进度"],
+                "标签汇总": summary["标签汇总"],
+                "生成时间": now(),
                 "播放口径": "原始相对电平；公共监听增益；16 kHz；无延迟自动校正",
                 "解释边界": "探索性偏好统计，不是标准 MUSHRA，不以评分证明干净语音恢复",
             }
@@ -1018,6 +1292,32 @@ def create_app(
             json.dumps(value, ensure_ascii=False, indent=2),
             media_type="application/json",
             headers={"Content-Disposition": 'attachment; filename="evaluation.json"'},
+        )
+
+    @app.get("/api/tasks/{task_id}/export.csv")
+    def export_csv(task_id: str, request: Request):
+        u = user(request)
+        with connect(database) as db:
+            task_access(db, task_id, u, True)
+        return Response(
+            results_csv(report(task_id, u)),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="evaluation-results.csv"'
+            },
+        )
+
+    @app.get("/api/tasks/{task_id}/export.md")
+    def export_markdown(task_id: str, request: Request):
+        u = user(request)
+        with connect(database) as db:
+            task_access(db, task_id, u, True)
+        return Response(
+            results_markdown(report(task_id, u)),
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="evaluation-report.md"'
+            },
         )
 
     @app.get("/api/backup")

@@ -1306,6 +1306,96 @@ kbd {
 .report > a {
   margin-top: 20px;
 }
+.report-exports {
+  display: flex;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+.report-exports a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+.progress-numbers {
+  display: flex;
+  gap: 26px;
+  margin: 12px 0 4px;
+}
+.progress-numbers span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.progress-numbers strong {
+  font-size: 24px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.review-progress p {
+  margin: 6px 0 0;
+  font-size: 13px;
+}
+.report section > small {
+  color: var(--muted);
+}
+.review-sample {
+  margin: 14px 0 0;
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.review-sample h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 2px;
+}
+.diff-badge {
+  background: #fdeee2;
+  color: #ad5b2b;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+:root[data-theme='dark'] .diff-badge {
+  background: #46301f;
+  color: #e8a06c;
+}
+.result-row em {
+  font-style: normal;
+  color: var(--muted);
+  width: 104px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.tag-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px dashed var(--line);
+}
+.tag-summary strong {
+  font-size: 13px;
+}
+.tag-locations {
+  display: flex;
+  gap: 4px 10px;
+  flex-wrap: wrap;
+}
+.review-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
 .auth-shell {
   display: grid;
   grid-template-columns: 1fr 1fr;

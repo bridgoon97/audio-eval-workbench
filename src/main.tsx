@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, type Analysis, type Sample, type Task, type User } from './types';
+import { distinctChoices, formatShare, shareWidth, type ReportPayload } from './review';
 import packageInfo from '../package.json';
 import { TeamMembers } from './TeamMembers';
 import { UserGuide } from './UserGuide';
@@ -144,7 +145,7 @@ function App() {
     null,
   );
   const [members, setMembers] = useState<User[]>([]);
-  const [report, setReport] = useState<any>(null);
+  const [report, setReport] = useState<ReportPayload | null>(null);
   const [dark, setDark] = useState(localStorage.getItem('theme') === 'dark');
   const [filter, setFilter] = useState('');
   const [saveState, setSaveState] = useState('');
@@ -423,6 +424,12 @@ function App() {
       setSaveState('已保存到主机');
       await refreshSample();
     });
+  // 复盘跳回：从结果/标签定位回片段试听区与评论楼层。
+  const jumpToSample = (sampleId: string) => {
+    setModal('');
+    setPanel('notes');
+    void run(() => openSample(sampleId));
+  };
 
   if (!ready)
     return (
@@ -1760,37 +1767,97 @@ function App() {
           {modal === 'help' && <UserGuide role={user.role} />}
           {modal === 'report' && report && (
             <div className="report">
-              <p className="muted">
-                逐片段显示原始偏好计数，不把重复试听作为独立样本。缺失判断未计入。
-              </p>
-              {report['样本'].map((s: any) => (
-                <section key={s.id}>
-                  <h3>{s.name}</h3>
-                  <small>
-                    {s.scene} · {s.ratings.length} 人已提交
-                  </small>
-                  {[...s.tracks, { id: 'tie', name: '无明显差异' }].map((t: any) => {
-                    const count = s.ratings.filter((r: any) => r.choice === t.id).length;
-                    return (
-                      <div className="result-row" key={t.id}>
-                        <span>{t.name}</span>
-                        <div>
-                          <i
-                            style={{ width: `${(count / Math.max(1, s.ratings.length)) * 100}%` }}
-                          />
-                        </div>
-                        <strong>{count}</strong>
-                      </div>
-                    );
-                  })}
-                </section>
-              ))}
               {task?.can_manage && (
-                <a className="button primary" href={'/api/tasks/' + task?.id + '/export'}>
-                  <Download size={17} />
-                  导出证据 JSON（无音频）
-                </a>
+                <div className="report-exports">
+                  <a className="button" href={'/api/tasks/' + task?.id + '/export'}>
+                    <Download size={16} />
+                    证据 JSON
+                  </a>
+                  <a className="button" href={'/api/tasks/' + task?.id + '/export.csv'}>
+                    <Download size={16} />
+                    结果 CSV（Excel）
+                  </a>
+                  <a className="button" href={'/api/tasks/' + task?.id + '/export.md'}>
+                    <Download size={16} />
+                    复盘 Markdown
+                  </a>
+                </div>
               )}
+              <section className="review-progress">
+                <h3>参与进度</h3>
+                <div className="progress-numbers">
+                  <span>
+                    总参与者<strong>{report['参与进度'].总参与者}</strong>
+                  </span>
+                  <span>
+                    已提交<strong>{report['参与进度'].已提交}</strong>
+                  </span>
+                  <span>
+                    未提交<strong>{report['参与进度'].未提交}</strong>
+                  </span>
+                </div>
+                <p>已提交：{report['参与进度'].已提交名单.join('、') || '—'}</p>
+                <p>未提交：{report['参与进度'].未提交名单.join('、') || '—'}</p>
+                <small>
+                  名单来自任务成员表；每人每片段至多一票，评论与回复不算提交。负责人在成员表中即计入，不会被额外补记或漏计。
+                </small>
+              </section>
+              <section>
+                <h3>逐片段偏好</h3>
+                <small>百分比以该片段的有效提交人数为分母；缺失判断不计入。</small>
+                {report['样本'].map((s) => (
+                  <div className="review-sample" key={s.id}>
+                    <h4>
+                      {s.name}
+                      {s.分歧 && <span className="diff-badge">存在分歧</span>}
+                    </h4>
+                    <small>
+                      {s.scene} · {s.分母} 人已提交（分母）
+                      {s.分歧 && ` · 出现 ${distinctChoices(s.票数)} 种不同偏好，仅为描述性提示`}
+                    </small>
+                    {s.票数.map((v) => (
+                      <div className="result-row" key={v.ID}>
+                        <span>{v.名称}</span>
+                        <div>
+                          <i style={{ width: shareWidth(v.票数, s.分母) }} />
+                        </div>
+                        <strong>{v.票数}</strong>
+                        <em>{formatShare(v.票数, s.分母)}</em>
+                      </div>
+                    ))}
+                    <button className="text-button" onClick={() => jumpToSample(s.id)}>
+                      回到此片段试听与标注
+                    </button>
+                  </div>
+                ))}
+              </section>
+              <section>
+                <h3>问题标签汇总</h3>
+                <small>按标签统计根评论数量；回复楼层不计入。点击片段名可定位到对应片段。</small>
+                {!report['标签汇总'].length && <p className="muted">还没有根评论标签。</p>}
+                {report['标签汇总'].map((t) => (
+                  <div className="tag-summary" key={t.标签}>
+                    <span className="comment-tag">{t.标签}</span>
+                    <strong>{t.根评论数} 条</strong>
+                    <div className="tag-locations">
+                      {t.片段.map((loc) => (
+                        <button
+                          className="text-button"
+                          key={loc.ID}
+                          onClick={() => jumpToSample(loc.ID)}
+                        >
+                          {loc.名称}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </section>
+              <p className="review-note">
+                {report['播放口径']}。{report['解释边界']}
+                。分歧只表示同一片段出现了不同偏好，不代表统计显著或算法优劣；三种导出（JSON／CSV／Markdown）均包含上述口径与稳定
+                ID。
+              </p>
             </div>
           )}
           {error && (
