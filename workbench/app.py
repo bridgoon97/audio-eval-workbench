@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import secrets
 import sqlite3
 import threading
@@ -1282,6 +1283,11 @@ def create_app(
             by_id = {tr["id"]: tr for tr in tracks}
             if reference not in by_id:
                 raise HTTPException(422, "参考候选必须属于当前片段")
+            if reference in _processing_modes(db, sample_id):
+                raise HTTPException(
+                    409,
+                    "参考候选已有派生处理，试听与原始不一致；请先恢复全部原始音频，再更换参考",
+                )
         ref_track, ref_x = _load_track_audio(reference)
         results = []
         persist = []
@@ -1327,117 +1333,153 @@ def create_app(
         参考: str
         处理: Annotated[list[ProcessingItem], Field(default_factory=list, max_length=6)]
 
+    def _referenced_derived_files(db):
+        return {
+            json.loads(r[0])["派生文件"]
+            for r in db.execute("SELECT data FROM track_processing")
+        }
+
+    def _unlink_derived(name):
+        # 仅清理 assets 下由服务端 SHA 派生的文件名，不接受外部任意路径。
+        if not re.fullmatch(r"[0-9a-f]{64}\.wav", name):
+            return
+        (assets / name).unlink(missing_ok=True)
+
     @app.post("/api/samples/{sample_id}/processing")
     def apply_sample_processing(sample_id: str, body: ProcessingInput, request: Request):
         u = user(request)
-        with mutation_lock, connect(database) as db:
-            _ = _sample_managers_only(db, sample_id, u)
-            tracks = db.execute(
-                "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid", (sample_id,)
-            ).fetchall()
-            by_id = {tr["id"]: tr for tr in tracks}
-            if body.参考 not in by_id:
-                raise HTTPException(422, "参考候选必须属于当前片段")
-            annotated = (
-                db.execute(
+        with mutation_lock:
+            # 手工事务：显式提交点放在文件写入之后；提交失败由补偿删除本次
+            # 新建的文件，保证不留下无引用资产。不修改全局 connect() 语义。
+            db = sqlite3.connect(database, timeout=15)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            created_files: list[Path] = []
+            try:
+                _ = _sample_managers_only(db, sample_id, u)
+                referenced_before = _referenced_derived_files(db)
+                tracks = db.execute(
+                    "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid",
+                    (sample_id,),
+                ).fetchall()
+                by_id = {tr["id"]: tr for tr in tracks}
+                if body.参考 not in by_id:
+                    raise HTTPException(422, "参考候选必须属于当前片段")
+                if body.参考 in _processing_modes(db, sample_id):
+                    raise HTTPException(
+                        409,
+                        "参考候选已有派生处理，试听与原始不一致；请先恢复全部原始音频，再更换参考",
+                    )
+                annotated = db.execute(
                     "SELECT 1 FROM comments WHERE sample_id=? LIMIT 1", (sample_id,)
-                ).fetchone()
-                or db.execute(
+                ).fetchone() or db.execute(
                     "SELECT 1 FROM ratings WHERE sample_id=? LIMIT 1", (sample_id,)
                 ).fetchone()
-            )
-            existing = _processing_modes(db, sample_id)
-            if annotated and (existing or body.处理):
-                raise HTTPException(
-                    409,
-                    "此片段已有评论或评分关联，不能替换试听资产；请创建新任务",
-                )
-            if not body.处理:
-                raise HTTPException(422, "请至少为一个候选选择要应用的处理")
-            _, ref_x = _load_track_audio(body.参考)
-            plans = []
-            requested_ids = set()
-            for item in body.处理:
-                tr = by_id.get(item.候选)
-                if not tr:
-                    raise HTTPException(422, "候选不属于当前片段")
-                if item.候选 == body.参考:
-                    raise HTTPException(422, "参考候选保持原始资产，不需要处理")
-                if item.候选 in requested_ids:
-                    raise HTTPException(422, "同一候选重复出现")
-                requested_ids.add(item.候选)
-                if not item.对齐 and not item.响度:
-                    continue
-                _, cand_x = _load_track_audio(tr["id"])
-                delay = estimate_delay(ref_x, cand_x)
-                if item.对齐 and not delay.applicable:
+                existing_modes = _processing_modes(db, sample_id)
+                if annotated and (existing_modes or body.处理):
                     raise HTTPException(
-                        422,
-                        f"对齐不可应用（{delay.reason_code}）：{delay.reason}",
+                        409,
+                        "此片段已有评论或评分关联，不能替换试听资产；请创建新任务",
                     )
-                lag = delay.metrics.get("lag", 0) if delay.applicable else 0
-                gain = estimate_gain(ref_x, cand_x, lag, delay.applicable)
-                if item.响度:
-                    if not delay.applicable:
+                if not body.处理:
+                    raise HTTPException(422, "请至少为一个候选选择要应用的处理")
+                _, ref_x = _load_track_audio(body.参考)
+                plans = []
+                requested_ids = set()
+                for item in body.处理:
+                    tr = by_id.get(item.候选)
+                    if not tr:
+                        raise HTTPException(422, "候选不属于当前片段")
+                    if item.候选 == body.参考:
+                        raise HTTPException(422, "参考候选保持原始资产，不需要处理")
+                    if item.候选 in requested_ids:
+                        raise HTTPException(422, "同一候选重复出现")
+                    requested_ids.add(item.候选)
+                    if not item.对齐 and not item.响度:
+                        continue
+                    _, cand_x = _load_track_audio(tr["id"])
+                    delay = estimate_delay(ref_x, cand_x)
+                    if item.对齐 and not delay.applicable:
                         raise HTTPException(
                             422,
-                            f"响度不可应用（{ERR_DELAY_NOT_APPLICABLE}）：{gain.reason}",
+                            f"对齐不可应用（{delay.reason_code}）：{delay.reason}",
                         )
-                    if not gain.applicable:
-                        raise HTTPException(
-                            422,
-                            f"响度不可应用（{gain.reason_code}）：{gain.reason}",
+                    lag = delay.metrics.get("lag", 0) if delay.applicable else 0
+                    gain = estimate_gain(ref_x, cand_x, lag, delay.applicable)
+                    if item.响度:
+                        if not delay.applicable:
+                            raise HTTPException(
+                                422,
+                                f"响度不可应用（{ERR_DELAY_NOT_APPLICABLE}）：{gain.reason}",
+                            )
+                        if not gain.applicable:
+                            raise HTTPException(
+                                422,
+                                f"响度不可应用（{gain.reason_code}）：{gain.reason}",
+                            )
+                    lag_applied = lag if item.对齐 else 0
+                    gain_db = gain.metrics.get("建议增益db", 0.0) if item.响度 else 0.0
+                    derived = apply_gain(
+                        shift_samples(cand_x, lag_applied), gain_db
+                    ).astype(np.float32)
+                    peak_before = float(np.max(np.abs(cand_x))) if len(cand_x) else 0.0
+                    peak_after = float(np.max(np.abs(derived))) if len(derived) else 0.0
+                    wav = encode_float_wav(derived)
+                    plans.append(
+                        (
+                            tr,
+                            {
+                                "模式": (
+                                    "对齐+响度"
+                                    if item.对齐 and item.响度
+                                    else "对齐" if item.对齐 else "响度"
+                                ),
+                                "参考": body.参考,
+                                "lag": lag_applied,
+                                "lag符号定义": LAG_SIGN_DEFINITION,
+                                "gain_db": gain_db,
+                                "原始资产SHA256": json.loads(tr["meta"])["asset_sha256"],
+                                "派生资产SHA256": hashlib.sha256(wav).hexdigest(),
+                                "派生文件": hashlib.sha256(wav).hexdigest() + ".wav",
+                                "算法": ALGORITHM_NAME,
+                                "活动门限": gain.metrics.get("活动门限"),
+                                "活动覆盖": gain.metrics.get("覆盖"),
+                                "共同活动秒": gain.metrics.get("共同活动秒"),
+                                "峰值前": round(peak_before, 6),
+                                "峰值后": round(peak_after, 6),
+                                "处理顺序": PROCESSING_ORDER,
+                                "生成时间": now(),
+                            },
+                            wav,
                         )
-                lag_applied = lag if item.对齐 else 0
-                gain_db = gain.metrics.get("建议增益db", 0.0) if item.响度 else 0.0
-                derived = apply_gain(
-                    shift_samples(cand_x, lag_applied), gain_db
-                ).astype(np.float32)
-                peak_before = float(np.max(np.abs(cand_x))) if len(cand_x) else 0.0
-                peak_after = float(np.max(np.abs(derived))) if len(derived) else 0.0
-                wav = encode_float_wav(derived)
-                plans.append(
-                    (
-                        tr,
-                        {
-                            "模式": ("对齐+响度" if item.对齐 and item.响度 else "对齐" if item.对齐 else "响度"),
-                            "参考": body.参考,
-                            "lag": lag_applied,
-                            "lag符号定义": LAG_SIGN_DEFINITION,
-                            "gain_db": gain_db,
-                            "原始资产SHA256": json.loads(tr["meta"])["asset_sha256"],
-                            "派生资产SHA256": hashlib.sha256(wav).hexdigest(),
-                            "派生文件": hashlib.sha256(wav).hexdigest() + ".wav",
-                            "算法": ALGORITHM_NAME,
-                            "活动门限": gain.metrics.get("活动门限"),
-                            "活动覆盖": gain.metrics.get("覆盖"),
-                            "共同活动秒": gain.metrics.get("共同活动秒"),
-                            "峰值前": round(peak_before, 6),
-                            "峰值后": round(peak_after, 6),
-                            "处理顺序": PROCESSING_ORDER,
-                            "生成时间": now(),
-                        },
-                        wav,
                     )
-                )
-            if not plans:
-                raise HTTPException(422, "没有需要应用的处理")
-            created = []
-            try:
+                if not plans:
+                    raise HTTPException(422, "没有需要应用的处理")
                 for _, proc, wav in plans:
+                    # 文件名只能由服务端计算的 SHA 派生，内容寻址且幂等。
                     path = assets / proc["派生文件"]
                     if not path.exists():
                         path.write_bytes(wav)
-                        created.append(path)
+                        created_files.append(path)
                 for tr, proc, _ in plans:
                     db.execute(
                         "INSERT OR REPLACE INTO track_processing VALUES(?,?)",
                         (tr["id"], json.dumps(proc, ensure_ascii=False)),
                     )
-            except Exception:
-                for path in created:
+                db.commit()
+            except BaseException:
+                # 补偿：回滚数据库并删除本次新建、尚未提交引用的文件。
+                db.rollback()
+                for path in created_files:
                     path.unlink(missing_ok=True)
                 raise
+            finally:
+                db.close()
+            # 提交成功后回收不再被任何 track_processing 行引用的旧派生文件。
+            with connect(database) as db:
+                referenced_after = _referenced_derived_files(db)
+            for name in referenced_before - referenced_after:
+                _unlink_derived(name)
             return {
                 "已应用": [
                     {
@@ -1456,40 +1498,50 @@ def create_app(
     @app.post("/api/samples/{sample_id}/restore-processing")
     def restore_sample_processing(sample_id: str, request: Request):
         u = user(request)
-        with mutation_lock, connect(database) as db:
-            _ = _sample_managers_only(db, sample_id, u)
-            rows = db.execute(
-                "SELECT tp.track_id, tp.data FROM track_processing tp "
-                "JOIN tracks tr ON tr.id=tp.track_id WHERE tr.sample_id=?",
-                (sample_id,),
-            ).fetchall()
-            if not rows:
-                raise HTTPException(409, "当前片段没有已应用的处理")
-            annotated = (
-                db.execute(
+        with mutation_lock:
+            # 手工事务：先提交数据库删除，成功后才回收文件；提交失败时
+            # 回滚，原 DB 引用的派生资产保持完整可播放。
+            db = sqlite3.connect(database, timeout=15)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            try:
+                _ = _sample_managers_only(db, sample_id, u)
+                rows = db.execute(
+                    "SELECT tp.track_id, tp.data FROM track_processing tp "
+                    "JOIN tracks tr ON tr.id=tp.track_id WHERE tr.sample_id=?",
+                    (sample_id,),
+                ).fetchall()
+                if not rows:
+                    raise HTTPException(409, "当前片段没有已应用的处理")
+                annotated = db.execute(
                     "SELECT 1 FROM comments WHERE sample_id=? LIMIT 1", (sample_id,)
-                ).fetchone()
-                or db.execute(
+                ).fetchone() or db.execute(
                     "SELECT 1 FROM ratings WHERE sample_id=? LIMIT 1", (sample_id,)
                 ).fetchone()
-            )
-            if annotated:
-                raise HTTPException(
-                    409,
-                    "此片段已有评论或评分关联，不能替换试听资产；请创建新任务",
-                )
-            for row in rows:
-                db.execute("DELETE FROM track_processing WHERE track_id=?", (row["track_id"],))
-            remaining = {
-                json.loads(r[0])["派生文件"]
-                for r in db.execute("SELECT data FROM track_processing").fetchall()
-            }
-            for row in rows:
-                derived = json.loads(row["data"])["派生文件"]
-                path = assets / derived
-                if derived not in remaining and path.exists():
-                    path.unlink()
-            return {"已恢复": [row["track_id"] for row in rows]}
+                if annotated:
+                    raise HTTPException(
+                        409,
+                        "此片段已有评论或评分关联，不能替换试听资产；请创建新任务",
+                    )
+                referenced_before = _referenced_derived_files(db)
+                restored_ids = [row["track_id"] for row in rows]
+                for row in rows:
+                    db.execute(
+                        "DELETE FROM track_processing WHERE track_id=?",
+                        (row["track_id"],),
+                    )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+            # 提交成功后回收不再被任何 track_processing 行引用的派生文件。
+            with connect(database) as db:
+                referenced_after = _referenced_derived_files(db)
+            for name in referenced_before - referenced_after:
+                _unlink_derived(name)
+            return {"已恢复": restored_ids}
 
     @app.get("/api/tasks/{task_id}/processing-summary")
     def task_processing_summary(task_id: str, request: Request):

@@ -26,7 +26,7 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, type Analysis, type Sample, type Task, type User } from './types';
-import { distinctChoices, formatShare, shareWidth, type ReportPayload } from './review';
+import { distinctChoices, formatShare, lagText, shareWidth, type ReportPayload } from './review';
 import packageInfo from '../package.json';
 import { TeamMembers } from './TeamMembers';
 import { UserGuide } from './UserGuide';
@@ -1024,7 +1024,7 @@ function App() {
                               <span className="proc-badge">
                                 派生试听 ·{' '}
                                 {tr.处理.模式 === '对齐+响度' || tr.处理.模式 === '对齐'
-                                  ? `对齐 ${tr.处理.lag > 0 ? '+' : ''}${tr.处理.lag} samples（前移）`
+                                  ? `对齐 ${lagText(tr.处理.lag).samples}（${lagText(tr.处理.lag).direction}）`
                                   : '时间位置未变'}
                                 {tr.处理.模式 === '对齐+响度' || tr.处理.模式 === '响度'
                                   ? ` · 活动段 RMS ${tr.处理.gain_db > 0 ? '+' : ''}${tr.处理.gain_db.toFixed(2)} dB`

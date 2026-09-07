@@ -1,6 +1,7 @@
 """恒定延迟与活动段 RMS 匹配判据的纯算法验证；信号全部运行时合成。"""
 
 import numpy as np
+import pytest
 
 from workbench.align import (
     ERR_ACTIVITY_INSUFFICIENT,
@@ -133,8 +134,9 @@ def test_loudness_known_6db_measured_and_applied():
 
 def test_activity_coverage_below_10pct_rejected():
     ref = np.zeros(96000)
-    # 4 个 1024 样本的帧对齐突发：共同活动 8 帧（≥0.5 秒）但覆盖 <10%。
-    for start in (24064, 44544, 65024, 85496):
+    # 9 个 1024 样本突发：不重复活动支持 9216 samples（0.576 s ≥0.5 s），
+    # 但覆盖 9.6% <10%，必须因覆盖不足拒绝。
+    for start in (0, 10240, 20480, 30720, 40960, 51200, 61440, 71680, 81920):
         ref[start : start + 1024] = broadband(seed=start, n=1024, peak=0.4)
     cand = shifted(ref, 0, -1.0)
     d = estimate_delay(ref, cand)
@@ -206,3 +208,30 @@ def test_loudness_uses_reference_mask_only():
     g = estimate_gain(ref, cand, d.metrics["lag"], True)
     assert g.applicable
     assert abs(g.metrics["建议增益db"] - (-6.0)) <= 0.2
+
+
+def test_overlapping_frames_do_not_inflate_activity_seconds():
+    """反例：活动帧并集按非重复非静音样本计，0.176 s 不得被放行为 0.512 s。"""
+    n = 27200
+    ref = np.zeros(n)
+    ref[8000:10816] = broadband(seed=30, n=2816, peak=0.4)
+    # 直接以 delay_applicable=True 调用，隔离活动时长口径本身。
+    g = estimate_gain(ref, ref.copy(), 0, True)
+    assert not g.applicable and g.reason_code == ERR_ACTIVITY_INSUFFICIENT
+    # 非重复、非静音支持 = 2816 samples = 0.176 s（帧重叠不再重复计数）。
+    assert g.metrics["有效活动样本数"] == 2816
+    assert g.metrics["共同活动秒"] == pytest.approx(2816 / 16000)
+    assert g.metrics["覆盖"] == round(2816 / 27200, 4)
+
+
+def test_activity_boundary_exactly_half_second_applicable():
+    """边界例：不重复支持恰好 0.5 s 且覆盖 ≥10%，判据为可应用。"""
+    n = 27200
+    ref = np.zeros(n)
+    for a, b in ((2000, 5000), (11000, 13000), (19000, 22000)):
+        ref[a:b] = broadband(seed=a, n=b - a, peak=0.4)
+    assert np.count_nonzero(ref) == 8000  # 8000 / 16000 = 0.5 s
+    g = estimate_gain(ref, ref.copy(), 0, True)
+    assert g.applicable and g.reason_code == OK
+    assert g.metrics["共同活动秒"] == pytest.approx(0.5)
+    assert g.metrics["覆盖"] >= 0.10

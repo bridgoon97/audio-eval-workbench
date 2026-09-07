@@ -12,6 +12,7 @@ import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 
+from workbench import app as app_module
 from workbench.app import create_app, csv_safe
 from workbench.audio import decode_audio, demo_wav, encode_float_wav
 
@@ -1509,3 +1510,156 @@ def test_backup_includes_derived_assets(env):
     c = TestClient(restored)
     c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
     assert c.get(f"/api/audio/{ids[1]}").content == served
+
+
+def test_processed_track_cannot_be_reference(env):
+    """已处理轨不得作参考：分析/应用稳定 409 且无副作用；原始轨可继续作参考。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "参考守卫", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+
+    def snapshot():
+        files = {p.name for p in (folder / "assets").iterdir()}
+        with sqlite3.connect(folder / "workbench.sqlite3") as db:
+            rows = db.execute(
+                "SELECT track_id, data FROM track_processing"
+            ).fetchall()
+        return files, {r[0]: json.loads(r[1])["派生资产SHA256"] for r in rows}
+
+    before = snapshot()
+    analyze_body = f"/api/samples/{s}/alignment?reference={ids[1]}"
+    rejected_analysis = a.get(analyze_body)
+    assert rejected_analysis.status_code == 409
+    assert "恢复全部原始音频" in rejected_analysis.text
+    rejected_apply = a.post(
+        f"/api/samples/{s}/processing",
+        json={"参考": ids[1], "处理": [{"候选": ids[2], "对齐": False, "响度": True}]},
+    )
+    assert rejected_apply.status_code == 409
+    assert "恢复全部原始音频" in rejected_apply.text
+    assert snapshot() == before
+    # 仍为原始的 A 继续作为参考正常工作。
+    assert a.get(f"/api/samples/{s}/alignment?reference={ids[0]}").status_code == 200
+
+
+class _CommitFailProxy:
+    def __init__(self, conn):
+        self._conn = conn
+
+    @property
+    def row_factory(self):
+        return self._conn.row_factory
+
+    @row_factory.setter
+    def row_factory(self, value):
+        self._conn.row_factory = value
+
+    def commit(self):
+        raise OSError("injected commit failure")
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class _FakeSqlite:
+    Row = sqlite3.Row
+
+    @staticmethod
+    def connect(path, timeout=15):
+        return _CommitFailProxy(sqlite3.connect(path, timeout=timeout))
+
+
+def test_apply_commit_failure_compensates_files_and_db(env, monkeypatch):
+    """注入真实 commit 失败：应用不留无引用新文件，DB 行与试听不变。"""
+    app, a, folder = env
+    t = a.post("/api/tasks", json={"title": "提交失败补偿", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        first_sha = json.loads(
+            db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+            ).fetchone()[0]
+        )["派生资产SHA256"]
+    served_before = a.get(f"/api/audio/{ids[1]}").content
+    files_before = {p.name for p in (folder / "assets").iterdir()}
+
+    monkeypatch.setattr(app_module, "sqlite3", _FakeSqlite)
+    strict = TestClient(app, raise_server_exceptions=False)
+    strict.cookies.update(a.cookies)
+    # 换一种处理（只对齐）：会生成新的派生文件，随后 commit 失败。
+    changed = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": False}]}
+    assert strict.post(f"/api/samples/{s}/processing", json=changed).status_code == 500
+
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        row = db.execute(
+            "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+        ).fetchone()
+    assert row is not None
+    assert json.loads(row[0])["派生资产SHA256"] == first_sha
+    assert {p.name for p in (folder / "assets").iterdir()} == files_before
+    assert a.get(f"/api/audio/{ids[1]}").content == served_before
+
+
+def test_restore_commit_failure_keeps_playable_asset(env, monkeypatch):
+    """注入真实 commit 失败：恢复回滚，DB 引用的派生资产仍可播放。"""
+    application, a, folder = env
+    t = a.post("/api/tasks", json={"title": "恢复补偿", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    served = a.get(f"/api/audio/{ids[1]}").content
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        derived_name = json.loads(
+            db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+            ).fetchone()[0]
+        )["派生文件"]
+
+    monkeypatch.setattr(app_module, "sqlite3", _FakeSqlite)
+    strict = TestClient(application, raise_server_exceptions=False)
+    strict.cookies.update(a.cookies)
+    assert strict.post(f"/api/samples/{s}/restore-processing").status_code == 500
+
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        row = db.execute(
+            "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+        ).fetchone()
+    assert row is not None
+    assert (folder / "assets" / derived_name).exists()
+    assert a.get(f"/api/audio/{ids[1]}").content == served
+
+
+def test_replacement_reclaims_old_derived_file(env):
+    """不同处理替换同一轨：旧派生文件被回收，当前派生可播放。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "替换回收", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    first = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=first).status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        first_name = json.loads(
+            db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+            ).fetchone()[0]
+        )["派生文件"]
+    served_first = a.get(f"/api/audio/{ids[1]}").content
+
+    second = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": False}]}
+    assert a.post(f"/api/samples/{s}/processing", json=second).status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        second_proc = json.loads(
+            db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+            ).fetchone()[0]
+        )
+    assert second_proc["模式"] == "对齐" and second_proc["gain_db"] == 0.0
+    second_name = second_proc["派生文件"]
+    assert second_name != first_name
+    assert (folder / "assets" / second_name).exists()
+    assert not (folder / "assets" / first_name).exists()
+    assert a.get(f"/api/audio/{ids[1]}").content != served_first
+    assert a.get(f"/api/audio/{ids[1]}").content == (folder / "assets" / second_name).read_bytes()

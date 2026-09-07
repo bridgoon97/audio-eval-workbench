@@ -715,6 +715,8 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   for (let i = 0; i < n; i++) ref[i] = (ref[i] / peak) * 0.5;
   const delayed = new Float32Array(n);
   for (let i = 320; i < n; i++) delayed[i] = ref[i - 320] * 0.7;
+  const advanced = new Float32Array(n);
+  for (let i = 0; i < n - 157; i++) advanced[i] = ref[i + 157] * 0.9;
   const sine = new Float32Array(n);
   for (let i = 0; i < n; i++) sine[i] = 0.5 * Math.sin((2 * Math.PI * 100 * i) / 16000);
   const wav = (x: Float32Array) => {
@@ -750,6 +752,7 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   for (const [name, data] of [
     ['参考宽带', wav(ref)],
     ['延迟衰减', wav(delayed)],
+    ['提前157', wav(advanced)],
     ['周期纯音', wav(sine)],
   ] as const) {
     const track = await (
@@ -773,6 +776,14 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
     '320 samples',
   );
   await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText('建议');
+  // 负 lag 渲染：-157 samples、早到、应用后移，符号不出现 "+-" 或 "--"。
+  const advancedRow = page.locator('.proc-row').filter({ hasText: '提前157' });
+  await expect(advancedRow).toContainText('-157 samples');
+  await expect(advancedRow).toContainText('-9.8 ms');
+  await expect(advancedRow).toContainText('候选早到，应用时后移');
+  const advancedText = await advancedRow.textContent();
+  expect(advancedText).not.toContain('+-');
+  expect(advancedText).not.toContain('--');
   const rejectedRow = page.locator('.proc-row').filter({ hasText: '周期纯音' });
   await expect(rejectedRow.locator('.rejected').first()).toContainText('ERR_LOW_CORRELATION');
   await expect(rejectedRow.locator('.rejected').nth(1)).toContainText('ERR_DELAY_NOT_APPLICABLE');
@@ -785,7 +796,9 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await expect(page.locator('.proc-summary')).toContainText('活动段 RMS 固定增益（后）');
   await page.getByRole('button', { name: '确认应用所选处理' }).click();
   await expect(page.locator('.proc-live').first()).toContainText('派生试听');
-  await expect(page.locator('.proc-live').first()).toContainText('对齐 +320 samples（前移）');
+  await expect(page.locator('.proc-live').first()).toContainText(
+    '对齐 +320 samples（候选晚到，应用时前移）',
+  );
 
   // 恢复原始 → 再应用。
   await page.getByRole('button', { name: '对齐与响度' }).click();

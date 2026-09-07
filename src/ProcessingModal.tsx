@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Check, X } from 'lucide-react';
 import { api, type Track } from './types';
+import { lagText } from './review';
 
 type Verdict = {
   可应用?: boolean;
@@ -20,8 +21,6 @@ type Verdict = {
 };
 type Entry = { track_id: string; 名称: string; 角色: string; 延迟: Verdict; 响度: Verdict };
 type Selection = Record<string, { 对齐: boolean; 响度: boolean }>;
-
-const ms = (lag: number) => `(+${(lag / 16).toFixed(1)} ms)`;
 
 export function ProcessingModal({
   sample,
@@ -98,12 +97,14 @@ export function ProcessingModal({
         参考候选（保持原始，0 samples / 0 dB）
         <select value={reference} onChange={(e) => setReference(e.target.value)}>
           {tracks.map((t) => (
-            <option key={t.id} value={t.id}>
+            <option key={t.id} value={t.id} disabled={!!t.处理}>
               {t.name}
+              {t.处理 ? '（已有派生处理，先恢复原始）' : ''}
             </option>
           ))}
         </select>
       </label>
+      <small>已应用派生处理的候选不能作参考：请先恢复全部原始音频，再更换参考。</small>
       <button className="full" disabled={busy || !reference} onClick={analyze}>
         {busy && !entries ? '分析中…' : '开始分析'}
       </button>
@@ -133,7 +134,8 @@ export function ProcessingModal({
                   <dd>
                     {d.可应用 ? (
                       <>
-                        {d.lag} samples {ms(d.lag || 0)} · 相关峰 {d.相关峰} · 旁瓣比 {d.峰旁瓣比} ·
+                        {lagText(d.lag || 0).samples}（{lagText(d.lag || 0).ms}）·{' '}
+                        {lagText(d.lag || 0).direction} · 相关峰 {d.相关峰} · 旁瓣比 {d.峰旁瓣比} ·
                         窗口 lag {d.窗口lag?.join('/')}（极差 {d.极差}）
                       </>
                     ) : (

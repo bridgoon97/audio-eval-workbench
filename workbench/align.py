@@ -5,7 +5,8 @@
   聚合峰 ≥0.55；峰旁瓣比 ≥1.5；lag 不触边界。正 lag 表示候选相对参考晚到
   N samples，应用时前移 N samples（端部补零/裁切，长度不变）。
 - 响度：参考轨活动掩码（帧长 1024 / 跳步 512，阈值 = 参考帧 RMS 90 分位
-  ×0.25，且 ≥1e-4 满刻度）；共同有效活动 ≥0.5 s 且覆盖 ≥10%；固定增益
+  ×0.25，且 ≥1e-4 满刻度）；活动时长与覆盖按活动帧并集内非静音样本数计
+  （帧重叠不重复计数），共同有效活动 ≥0.5 s 且覆盖 ≥10%；固定增益
   ≤±12 dB；应用后预测峰值 ≤−1 dBFS。全部计算以 1.0 = 0 dBFS 的 float64。
 - 处理顺序固定：先整数采样对齐，再固定增益。不做时间拉伸、漂移修复、
   逐帧增益、重采样或任何逐帧调节。
@@ -26,7 +27,7 @@ HOP = 512
 ACTIVITY_QUANTILE = 0.9
 ACTIVITY_FACTOR = 0.25
 ACTIVITY_FLOOR = 1e-4
-MIN_COMMON_ACTIVE_FRAMES = max(1, int(np.ceil(8000 / FRAME)))  # ≥0.5 s
+MIN_COMMON_ACTIVE_SECONDS = 0.5
 MIN_COVERAGE = 0.10
 MAX_GAIN_DB = 12.0
 MAX_PEAK = 10 ** (-1 / 20)
@@ -209,23 +210,33 @@ def estimate_gain(ref, cand, lag, delay_applicable):
     quantile = float(np.quantile(ref_rms_frames, ACTIVITY_QUANTILE))
     threshold = max(quantile * ACTIVITY_FACTOR, ACTIVITY_FLOOR)
     active = ref_rms_frames >= threshold
-    total_frames = len(ref_rms_frames)
-    active_count = int(active.sum())
-    coverage = active_count / total_frames if total_frames else 0.0
-    common_seconds = active_count * FRAME / 16000.0
+    # 不重复样本掩码：活动帧区间求并集（帧长 1024、跳步 512，重叠只计一次），
+    # 剔除帧内静音样本（|样本| ≤ 1e-6），并限制在可比较区间内。
+    mask = np.zeros(n, dtype=bool)
+    for i in np.nonzero(active)[0]:
+        start = i * HOP
+        mask[start : start + FRAME] = True
+    lo = max(0, -lag)
+    hi = n - max(0, lag)
+    comparable_span = max(0, hi - lo)
+    span_mask = np.zeros(n, dtype=bool)
+    if comparable_span:
+        span_mask[lo:hi] = True
+    effective = mask & span_mask & (np.abs(ref) > 1e-6)
+    union_count = int(effective.sum())
+    coverage = union_count / comparable_span if comparable_span else 0.0
+    common_seconds = union_count / 16000.0
     metrics = {
         "建议增益db": 0.0,
         "活动门限": round(threshold, 6),
-        "活动帧": active_count,
-        "总帧数": total_frames,
+        "有效活动样本数": union_count,
+        "可比较样本数": comparable_span,
         "覆盖": round(coverage, 4),
         "共同活动秒": round(common_seconds, 3),
     }
-    if active_count < MIN_COMMON_ACTIVE_FRAMES or coverage < MIN_COVERAGE:
+    if common_seconds < MIN_COMMON_ACTIVE_SECONDS or coverage < MIN_COVERAGE:
         return _fail(ERR_ACTIVITY_INSUFFICIENT, **metrics)
-    positions = np.concatenate(
-        [np.arange(i * HOP, i * HOP + FRAME) for i in np.nonzero(active)[0]]
-    )
+    positions = np.nonzero(effective)[0]
     ref_energy = float(ref[positions] @ ref[positions])
     cand_energy = float(aligned[positions] @ aligned[positions])
     gain_db = float(
@@ -233,8 +244,12 @@ def estimate_gain(ref, cand, lag, delay_applicable):
     )  # 不做钳制：超出 ±12 dB 必须原样进入拒绝判定。
     predicted = float(np.max(np.abs(aligned))) * (10 ** (gain_db / 20.0)) if len(aligned) else 0.0
     metrics["建议增益db"] = round(gain_db, 3)
-    metrics["参考活动RMSdbfs"] = round(20 * np.log10(max(np.sqrt(ref_energy / len(positions)), RMS_FLOOR)), 2)
-    metrics["候选活动RMSdbfs"] = round(20 * np.log10(max(np.sqrt(cand_energy / len(positions)), RMS_FLOOR)), 2)
+    metrics["参考活动RMSdbfs"] = round(
+        20 * np.log10(max(np.sqrt(ref_energy / union_count), RMS_FLOOR)), 2
+    )
+    metrics["候选活动RMSdbfs"] = round(
+        20 * np.log10(max(np.sqrt(cand_energy / union_count), RMS_FLOOR)), 2
+    )
     metrics["预测峰值"] = round(predicted, 4)
     if abs(gain_db) > MAX_GAIN_DB:
         return _fail(ERR_GAIN_TOO_LARGE, **metrics)

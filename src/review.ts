@@ -45,3 +45,20 @@ export function shareWidth(count: number, denominator: number): string {
 export function distinctChoices(votes: VoteRow[]): number {
   return votes.filter((vote) => vote.票数 > 0).length;
 }
+
+// 对齐 lag 的统一符号与方向文案：+N＝候选晚到、应用前移；-N＝候选早到、
+// 应用后移；0＝无需移动。samples 与 ms 共用同一符号函数，不出现 "+-"、"--"。
+export function lagText(lag: number): {
+  samples: string;
+  ms: string;
+  direction: string;
+} {
+  if (lag === 0) return { samples: '0 samples', ms: '0 ms', direction: '无需移动' };
+  const sign = lag > 0 ? '+' : '-';
+  const magnitude = Math.abs(lag);
+  return {
+    samples: `${sign}${magnitude} samples`,
+    ms: `${sign}${(magnitude / 16).toFixed(1)} ms`,
+    direction: lag > 0 ? '候选晚到，应用时前移' : '候选早到，应用时后移',
+  };
+}
