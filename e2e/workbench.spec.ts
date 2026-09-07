@@ -237,7 +237,7 @@ test('角色指南默认入口、章节搜索、完整下载与窄屏阅读', as
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toBe('听鉴分角色使用手册.md');
   const markdown = fs.readFileSync((await download.path())!, 'utf8');
-  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.5.0'])
+  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.6.0'])
     expect(markdown).toContain(text);
   const footer = await page.locator('.guide-footer').boundingBox();
   expect(footer!.y + footer!.height).toBeLessThanOrEqual(768);
@@ -354,7 +354,7 @@ test('同事不刷新网页即可收到角色和任务变化，保留未提交�
     });
     await expect(colleague.locator('#comment')).toHaveValue('尚未提交的听感不能被自动刷新清空');
     await expect(colleague.getByLabel('起点', { exact: true })).toHaveValue('1.2');
-    await colleague.getByRole('button', { name: '服务信息 · 0.5.0' }).click();
+    await colleague.getByRole('button', { name: '服务信息 · 0.6.0' }).click();
     await expect(colleague.getByText('数据编号', { exact: true })).toBeVisible();
     await expect(colleague.getByText('数据目录（仅管理员可见）')).toHaveCount(0);
     await colleague.keyboard.press('Escape');
@@ -378,7 +378,7 @@ test('服务与网页版本不一致时给出明确刷新提示', async ({ page 
     route.fulfill({ json: { needs_setup: false, version: '0.3.0' } }),
   );
   await page.goto('/');
-  await expect(page.getByRole('alert')).toContainText('页面版本 0.5.0 与服务版本 0.3.0 不一致');
+  await expect(page.getByRole('alert')).toContainText('页面版本 0.6.0 与服务版本 0.3.0 不一致');
   await expect(page.getByRole('button', { name: '重新加载页面' })).toBeVisible();
 });
 
