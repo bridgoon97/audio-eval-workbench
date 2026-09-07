@@ -795,8 +795,10 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await expect(page.locator('.proc-summary')).toContainText('整数采样对齐（先）');
   await expect(page.locator('.proc-summary')).toContainText('活动段 RMS 固定增益（后）');
   await page.getByRole('button', { name: '确认应用所选处理' }).click();
-  await expect(page.locator('.proc-live').first()).toContainText('派生试听');
-  await expect(page.locator('.proc-live').first()).toContainText(
+  // 候选顺序按用户匿名映射随机：先定位明确候选名所在的 .track，再查其派生徽标。
+  const processedTrackCard = page.locator('.track', { hasText: '延迟衰减' });
+  await expect(processedTrackCard.locator('.proc-live')).toContainText('派生试听');
+  await expect(processedTrackCard.locator('.proc-live')).toContainText(
     '对齐 +320 samples（候选晚到，应用时前移）',
   );
 
@@ -808,7 +810,7 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
     '320 samples',
   );
   await page.getByRole('button', { name: '确认应用所选处理' }).click();
-  await expect(page.locator('.proc-live').first()).toContainText('派生试听');
+  await expect(processedTrackCard.locator('.proc-live')).toContainText('派生试听');
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByRole('button', { name: '恢复原始处理' }).click();
   await expect(page.locator('.proc-live')).toHaveCount(0);
@@ -819,7 +821,7 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
     '320 samples',
   );
   await page.getByRole('button', { name: '确认应用所选处理' }).click();
-  await expect(page.locator('.proc-live').first()).toContainText('派生试听');
+  await expect(processedTrackCard.locator('.proc-live')).toContainText('派生试听');
 
   // 发布确认显示混合处理与被拒绝建议；发布后冻结。
   await page.getByRole('button', { name: '发布评测', exact: true }).click();
