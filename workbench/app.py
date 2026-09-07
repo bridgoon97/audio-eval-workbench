@@ -13,12 +13,25 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
+import numpy as np
+import soundfile as sf
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .audio import analyze, decode_audio, demo_wav
+from .align import (
+    ALGORITHM_NAME,
+    ERR_DELAY_NOT_APPLICABLE,
+    LAG_SIGN_DEFINITION,
+    PROCESSING_ORDER,
+    REASONS,
+    apply_gain,
+    estimate_delay,
+    estimate_gain,
+    shift_samples,
+)
+from .audio import analyze, decode_audio, demo_wav, encode_float_wav
 from .db import connect, init, password_hash, verify
 from .version import VERSION
 
@@ -217,6 +230,44 @@ def results_csv(value) -> bytes:
                     note,
                 ]
             )
+    for sample in samples:
+        summary = sample.get("处理摘要") or {}
+        for track in sample["tracks"]:
+            proc = track.get("处理口径")
+            if not isinstance(proc, dict):
+                continue
+            rows.append(
+                [
+                    "处理口径",
+                    track["id"],
+                    sample["id"],
+                    sample["name"],
+                    proc["模式"],
+                    "",
+                    proc["lag"],
+                    "",
+                    "",
+                    (
+                        f"增益 {proc['增益db']:+.2f} dB；参考 {proc['参考track']}；"
+                        f"{proc['算法']}；派生SHA256 {proc['派生资产SHA256']}"
+                    ),
+                ]
+            )
+        for rejection in summary.get("拒绝建议", []):
+            rows.append(
+                [
+                    "处理口径",
+                    "",
+                    sample["id"],
+                    sample["name"],
+                    rejection["候选"],
+                    "",
+                    "",
+                    "",
+                    "",
+                    f"{rejection['判据']}建议被拒绝（{rejection['拒绝码']}）：{rejection['原因']}",
+                ]
+            )
     for tag in value["标签汇总"]:
         location = "；".join(
             f"{part['名称']}（ID：{part['ID']}，{part['根评论数']} 条）" for part in tag["片段"]
@@ -311,7 +362,34 @@ def results_markdown(value) -> str:
                 f"{share_text(vote['票数'], sample['分母'])} | {option_id} |"
             )
         lines.append("")
-    lines += ["## 问题标签汇总", "", "仅统计根评论，回复楼层不计入。", ""]
+    lines += [
+        "## 处理口径",
+        "",
+        "派生试听资产按「先整数采样对齐，再固定增益」生成；原始 WAV 未修改。",
+        "活动段 RMS 匹配不是 LUFS/ITU BS.1770 响度校准，也不是听感等响。",
+        "",
+    ]
+    processed_any = False
+    for sample in value["样本"]:
+        summary = sample.get("处理摘要") or {}
+        for track in sample["tracks"]:
+            proc = track.get("处理口径")
+            if not isinstance(proc, dict):
+                continue
+            processed_any = True
+            lines.append(
+                f"- {md_cell(sample['name'])} / {md_cell(track['name'])}：{proc['模式']}；"
+                f"lag {proc['lag']:+d} samples（{proc['lag符号定义']}）；"
+                f"增益 {proc['增益db']:+.2f} dB；派生 SHA256 `{proc['派生资产SHA256']}`。"
+            )
+        for rejection in summary.get("拒绝建议", []):
+            lines.append(
+                f"- {md_cell(sample['name'])} / {md_cell(rejection['候选'])}："
+                f"{rejection['判据']}建议被拒绝（{rejection['拒绝码']}）——{rejection['原因']}。"
+            )
+    if not processed_any:
+        lines.append("全部候选为原始音频，无派生处理。")
+    lines += ["", "## 问题标签汇总", "", "仅统计根评论，回复楼层不计入。", ""]
     if value["标签汇总"]:
         lines += ["| 标签 | 根评论数 | 涉及片段 |", "| --- | --- | --- |"]
         for tag in value["标签汇总"]:
@@ -1158,6 +1236,312 @@ def create_app(
             db.execute("UPDATE tasks SET status='closed' WHERE id=?", (task_id,))
         return {"ok": True}
 
+    def _load_track_audio(track_id):
+        with connect(database) as db:
+            tr = db.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
+        if not tr:
+            raise HTTPException(404, "候选不存在")
+        path = assets / tr["path"]
+        if not path.exists():
+            raise HTTPException(409, "音频资产缺失，请联系组织者恢复备份")
+        data, _ = sf.read(path, dtype="float64")
+        return tr, data
+
+    def _sample_managers_only(db, sample_id, u, require_draft=True):
+        s, t = sample_access(db, sample_id, u)
+        if not t["can_manage"]:
+            raise HTTPException(403, "仅任务管理者可以操作对齐与响度")
+        if require_draft and t["status"] != "draft":
+            raise HTTPException(409, "发布后播放处理冻结，不能分析或修改")
+        return s, t
+
+    def _processing_modes(db, sample_id):
+        rows = db.execute(
+            "SELECT tp.track_id, tp.data FROM track_processing tp "
+            "JOIN tracks tr ON tr.id=tp.track_id WHERE tr.sample_id=?",
+            (sample_id,),
+        ).fetchall()
+        return {r["track_id"]: json.loads(r["data"]) for r in rows}
+
+    def _analysis_rows(db, sample_id):
+        rows = db.execute(
+            "SELECT ta.track_id, ta.data FROM track_analysis ta "
+            "JOIN tracks tr ON tr.id=ta.track_id WHERE tr.sample_id=?",
+            (sample_id,),
+        ).fetchall()
+        return {r["track_id"]: json.loads(r["data"]) for r in rows}
+
+    @app.get("/api/samples/{sample_id}/alignment")
+    def analyze_sample_alignment(sample_id: str, request: Request, reference: str = ""):
+        u = user(request)
+        with connect(database) as db:
+            s, _ = _sample_managers_only(db, sample_id, u)
+            tracks = db.execute(
+                "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid", (sample_id,)
+            ).fetchall()
+            by_id = {tr["id"]: tr for tr in tracks}
+            if reference not in by_id:
+                raise HTTPException(422, "参考候选必须属于当前片段")
+        ref_track, ref_x = _load_track_audio(reference)
+        results = []
+        persist = []
+        for tr in tracks:
+            if tr["id"] == reference:
+                results.append(
+                    {
+                        "track_id": tr["id"],
+                        "名称": tr["name"],
+                        "角色": "参考",
+                        "延迟": {"lag": 0, "可应用": True, "拒绝码": None},
+                        "响度": {"建议增益db": 0.0, "可应用": True, "拒绝码": None},
+                    }
+                )
+                continue
+            _, cand_x = _load_track_audio(tr["id"])
+            delay = estimate_delay(ref_x, cand_x)
+            lag = delay.metrics.get("lag", 0) if delay.applicable else 0
+            gain = estimate_gain(ref_x, cand_x, lag, delay.applicable)
+            entry = {
+                "track_id": tr["id"],
+                "名称": tr["name"],
+                "角色": "候选",
+                "延迟": dict(delay.as_dict(), lag符号定义=LAG_SIGN_DEFINITION),
+                "响度": gain.as_dict(),
+            }
+            results.append(entry)
+            persist.append((tr["id"], entry))
+        with mutation_lock, connect(database) as db:
+            for track_id, entry in persist:
+                db.execute(
+                    "INSERT OR REPLACE INTO track_analysis VALUES(?,?)",
+                    (track_id, json.dumps({"参考": reference, **entry, "生成时间": now()}, ensure_ascii=False)),
+                )
+        return {"片段": s["name"], "参考": {"track_id": reference, "名称": ref_track["name"]}, "候选": results}
+
+    class ProcessingItem(BaseModel):
+        候选: str
+        对齐: bool = False
+        响度: bool = False
+
+    class ProcessingInput(BaseModel):
+        参考: str
+        处理: Annotated[list[ProcessingItem], Field(default_factory=list, max_length=6)]
+
+    @app.post("/api/samples/{sample_id}/processing")
+    def apply_sample_processing(sample_id: str, body: ProcessingInput, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            _ = _sample_managers_only(db, sample_id, u)
+            tracks = db.execute(
+                "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid", (sample_id,)
+            ).fetchall()
+            by_id = {tr["id"]: tr for tr in tracks}
+            if body.参考 not in by_id:
+                raise HTTPException(422, "参考候选必须属于当前片段")
+            annotated = (
+                db.execute(
+                    "SELECT 1 FROM comments WHERE sample_id=? LIMIT 1", (sample_id,)
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM ratings WHERE sample_id=? LIMIT 1", (sample_id,)
+                ).fetchone()
+            )
+            existing = _processing_modes(db, sample_id)
+            if annotated and (existing or body.处理):
+                raise HTTPException(
+                    409,
+                    "此片段已有评论或评分关联，不能替换试听资产；请创建新任务",
+                )
+            if not body.处理:
+                raise HTTPException(422, "请至少为一个候选选择要应用的处理")
+            _, ref_x = _load_track_audio(body.参考)
+            plans = []
+            requested_ids = set()
+            for item in body.处理:
+                tr = by_id.get(item.候选)
+                if not tr:
+                    raise HTTPException(422, "候选不属于当前片段")
+                if item.候选 == body.参考:
+                    raise HTTPException(422, "参考候选保持原始资产，不需要处理")
+                if item.候选 in requested_ids:
+                    raise HTTPException(422, "同一候选重复出现")
+                requested_ids.add(item.候选)
+                if not item.对齐 and not item.响度:
+                    continue
+                _, cand_x = _load_track_audio(tr["id"])
+                delay = estimate_delay(ref_x, cand_x)
+                if item.对齐 and not delay.applicable:
+                    raise HTTPException(
+                        422,
+                        f"对齐不可应用（{delay.reason_code}）：{delay.reason}",
+                    )
+                lag = delay.metrics.get("lag", 0) if delay.applicable else 0
+                gain = estimate_gain(ref_x, cand_x, lag, delay.applicable)
+                if item.响度:
+                    if not delay.applicable:
+                        raise HTTPException(
+                            422,
+                            f"响度不可应用（{ERR_DELAY_NOT_APPLICABLE}）：{gain.reason}",
+                        )
+                    if not gain.applicable:
+                        raise HTTPException(
+                            422,
+                            f"响度不可应用（{gain.reason_code}）：{gain.reason}",
+                        )
+                lag_applied = lag if item.对齐 else 0
+                gain_db = gain.metrics.get("建议增益db", 0.0) if item.响度 else 0.0
+                derived = apply_gain(
+                    shift_samples(cand_x, lag_applied), gain_db
+                ).astype(np.float32)
+                peak_before = float(np.max(np.abs(cand_x))) if len(cand_x) else 0.0
+                peak_after = float(np.max(np.abs(derived))) if len(derived) else 0.0
+                wav = encode_float_wav(derived)
+                plans.append(
+                    (
+                        tr,
+                        {
+                            "模式": ("对齐+响度" if item.对齐 and item.响度 else "对齐" if item.对齐 else "响度"),
+                            "参考": body.参考,
+                            "lag": lag_applied,
+                            "lag符号定义": LAG_SIGN_DEFINITION,
+                            "gain_db": gain_db,
+                            "原始资产SHA256": json.loads(tr["meta"])["asset_sha256"],
+                            "派生资产SHA256": hashlib.sha256(wav).hexdigest(),
+                            "派生文件": hashlib.sha256(wav).hexdigest() + ".wav",
+                            "算法": ALGORITHM_NAME,
+                            "活动门限": gain.metrics.get("活动门限"),
+                            "活动覆盖": gain.metrics.get("覆盖"),
+                            "共同活动秒": gain.metrics.get("共同活动秒"),
+                            "峰值前": round(peak_before, 6),
+                            "峰值后": round(peak_after, 6),
+                            "处理顺序": PROCESSING_ORDER,
+                            "生成时间": now(),
+                        },
+                        wav,
+                    )
+                )
+            if not plans:
+                raise HTTPException(422, "没有需要应用的处理")
+            created = []
+            try:
+                for _, proc, wav in plans:
+                    path = assets / proc["派生文件"]
+                    if not path.exists():
+                        path.write_bytes(wav)
+                        created.append(path)
+                for tr, proc, _ in plans:
+                    db.execute(
+                        "INSERT OR REPLACE INTO track_processing VALUES(?,?)",
+                        (tr["id"], json.dumps(proc, ensure_ascii=False)),
+                    )
+            except Exception:
+                for path in created:
+                    path.unlink(missing_ok=True)
+                raise
+            return {
+                "已应用": [
+                    {
+                        "track_id": tr["id"],
+                        "名称": tr["name"],
+                        "模式": proc["模式"],
+                        "lag": proc["lag"],
+                        "gain_db": proc["gain_db"],
+                        "派生资产SHA256": proc["派生资产SHA256"],
+                        "峰值前后": [proc["峰值前"], proc["峰值后"]],
+                    }
+                    for tr, proc, _ in plans
+                ]
+            }
+
+    @app.post("/api/samples/{sample_id}/restore-processing")
+    def restore_sample_processing(sample_id: str, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            _ = _sample_managers_only(db, sample_id, u)
+            rows = db.execute(
+                "SELECT tp.track_id, tp.data FROM track_processing tp "
+                "JOIN tracks tr ON tr.id=tp.track_id WHERE tr.sample_id=?",
+                (sample_id,),
+            ).fetchall()
+            if not rows:
+                raise HTTPException(409, "当前片段没有已应用的处理")
+            annotated = (
+                db.execute(
+                    "SELECT 1 FROM comments WHERE sample_id=? LIMIT 1", (sample_id,)
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM ratings WHERE sample_id=? LIMIT 1", (sample_id,)
+                ).fetchone()
+            )
+            if annotated:
+                raise HTTPException(
+                    409,
+                    "此片段已有评论或评分关联，不能替换试听资产；请创建新任务",
+                )
+            for row in rows:
+                db.execute("DELETE FROM track_processing WHERE track_id=?", (row["track_id"],))
+            remaining = {
+                json.loads(r[0])["派生文件"]
+                for r in db.execute("SELECT data FROM track_processing").fetchall()
+            }
+            for row in rows:
+                derived = json.loads(row["data"])["派生文件"]
+                path = assets / derived
+                if derived not in remaining and path.exists():
+                    path.unlink()
+            return {"已恢复": [row["track_id"] for row in rows]}
+
+    @app.get("/api/tasks/{task_id}/processing-summary")
+    def task_processing_summary(task_id: str, request: Request):
+        u = user(request)
+        with connect(database) as db:
+            t = task_access(db, task_id, u, True)
+            samples = db.execute(
+                "SELECT * FROM samples WHERE task_id=? ORDER BY rowid", (task_id,)
+            ).fetchall()
+            out = []
+            for s in samples:
+                tracks = db.execute(
+                    "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid", (s["id"],)
+                ).fetchall()
+                modes = _processing_modes(db, s["id"])
+                analyses = _analysis_rows(db, s["id"])
+                entries = []
+                for tr in tracks:
+                    proc = modes.get(tr["id"])
+                    analysis = analyses.get(tr["id"])
+                    rejected = []
+                    if analysis:
+                        for key in ("延迟", "响度"):
+                            part = analysis.get(key) or {}
+                            if not part.get("可应用", True) and part.get("拒绝码"):
+                                rejected.append(
+                                    {
+                                        "候选": tr["name"],
+                                        "判据": key,
+                                        "拒绝码": part["拒绝码"],
+                                        "原因": part.get("原因", REASONS.get(part["拒绝码"], "")),
+                                    }
+                                )
+                    entries.append(
+                        {
+                            "track_id": tr["id"],
+                            "名称": tr["name"],
+                            "模式": proc["模式"] if proc else "原始",
+                            "拒绝": rejected,
+                        }
+                    )
+                mixed = len({e["模式"] for e in entries}) > 1
+                out.append(
+                    {
+                        "片段ID": s["id"],
+                        "片段": s["name"],
+                        "候选": entries,
+                        "混合处理": mixed,
+                    }
+                )
+            return {"任务": task_id, "状态": t["status"], "片段": out}
+
     @app.get("/api/tasks/{task_id}/progress")
     def task_progress(task_id: str, request: Request):
         # 收集期间的管理者进度：只含受邀名单、每人已提交片段数与三态状态，
@@ -1183,6 +1567,9 @@ def create_app(
             rows = db.execute(
                 "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid", (sample_id,)
             ).fetchall()
+            proc_modes = (
+                {} if blind else _processing_modes(db, sample_id)
+            )
             s["tracks"] = []
             for row in sorted(rows, key=lambda x: mapping[x["id"]]):
                 tr = {
@@ -1193,6 +1580,17 @@ def create_app(
                 }
                 if not blind:
                     tr["meta"] = json.loads(row["meta"])
+                    proc = proc_modes.get(row["id"])
+                    tr["处理"] = (
+                        {
+                            "模式": proc["模式"],
+                            "lag": proc["lag"],
+                            "gain_db": proc["gain_db"],
+                            "参考": proc["参考"],
+                        }
+                        if proc
+                        else None
+                    )
                 s["tracks"].append(tr)
             comments = db.execute(
                 "SELECT c.*,u.name author FROM comments c JOIN users u ON c.user_id=u.id WHERE c.sample_id=? ORDER BY c.created",
@@ -1216,6 +1614,21 @@ def create_app(
             if not tr:
                 raise HTTPException(404, "候选不存在")
             _, task = sample_access(db, tr["sample_id"], u)
+            row = db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (track_id,)
+            ).fetchone()
+        if row:
+            proc = json.loads(row["data"])
+            path = assets / proc["派生文件"]
+            if (
+                not path.exists()
+                or hashlib.sha256(path.read_bytes()).hexdigest()
+                != proc["派生资产SHA256"]
+            ):
+                raise HTTPException(
+                    409, "派生音频完整性检查失败，请联系组织者恢复备份"
+                )
+            return path, task
         path = assets / tr["path"]
         if (
             not path.exists()
@@ -1341,17 +1754,58 @@ def create_app(
             ).fetchall():
                 s = dict(row)
                 s.update(summary["逐片段"][s["id"]])
-                s["tracks"] = [
-                    {
-                        "id": tr["id"],
-                        "name": tr["name"],
-                        "version": tr["version"],
-                        "meta": json.loads(tr["meta"]),
-                    }
-                    for tr in db.execute(
-                        "SELECT * FROM tracks WHERE sample_id=?", (s["id"],)
+                proc_modes = _processing_modes(db, s["id"])
+                analyses = _analysis_rows(db, s["id"])
+                track_entries = []
+                for tr in db.execute(
+                    "SELECT * FROM tracks WHERE sample_id=?", (s["id"],)
+                ).fetchall():
+                    proc = proc_modes.get(tr["id"])
+                    track_entries.append(
+                        {
+                            "id": tr["id"],
+                            "name": tr["name"],
+                            "version": tr["version"],
+                            "meta": json.loads(tr["meta"]),
+                            "处理口径": (
+                                {
+                                    "模式": proc["模式"],
+                                    "参考track": proc["参考"],
+                                    "lag": proc["lag"],
+                                    "lag符号定义": proc["lag符号定义"],
+                                    "增益db": proc["gain_db"],
+                                    "原始资产SHA256": proc["原始资产SHA256"],
+                                    "派生资产SHA256": proc["派生资产SHA256"],
+                                    "算法": proc["算法"],
+                                    "处理顺序": proc["处理顺序"],
+                                    "生成时间": proc["生成时间"],
+                                }
+                                if proc
+                                else "原始"
+                            ),
+                        }
                     )
-                ]
+                s["tracks"] = track_entries
+                rejected = []
+                for tr in s["tracks"]:
+                    analysis = analyses.get(tr["id"])
+                    if not analysis:
+                        continue
+                    for key in ("延迟", "响度"):
+                        part = analysis.get(key) or {}
+                        if not part.get("可应用", True) and part.get("拒绝码"):
+                            rejected.append(
+                                {
+                                    "候选": tr["name"],
+                                    "判据": key,
+                                    "拒绝码": part["拒绝码"],
+                                    "原因": part.get("原因", ""),
+                                }
+                            )
+                s["处理摘要"] = {
+                    "混合处理": len({t2["处理口径"]["模式"] if isinstance(t2["处理口径"], dict) else "原始" for t2 in track_entries}) > 1,
+                    "拒绝建议": rejected,
+                }
                 s["ratings"] = [
                     dict(x)
                     for x in db.execute(
@@ -1371,6 +1825,7 @@ def create_app(
                 "任务": dict(t),
                 "样本": samples,
                 "参与进度": summary["参与进度"],
+                "处理口径": "派生试听资产按「先整数采样对齐，再固定增益」生成；原始 WAV 未修改。活动段 RMS 匹配不是 LUFS/ITU BS.1770 响度校准，也不是听感等响。",
                 "标签汇总": summary["标签汇总"],
                 "生成时间": now(),
                 "播放口径": "原始相对电平；公共监听增益；16 kHz；无延迟自动校正",
@@ -1430,7 +1885,12 @@ def create_app(
             memory.execute("DELETE FROM sessions")
             memory.commit()
             blob = memory.serialize()
-            paths = [r[0] for r in memory.execute("SELECT DISTINCT path FROM tracks")]
+            paths = {
+                r[0] for r in memory.execute("SELECT DISTINCT path FROM tracks")
+            }
+            for (data,) in memory.execute("SELECT data FROM track_processing"):
+                paths.add(json.loads(data)["派生文件"])
+            paths = sorted(paths)
             memory.close()
             output = io.BytesIO()
             with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as z:

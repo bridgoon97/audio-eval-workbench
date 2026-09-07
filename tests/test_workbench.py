@@ -13,7 +13,7 @@ import soundfile as sf
 from fastapi.testclient import TestClient
 
 from workbench.app import create_app, csv_safe
-from workbench.audio import decode_audio, demo_wav
+from workbench.audio import decode_audio, demo_wav, encode_float_wav
 
 
 @pytest.fixture
@@ -1276,3 +1276,236 @@ def test_csv_safe_control_characters():
     assert csv_safe("普通文本") == "普通文本"
     assert csv_safe(" x=y") == " x=y"
     assert csv_safe("5") == "5" and csv_safe(5) == 5 and csv_safe(0) == 0
+
+
+def processing_sample(admin, t, name="对齐片段"):
+    """参考宽带 + 延迟 320/衰减 0.7 的候选 + 周期纯音（会被拒绝）。"""
+    rng = np.random.default_rng(7)
+    n = 96000
+    axis = np.arange(n)
+    ref = 0.35 * rng.standard_normal(n) + 0.35 * np.sin(
+        2 * np.pi * (50 * axis / 16000 + 1800 * (axis / 16000) ** 2 / 2)
+    )
+    ref /= np.max(np.abs(ref))
+    ref *= 0.5
+    cand = np.zeros(n)
+    cand[320:] = ref[:-320] * 0.7
+    sine = 0.5 * np.sin(2 * np.pi * 100 * axis / 16000)
+    s = admin.post(f"/api/tasks/{t}/samples", json={"name": name}).json()["id"]
+    ids = []
+    for nm, data in (
+        ("参考宽带", encode_float_wav(ref)),
+        ("延迟衰减", encode_float_wav(cand)),
+        ("周期纯音", encode_float_wav(sine)),
+    ):
+        r = admin.post(
+            f"/api/samples/{s}/tracks",
+            data={"name": nm, "version": "v"},
+            files={"file": ("x.wav", data, "audio/wav")},
+        )
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["id"])
+    return s, ids, ref
+
+
+def test_processing_permission_state_and_input_gates(env):
+    """仅管理者可在 draft 分析/应用/恢复；active/closed 409 无副作用。"""
+    app, a, folder = env
+    member, member_id = reviewer(app, a, "处理评测者")
+    outsider, _ = reviewer(app, a, "处理局外")
+    t, _s, tracks = task(a)  # demo 声音的两轨片段
+    s2, ids, _ = processing_sample(a, t)
+
+    # 分析输入校验（draft 阶段）：参考必须是当前片段内已有 track ID，
+    # 任意路径或跨片段引用都被拒绝。
+    assert (
+        a.get(f"/api/samples/{s2}/alignment?reference={ids[1]}").status_code == 200
+    )
+    assert (
+        a.get(f"/api/samples/{s2}/alignment?reference={tracks[0]}").status_code == 422
+    )
+    assert (
+        a.get(f"/api/samples/{s2}/alignment?reference=../../etc/passwd").status_code
+        == 422
+    )
+    publish(a, t, [member_id])
+
+    def snapshot():
+        rows = list(folder.joinpath("assets").iterdir())
+        with sqlite3.connect(folder / "workbench.sqlite3") as db:
+            n = db.execute("SELECT count(*) FROM track_processing").fetchone()[0]
+        return {p.name for p in rows}, n
+
+    before = snapshot()
+    for client in (member, outsider, TestClient(app)):
+        for path in (
+            f"/api/samples/{s2}/alignment?reference={ids[0]}",
+            f"/api/tasks/{t}/processing-summary",
+        ):
+            assert client.get(path).status_code in (401, 403)
+        for method, path in (
+            ("post", f"/api/samples/{s2}/processing"),
+            ("post", f"/api/samples/{s2}/restore-processing"),
+        ):
+            assert client.request(method, path, json={"参考": ids[0], "处理": []}).status_code in (401, 403)
+    # 管理者在 active 任务上一律 409，且无文件/数据库副作用。
+    for path in (
+        f"/api/samples/{s2}/alignment?reference={ids[0]}",
+        f"/api/samples/{s2}/processing",
+        f"/api/samples/{s2}/restore-processing",
+    ):
+        r = a.get(path) if path.startswith("/api/samples") and "alignment" in path else a.request(
+            "POST", path, json={"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True}]}
+        )
+        assert r.status_code == 409, (path, r.status_code)
+    assert snapshot() == before
+
+    # 处理摘要（只读）对管理者在任意状态可用。
+    assert a.get(f"/api/tasks/{t}/processing-summary").status_code == 200
+
+
+def test_processing_apply_restore_roundtrip_and_idempotency(env):
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "处理往返", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    assets = folder / "assets"
+    original_bytes = (assets / a.get(f"/api/samples/{s}").json()["tracks"][1]["path"]).read_bytes() if False else None
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_path = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    original_bytes = (assets / cand_path).read_bytes()
+
+    r = a.get(f"/api/samples/{s}/alignment?reference={ids[0]}")
+    assert r.status_code == 200, r.text
+    entries = {e["track_id"]: e for e in r.json()["候选"]}
+    good = entries[ids[1]]
+    assert good["延迟"]["可应用"] is True and good["延迟"]["lag"] == 320
+    assert abs(good["响度"]["建议增益db"] - 3.0988) < 0.05  # 20·log10(1/0.7)
+    bad = entries[ids[2]]
+    # 纯音候选相对宽带参考＝内容不相关；多峰旁瓣场景由 test_align 单测覆盖。
+    assert bad["延迟"]["可应用"] is False and bad["延迟"]["拒绝码"] == "ERR_LOW_CORRELATION"
+    assert bad["响度"]["拒绝码"] == "ERR_DELAY_NOT_APPLICABLE"
+
+    apply_body = {
+        "参考": ids[0],
+        "处理": [{"候选": ids[1], "对齐": True, "响度": True}],
+    }
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        row = db.execute(
+            "SELECT data FROM track_processing WHERE track_id=?", (ids[1],)
+        ).fetchone()[0]
+    proc = json.loads(row)
+    assert proc["模式"] == "对齐+响度" and proc["lag"] == 320
+    derived_path = assets / proc["派生文件"]
+    assert derived_path.exists()
+    # 原始资产字节不变。
+    assert (assets / cand_path).read_bytes() == original_bytes
+    # 试听切到派生资产（试听字节与派生文件一致，且与原始不同）。
+    served = a.get(f"/api/audio/{ids[1]}").content
+    assert served == derived_path.read_bytes()
+    assert served != original_bytes
+    detail = a.get(f"/api/samples/{s}").json()
+    track_view = next(tr for tr in detail["tracks"] if tr["id"] == ids[1])
+    assert track_view["处理"]["模式"] == "对齐+响度" and track_view["处理"]["lag"] == 320
+
+    # 重复应用幂等：不新增文件、不新增行。
+    files_before = {p.name for p in assets.iterdir()}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM track_processing").fetchone()[0] == 1
+    assert {p.name for p in assets.iterdir()} == files_before
+
+    # 恢复原始：回到原资产，派生文件清理，再次恢复 409。
+    assert a.post(f"/api/samples/{s}/restore-processing").status_code == 200
+    assert a.get(f"/api/audio/{ids[1]}").content == original_bytes
+    assert not derived_path.exists()
+    assert a.post(f"/api/samples/{s}/restore-processing").status_code == 409
+
+
+def test_processing_blocked_by_annotations(env):
+    _, a, _ = env
+    t = a.post("/api/tasks", json={"title": "标注保护", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    # 先应用，再写草稿评论（owner 可在草稿写评论），恢复/替换被阻止。
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    assert (
+        a.post(
+            f"/api/samples/{s}/comments",
+            json={"start": 0, "end": 100, "body": "草稿标注"},
+        ).status_code
+        == 200
+    )
+    blocked = a.post(f"/api/samples/{s}/processing", json=apply_body)
+    assert blocked.status_code == 409
+    blocked_restore = a.post(f"/api/samples/{s}/restore-processing")
+    assert blocked_restore.status_code == 409
+
+
+def test_processing_blind_seal_and_export_evidence(env):
+    app, a, folder = env
+    member, member_id = reviewer(app, a, "盲评处理员")
+    t = a.post("/api/tasks", json={"title": "盲评处理任务", "mode": "blind"}).json()["id"]
+    s, ids, _ = processing_sample(a, t, name="盲评片段")
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute("UPDATE tracks SET name='秘密算法' WHERE id=?", (ids[1],))
+        db.execute("UPDATE tracks SET name='秘密参考' WHERE id=?", (ids[0],))
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    publish(a, t, [member_id])
+    # active 盲评：处理参数与真实名不外泄。
+    detail = member.get(f"/api/samples/{s}")
+    assert detail.status_code == 200
+    assert "秘密" not in detail.text
+    assert "处理" not in detail.text and "lag" not in detail.text
+    assert "派生资产SHA256" not in detail.text
+    # closed 后按既有规则揭晓，导出包含处理证据。
+    a.post(f"/api/tasks/{t}/close")
+    report = member.get(f"/api/tasks/{t}/report").json()
+    track = next(tr for srow in report["样本"] for tr in srow["tracks"] if tr["id"] == ids[1])
+    assert track["处理口径"]["模式"] == "对齐+响度" and track["处理口径"]["lag"] == 320
+    assert track["处理口径"]["增益db"] > 0 and "派生资产SHA256" in track["处理口径"]
+    exported = a.get(f"/api/tasks/{t}/export")
+    assert "处理" in exported.text and "派生资产SHA256" in exported.text
+    csv_text = a.get(f"/api/tasks/{t}/export.csv").content.decode("utf-8-sig")
+    assert "处理口径" in csv_text
+    markdown = a.get(f"/api/tasks/{t}/export.md").text
+    assert "处理口径" in markdown
+
+
+def test_processing_summary_reports_mixed_and_rejected(env):
+    _, a, _ = env
+    t = a.post("/api/tasks", json={"title": "混合处理", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    r = a.get(f"/api/samples/{s}/alignment?reference={ids[0]}")
+    assert r.status_code == 200
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    summary = a.get(f"/api/tasks/{t}/processing-summary").json()
+    sample = next(x for x in summary["片段"] if x["片段ID"] == s)
+    assert sample["混合处理"] is True
+    modes = {e["名称"]: e["模式"] for e in sample["候选"]}
+    assert modes == {"参考宽带": "原始", "延迟衰减": "对齐+响度", "周期纯音": "原始"}
+    rejected = {(x["候选"], x["判据"], x["拒绝码"]) for x in sample["候选"] for x in x["拒绝"]}
+    assert ("周期纯音", "延迟", "ERR_LOW_CORRELATION") in rejected
+    assert ("周期纯音", "响度", "ERR_DELAY_NOT_APPLICABLE") in rejected
+
+
+def test_backup_includes_derived_assets(env):
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "备份派生", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    apply_body = {"参考": ids[0], "处理": [{"候选": ids[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s}/processing", json=apply_body).status_code == 200
+    served = a.get(f"/api/audio/{ids[1]}").content
+    result = a.get("/api/backup")
+    assert result.status_code == 200
+    destination = folder / "备份恢复验证"
+    with zipfile.ZipFile(io.BytesIO(result.content)) as z:
+        names = z.namelist()
+        z.extractall(destination)
+    assert any("派生" not in n for n in names)
+    restored = create_app(destination)
+    c = TestClient(restored)
+    c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
+    assert c.get(f"/api/audio/{ids[1]}").content == served

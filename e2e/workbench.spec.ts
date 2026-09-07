@@ -200,18 +200,19 @@ test('同事获授组织者权限后可上传、删除及恢复自己的任务',
 });
 
 test('角色指南默认入口、章节搜索、完整下载与窄屏阅读', async ({ page }) => {
-  await page.request.post('/api/login', {
-    data: { name: '浏览器测试', password: 'test-password-only' },
-  });
-  await page.request.post('/api/users', {
-    data: { name: '指南评测者', password: 'guide-password-only', role: 'reviewer' },
-  });
+  // 登录次数受服务端限流（20 次/5 分钟）约束：管理员首项登录后创建指南
+  // 评测者账号，避免重复登录占用整套件的限流额度。
   for (const [name, password, role, heading] of [
     ['浏览器测试', 'test-password-only', '管理员', '首次启动与局域网部署'],
     ['同事上传者', 'colleague-password', '组织者', '准备一组公平的比较'],
     ['指南评测者', 'guide-password-only', '评测者', '登录并找到分配的任务'],
   ]) {
     await page.request.post('/api/login', { data: { name, password } });
+    if (name === '浏览器测试') {
+      await page.request.post('/api/users', {
+        data: { name: '指南评测者', password: 'guide-password-only', role: 'reviewer' },
+      });
+    }
     await page.goto('/');
     await page.getByRole('button', { name: '使用指南', exact: true }).click();
     await expect(
@@ -682,5 +683,148 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
     true,
   );
+  expect(errors).toEqual([]);
+});
+
+test('对齐与响度：分析、应用、恢复、发布确认与导出处理证据', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+
+  // 运行时合成 4 秒 16 kHz 宽带信号（xorshift 白噪声 + 线性扫频）：
+  // 参考、延迟 320/衰减 0.7 的候选、周期纯音。
+  const n = 64000;
+  const ref = new Float32Array(n);
+  let seed = 123456789;
+  const rand = () => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    seed >>>= 0;
+    return seed / 2147483648 - 1;
+  };
+  for (let i = 0; i < n; i++) {
+    ref[i] =
+      0.6 * rand() +
+      0.3 * Math.sin(2 * Math.PI * (40 * (i / 16000) + (900 * (i / 16000) ** 2) / 2));
+  }
+  let peak = 0;
+  for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(ref[i]));
+  for (let i = 0; i < n; i++) ref[i] = (ref[i] / peak) * 0.5;
+  const delayed = new Float32Array(n);
+  for (let i = 320; i < n; i++) delayed[i] = ref[i - 320] * 0.7;
+  const sine = new Float32Array(n);
+  for (let i = 0; i < n; i++) sine[i] = 0.5 * Math.sin((2 * Math.PI * 100 * i) / 16000);
+  const wav = (x: Float32Array) => {
+    const buf = Buffer.alloc(44 + n * 2);
+    buf.write('RIFF', 0);
+    buf.writeUInt32LE(buf.length - 8, 4);
+    buf.write('WAVEfmt ', 8);
+    buf.writeUInt32LE(16, 16);
+    buf.writeUInt16LE(1, 20);
+    buf.writeUInt16LE(1, 22);
+    buf.writeUInt32LE(16000, 24);
+    buf.writeUInt32LE(n * 2, 28);
+    buf.writeUInt16LE(4, 32);
+    buf.writeUInt16LE(16, 34);
+    buf.write('data', 36);
+    buf.writeUInt32LE(n * 2, 40);
+    for (let i = 0; i < n; i++)
+      buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(x[i] * 32767))), 44 + i * 2);
+    return buf;
+  };
+
+  const created = await (
+    await page.request.post('/api/tasks', {
+      data: { title: '对齐响度验收', kind: '算法版本', mode: 'development' },
+    })
+  ).json();
+  const sample = await (
+    await page.request.post(`/api/tasks/${created.id}/samples`, {
+      data: { name: '对齐片段', provenance: 'PUBLIC reproducible' },
+    })
+  ).json();
+  const trackIds: string[] = [];
+  for (const [name, data] of [
+    ['参考宽带', wav(ref)],
+    ['延迟衰减', wav(delayed)],
+    ['周期纯音', wav(sine)],
+  ] as const) {
+    const track = await (
+      await page.request.post(`/api/samples/${sample.id}/tracks`, {
+        multipart: {
+          name,
+          version: 'v1',
+          file: { name: 'clip.wav', mimeType: 'audio/wav', buffer: data },
+        },
+      })
+    ).json();
+    trackIds.push(track.id);
+  }
+
+  await page.goto('/');
+  await page.locator('.task-card').filter({ hasText: '对齐响度验收' }).click();
+  await page.getByRole('button', { name: '对齐与响度' }).click();
+  await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
+  await page.getByRole('button', { name: '开始分析' }).click();
+  await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText(
+    '320 samples',
+  );
+  await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText('建议');
+  const rejectedRow = page.locator('.proc-row').filter({ hasText: '周期纯音' });
+  await expect(rejectedRow.locator('.rejected').first()).toContainText('ERR_LOW_CORRELATION');
+  await expect(rejectedRow.locator('.rejected').nth(1)).toContainText('ERR_DELAY_NOT_APPLICABLE');
+
+  // 默认勾选＝判据通过项；应用「先对齐后增益」。
+  const row = page.locator('.proc-row').filter({ hasText: '延迟衰减' });
+  await expect(row.getByRole('checkbox').nth(0)).toBeChecked();
+  await expect(row.getByRole('checkbox').nth(1)).toBeChecked();
+  await expect(page.locator('.proc-summary')).toContainText('整数采样对齐（先）');
+  await expect(page.locator('.proc-summary')).toContainText('活动段 RMS 固定增益（后）');
+  await page.getByRole('button', { name: '确认应用所选处理' }).click();
+  await expect(page.locator('.proc-live').first()).toContainText('派生试听');
+  await expect(page.locator('.proc-live').first()).toContainText('对齐 +320 samples（前移）');
+
+  // 恢复原始 → 再应用。
+  await page.getByRole('button', { name: '对齐与响度' }).click();
+  await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
+  await page.getByRole('button', { name: '开始分析' }).click();
+  await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText(
+    '320 samples',
+  );
+  await page.getByRole('button', { name: '确认应用所选处理' }).click();
+  await expect(page.locator('.proc-live').first()).toContainText('派生试听');
+  await page.getByRole('button', { name: '对齐与响度' }).click();
+  await page.getByRole('button', { name: '恢复原始处理' }).click();
+  await expect(page.locator('.proc-live')).toHaveCount(0);
+  await page.getByRole('button', { name: '对齐与响度' }).click();
+  await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
+  await page.getByRole('button', { name: '开始分析' }).click();
+  await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText(
+    '320 samples',
+  );
+  await page.getByRole('button', { name: '确认应用所选处理' }).click();
+  await expect(page.locator('.proc-live').first()).toContainText('派生试听');
+
+  // 发布确认显示混合处理与被拒绝建议；发布后冻结。
+  await page.getByRole('button', { name: '发布评测', exact: true }).click();
+  await expect(page.locator('.publish-processing')).toContainText('存在混合处理口径');
+  await expect(page.locator('.publish-processing')).toContainText('延迟衰减：对齐+响度');
+  await expect(page.locator('.publish-processing-rejected')).toContainText('ERR_LOW_CORRELATION');
+  await page.locator('input[name="alignment"]').check();
+  await page.getByRole('button', { name: '发布并锁定任务' }).click();
+  await page.getByRole('button', { name: '关闭并揭晓' }).click();
+  await page.getByRole('button', { name: '关闭收集并统一揭晓' }).click();
+  await expect(page.getByRole('button', { name: '查看结果' })).toBeVisible({ timeout: 15000 });
+
+  const exported = await (await page.request.get(`/api/tasks/${created.id}/export`)).text();
+  const data = JSON.parse(exported);
+  const processedTrack = data['样本'][0].tracks.find((t: { id: string }) => t.id === trackIds[1]);
+  expect(processedTrack['处理口径']['模式']).toBe('对齐+响度');
+  expect(processedTrack['处理口径']['lag']).toBe(320);
+  expect(processedTrack['处理口径']['派生资产SHA256']).toMatch(/^[0-9a-f]{64}$/);
+  expect(exported).toContain('ERR_LOW_CORRELATION');
   expect(errors).toEqual([]);
 });

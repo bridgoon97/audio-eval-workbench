@@ -18,6 +18,7 @@ export type Track = {
   label: string;
   name: string;
   version: string;
+  处理?: { 模式: string; lag: number; gain_db: number; 参考: string } | null;
   meta?: {
     peak: number;
     rms_dbfs: number;

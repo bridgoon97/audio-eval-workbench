@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS aliases(user_id TEXT REFERENCES users(id), sample_id 
 CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY, sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), track_id TEXT REFERENCES tracks(id), start INTEGER NOT NULL, end INTEGER NOT NULL, body TEXT NOT NULL, tag TEXT NOT NULL, parent TEXT REFERENCES comments(id), created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ratings(sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), choice TEXT NOT NULL, reason TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY(sample_id,user_id));
 CREATE TABLE IF NOT EXISTS review_assignments(task_id TEXT NOT NULL REFERENCES tasks(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(task_id,user_id));
+CREATE TABLE IF NOT EXISTS track_processing(track_id TEXT PRIMARY KEY REFERENCES tracks(id), data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS track_analysis(track_id TEXT PRIMARY KEY REFERENCES tracks(id), data TEXT NOT NULL);
 """
 
 
