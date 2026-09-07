@@ -30,6 +30,7 @@ import packageInfo from '../package.json';
 import { TeamMembers } from './TeamMembers';
 import { UserGuide } from './UserGuide';
 import { BatchImport } from './BatchImport';
+import { CommentThread } from './CommentThread';
 import { Waveform } from './Waveform';
 import './style.css';
 
@@ -149,6 +150,7 @@ function App() {
   const [saveState, setSaveState] = useState('');
   const activeSample = useRef('');
   const duration = (sample?.samples || 0) / 16000;
+  const replyTarget = sample?.comments?.find((item) => item.id === reply);
 
   useEffect(() => {
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
@@ -801,6 +803,7 @@ function App() {
               <div className="actions">
                 {task.can_manage && task.status === 'draft' && (
                   <>
+                    <button onClick={() => setModal('edit-task')}>编辑任务</button>
                     <button onClick={() => setModal('batch')}>批量导入</button>
                     <button onClick={() => setModal('sample')}>
                       <Plus size={17} />
@@ -821,10 +824,22 @@ function App() {
                   </>
                 )}
                 {task.can_manage && task.status === 'active' && (
-                  <button onClick={() => setModal('close')}>
-                    <Check size={17} />
-                    关闭并揭晓
-                  </button>
+                  <>
+                    <button
+                      onClick={() =>
+                        void run(async () => {
+                          setMembers(await api('/users'));
+                          setModal('members');
+                        })
+                      }
+                    >
+                      参与人员
+                    </button>
+                    <button onClick={() => setModal('close')}>
+                      <Check size={17} />
+                      关闭并揭晓
+                    </button>
+                  </>
                 )}
                 {task.can_manage && (
                   <button onClick={() => setModal('delete-task')}>删除任务</button>
@@ -893,6 +908,9 @@ function App() {
                         <p>{sample.scene || '场景未填写'}</p>
                       </div>
                       <div className="view-tabs">
+                        {task.can_manage && task.status === 'draft' && (
+                          <button onClick={() => setModal('edit-sample')}>编辑片段</button>
+                        )}
                         <button
                           className={!spectrum ? 'selected' : ''}
                           disabled={sample.blind}
@@ -1056,7 +1074,7 @@ function App() {
                         <div className="note-editor">
                           <span className="eyebrow">
                             {reply
-                              ? '回复评论'
+                              ? `回复 ${replyTarget?.author || '评论'}`
                               : `当前候选 ${sample.tracks?.[selected]?.label || '—'}`}
                           </span>
                           <h3>
@@ -1121,41 +1139,23 @@ function App() {
                           {!sample.comments?.length && (
                             <p className="muted">还没有记录。框选一段声音，留下第一条判断。</p>
                           )}
-                          {sample.comments?.map((c) => (
-                            <article className="comment" key={c.id}>
-                              <div>
-                                <strong>{c.author}</strong>
-                                <span>{c.tag}</span>
-                              </div>
-                              <button
-                                className="timestamp"
-                                onClick={() => {
-                                  const r: [number, number] = [c.start / 16000, c.end / 16000];
-                                  selectRegion(r);
-                                  const i =
-                                    sample.tracks?.findIndex((t) => t.id === c.track_id) ?? -1;
-                                  if (i >= 0) select(i);
-                                  engine?.seek(r[0]);
-                                  setPosition(r[0]);
-                                }}
-                              >
-                                {time(c.start / 16000)} — {time(c.end / 16000)} ·{' '}
-                                {sample.tracks?.find((t) => t.id === c.track_id)?.label || '片段'}
-                              </button>
-                              {c.parent && <small>回复一条片段记录</small>}
-                              <p>{c.body}</p>
-                              <button
-                                className="text-button"
-                                onClick={() => {
-                                  setReply(c.id);
-                                  selectRegion([c.start / 16000, c.end / 16000]);
-                                  document.querySelector<HTMLTextAreaElement>('#comment')?.focus();
-                                }}
-                              >
-                                回复
-                              </button>
-                            </article>
-                          ))}
+                          <CommentThread
+                            comments={sample.comments || []}
+                            tracks={sample.tracks || []}
+                            onJump={(c) => {
+                              const r: [number, number] = [c.start / 16000, c.end / 16000];
+                              selectRegion(r);
+                              const i = sample.tracks?.findIndex((t) => t.id === c.track_id) ?? -1;
+                              if (i >= 0) select(i);
+                              engine?.seek(r[0]);
+                              setPosition(r[0]);
+                            }}
+                            onReply={(c) => {
+                              setReply(c.id);
+                              selectRegion([c.start / 16000, c.end / 16000]);
+                              document.querySelector<HTMLTextAreaElement>('#comment')?.focus();
+                            }}
+                          />
                         </div>
                       </>
                     ) : (
@@ -1298,6 +1298,9 @@ function App() {
           title={
             {
               new: '新建评测任务',
+              'edit-task': '编辑评测任务',
+              'edit-sample': '编辑音频片段',
+              members: '调整参与人员',
               batch: '按版本目录批量导入',
               'edit-track': '管理草稿候选',
               sample: '添加音频片段',
@@ -1507,6 +1510,116 @@ function App() {
               </button>
             </form>
           )}
+          {modal === 'edit-task' && task && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const data = Object.fromEntries(new FormData(e.currentTarget));
+                void run(async () => {
+                  await api('/tasks/' + task.id, 'PATCH', data);
+                  await openTask(task.id);
+                  await refreshTasks();
+                  setModal('');
+                  setNotice('任务信息已更新。');
+                });
+              }}
+            >
+              <p className="muted">仅准备中的任务可修改；发布后名称、比较类型和模式冻结。</p>
+              <label>
+                任务名称
+                <input name="title" required maxLength={150} defaultValue={task.title} />
+              </label>
+              <label>
+                比较场景
+                <select name="kind" defaultValue={task.kind}>
+                  {['算法版本', 'VPU 支路', '级联链路', '竞品算法', '竞品整机'].map((kind) => (
+                    <option key={kind}>{kind}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                工作模式
+                <select name="mode" defaultValue={task.mode}>
+                  <option value="development">开发诊断：显示版本、波形与频谱</option>
+                  <option value="blind">独立评测：隐藏版本，关闭后统一揭晓</option>
+                </select>
+              </label>
+              <button className="primary full" disabled={busy}>
+                保存任务信息
+              </button>
+            </form>
+          )}
+          {modal === 'edit-sample' && sample && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const data = Object.fromEntries(new FormData(e.currentTarget));
+                void run(async () => {
+                  await api('/samples/' + sample.id, 'PATCH', data);
+                  await refreshSample();
+                  setModal('');
+                  setNotice('片段信息已更新。');
+                });
+              }}
+            >
+              <p className="muted">修改名称、场景和来源标记不会改变音频；发布后这些信息冻结。</p>
+              <label>
+                片段名称
+                <input name="name" required maxLength={100} defaultValue={sample.name} />
+              </label>
+              <label>
+                场景
+                <input name="scene" maxLength={200} defaultValue={sample.scene} />
+              </label>
+              <label>
+                数据来源
+                <select name="provenance" defaultValue={sample.provenance}>
+                  <option>PRIVATE local verification</option>
+                  <option>DECLASSIFIED real-device</option>
+                  <option>PUBLIC reproducible</option>
+                </select>
+              </label>
+              <button className="primary full" disabled={busy}>
+                保存片段信息
+              </button>
+            </form>
+          )}
+          {modal === 'members' && task && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const form = new FormData(e.currentTarget);
+                void run(async () => {
+                  await api('/tasks/' + task.id + '/members', 'PATCH', {
+                    users: form.getAll('users'),
+                  });
+                  await openTask(task.id);
+                  setModal('');
+                  setNotice('参与人员已更新；在线同事将在约 5 秒内看到变化。');
+                });
+              }}
+            >
+              <p>
+                发布进行中仍可增加参与者。只可移除尚未提交评论或偏好判断的人；任务创建者始终保留。关闭任务后名单冻结。
+              </p>
+              {members.map((member) => (
+                <label className="checkbox" key={member.id}>
+                  <input
+                    type="checkbox"
+                    name="users"
+                    value={member.id}
+                    defaultChecked={task.members?.includes(member.id) || member.id === task.owner}
+                    disabled={member.id === task.owner}
+                  />
+                  {member.name}
+                  {member.id === task.owner ? '（任务创建者）' : ''}
+                </label>
+              ))}
+              <button className="primary full" disabled={busy}>
+                保存参与人员
+              </button>
+            </form>
+          )}
           {modal === 'track' && (
             <form
               onSubmit={(e) => {
@@ -1580,7 +1693,7 @@ function App() {
                   </label>
                 ))}
               {members.length <= 1 && (
-                <p className="muted">目前只有你；可先到“团队成员”创建账号。发布后成员固定。</p>
+                <p className="muted">目前只有你；可先到“团队成员”创建账号。</p>
               )}
               <label className="checkbox confirm">
                 <input name="alignment" type="checkbox" required />

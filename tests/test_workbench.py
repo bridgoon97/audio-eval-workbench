@@ -681,3 +681,81 @@ def test_service_identity_and_page_cache_boundary(env):
     assert admin_info["data_directory"] == str(folder.resolve())
     assert TestClient(app).get("/api/server-info").status_code == 401
     assert a.get("/").headers["cache-control"] == "no-store"
+
+
+def test_draft_task_and_sample_metadata_can_be_corrected_then_freeze(env):
+    app, admin, _ = env
+    colleague, _ = reviewer(app, admin, "无权编辑者")
+    task_id, sample_id, _ = task(admin, "development")
+    task_body = {"title": "修正后的任务", "kind": "竞品算法", "mode": "blind"}
+    assert colleague.patch(f"/api/tasks/{task_id}", json=task_body).status_code == 403
+    assert admin.patch(f"/api/tasks/{task_id}", json=task_body).status_code == 200
+    sample_body = {
+        "name": "修正后的片段",
+        "scene": "车内",
+        "provenance": "PUBLIC reproducible",
+    }
+    assert admin.patch(f"/api/samples/{sample_id}", json=sample_body).status_code == 200
+    detail = admin.get(f"/api/tasks/{task_id}").json()
+    assert (detail["title"], detail["kind"], detail["mode"]) == (
+        "修正后的任务",
+        "竞品算法",
+        "blind",
+    )
+    assert detail["samples"][0]["name"] == "修正后的片段"
+    assert detail["samples"][0]["scene"] == "车内"
+    publish(admin, task_id)
+    assert admin.patch(f"/api/tasks/{task_id}", json=task_body).status_code == 409
+    assert admin.patch(f"/api/samples/{sample_id}", json=sample_body).status_code == 409
+
+
+def test_active_member_changes_preserve_contributors(env):
+    app, admin, _ = env
+    first, first_id = reviewer(app, admin, "首批参与者")
+    second, second_id = reviewer(app, admin, "后加入者")
+    third, third_id = reviewer(app, admin, "可移除者")
+    task_id, sample_id, tracks = task(admin)
+    owner_id = admin.get("/api/me").json()["id"]
+    publish(admin, task_id, [first_id, third_id])
+    endpoint = f"/api/tasks/{task_id}/members"
+    assert first.patch(endpoint, json={"users": [second_id]}).status_code == 403
+    assert (
+        admin.patch(endpoint, json={"users": [first_id, second_id]}).status_code == 200
+    )
+    assert second.get(f"/api/tasks/{task_id}").status_code == 200
+    assert third.get(f"/api/tasks/{task_id}").status_code == 403
+    first.post(
+        f"/api/samples/{sample_id}/comments",
+        json={"track_id": tracks[0], "start": 0, "end": 160, "body": "已贡献"},
+    )
+    response = admin.patch(endpoint, json={"users": [second_id]})
+    assert response.status_code == 409
+    assert "首批参与者" in response.text
+    members = set(admin.get(f"/api/tasks/{task_id}").json()["members"])
+    assert {owner_id, first_id, second_id} <= members
+    assert admin.post(f"/api/tasks/{task_id}/close").status_code == 200
+    assert admin.patch(endpoint, json={"users": [first_id]}).status_code == 409
+
+
+def test_nested_replies_keep_exact_parent(env):
+    app, admin, _ = env
+    first, first_id = reviewer(app, admin, "发帖人")
+    second, second_id = reviewer(app, admin, "回复人")
+    task_id, sample_id, tracks = task(admin, "development")
+    publish(admin, task_id, [first_id, second_id])
+    base = {"track_id": tracks[0], "start": 100, "end": 300, "tag": "音色"}
+    root = first.post(
+        f"/api/samples/{sample_id}/comments", json={**base, "body": "原评论"}
+    ).json()["id"]
+    reply = second.post(
+        f"/api/samples/{sample_id}/comments",
+        json={**base, "body": "一级回复", "parent": root},
+    ).json()["id"]
+    nested = first.post(
+        f"/api/samples/{sample_id}/comments",
+        json={**base, "body": "回复回复", "parent": reply},
+    ).json()["id"]
+    comments = admin.get(f"/api/samples/{sample_id}").json()["comments"]
+    by_id = {comment["id"]: comment for comment in comments}
+    assert by_id[reply]["parent"] == root
+    assert by_id[nested]["parent"] == reply

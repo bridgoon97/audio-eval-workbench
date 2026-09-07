@@ -236,7 +236,7 @@ test('角色指南默认入口、章节搜索、完整下载与窄屏阅读', as
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toBe('听鉴分角色使用手册.md');
   const markdown = fs.readFileSync((await download.path())!, 'utf8');
-  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.4.0'])
+  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.5.0'])
     expect(markdown).toContain(text);
   const footer = await page.locator('.guide-footer').boundingBox();
   expect(footer!.y + footer!.height).toBeLessThanOrEqual(768);
@@ -353,7 +353,7 @@ test('同事不刷新网页即可收到角色和任务变化，保留未提交�
     });
     await expect(colleague.locator('#comment')).toHaveValue('尚未提交的听感不能被自动刷新清空');
     await expect(colleague.getByLabel('起点', { exact: true })).toHaveValue('1.2');
-    await colleague.getByRole('button', { name: '服务信息 · 0.4.0' }).click();
+    await colleague.getByRole('button', { name: '服务信息 · 0.5.0' }).click();
     await expect(colleague.getByText('数据编号', { exact: true })).toBeVisible();
     await expect(colleague.getByText('数据目录（仅管理员可见）')).toHaveCount(0);
     await colleague.keyboard.press('Escape');
@@ -377,6 +377,96 @@ test('服务与网页版本不一致时给出明确刷新提示', async ({ page 
     route.fulfill({ json: { needs_setup: false, version: '0.3.0' } }),
   );
   await page.goto('/');
-  await expect(page.getByRole('alert')).toContainText('页面版本 0.4.0 与服务版本 0.3.0 不一致');
+  await expect(page.getByRole('alert')).toContainText('页面版本 0.5.0 与服务版本 0.3.0 不一致');
   await expect(page.getByRole('button', { name: '重新加载页面' })).toBeVisible();
+});
+
+test('草稿信息可修正、发布后增补成员、评论按楼层回复', async ({ page, browser }) => {
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  for (const name of ['评论甲', '评论乙', '待移除成员']) {
+    await page.request.post('/api/users', {
+      data: { name, password: 'comment-test-password', role: 'reviewer' },
+    });
+  }
+  const users = await (await page.request.get('/api/users')).json();
+  const id = (name: string) => users.find((user: { name: string }) => user.name === name).id;
+  const created = await (
+    await page.request.post('/api/tasks', {
+      data: { title: '写错的任务名', kind: '算法版本', mode: 'development' },
+    })
+  ).json();
+  await page.request.post(`/api/tasks/${created.id}/samples`, {
+    data: { name: '写错的片段名', scene: '', provenance: 'PRIVATE local verification' },
+  });
+  await page.goto('/');
+  await page.locator('.task-card').filter({ hasText: '写错的任务名' }).click();
+  await page.getByRole('button', { name: '编辑任务', exact: true }).click();
+  await page.getByLabel('任务名称', { exact: true }).fill('修正后的任务名');
+  await page.getByLabel('比较场景').selectOption({ label: 'VPU 支路' });
+  await page.getByRole('button', { name: '保存任务信息' }).click();
+  await expect(page.getByRole('heading', { name: '修正后的任务名' })).toBeVisible();
+  await page.getByRole('button', { name: '编辑片段', exact: true }).click();
+  await page.getByLabel('片段名称').fill('修正后的片段名');
+  await page.getByLabel('场景', { exact: true }).fill('会议室');
+  await page.getByRole('button', { name: '保存片段信息' }).click();
+  await expect(page.getByRole('heading', { name: '修正后的片段名' })).toBeVisible();
+
+  // 使用已有合成任务验证发布后的成员调整和评论楼层。
+  const demo = await (await page.request.post('/api/demo')).json();
+  await page.request.patch(`/api/tasks/${demo.id}`, {
+    data: { title: '评论线程与增补成员测试', kind: '算法版本', mode: 'development' },
+  });
+  await page.request.post(`/api/tasks/${demo.id}/publish`, {
+    data: { users: [id('评论甲'), id('待移除成员')], alignment_confirmed: true },
+  });
+  await page.getByText('全部任务', { exact: true }).click();
+  await expect(
+    page.locator('.task-card').filter({ hasText: '评论线程与增补成员测试' }),
+  ).toBeVisible();
+  await page.locator('.task-card').filter({ hasText: '评论线程与增补成员测试' }).click();
+  await page.getByRole('button', { name: '参与人员', exact: true }).click();
+  await page.getByRole('checkbox', { name: '评论乙', exact: true }).check();
+  await page.getByRole('checkbox', { name: '待移除成员', exact: true }).uncheck();
+  await page.getByRole('button', { name: '保存参与人员' }).click();
+
+  const first = await browser.newContext();
+  const second = await browser.newContext();
+  const firstPage = await first.newPage();
+  const secondPage = await second.newPage();
+  try {
+    for (const [participant, name] of [
+      [firstPage, '评论甲'],
+      [secondPage, '评论乙'],
+    ] as const) {
+      await participant.goto('http://127.0.0.1:8877');
+      await participant.getByLabel('账号', { exact: true }).fill(name);
+      await participant.getByLabel('密码', { exact: true }).fill('comment-test-password');
+      await participant.getByRole('button', { name: '进入工作台' }).click();
+      await participant.locator('.task-card').filter({ hasText: '评论线程与增补成员测试' }).click();
+    }
+    await firstPage.locator('#comment').fill('主评论：这里有音色变化');
+    await firstPage.getByRole('button', { name: '保存标注' }).click();
+    await secondPage.getByRole('button', { name: '刷新', exact: true }).click();
+    await secondPage
+      .locator('.comment-thread')
+      .getByRole('button', { name: '回复', exact: true })
+      .click();
+    await secondPage.locator('#comment').fill('一级回复：我也听到了');
+    await secondPage.getByRole('button', { name: '保存标注' }).click();
+    await firstPage.getByRole('button', { name: '刷新', exact: true }).click();
+    const thread = firstPage.locator('.comment-thread');
+    await expect(thread).toHaveCount(1);
+    await expect(thread).toContainText('回复 @评论甲');
+    await thread.locator('.comment-reply').getByRole('button', { name: '回复' }).click();
+    await expect(firstPage.getByText('回复 评论乙')).toBeVisible();
+    await firstPage.locator('#comment').fill('二级回复：收到');
+    await firstPage.getByRole('button', { name: '保存标注' }).click();
+    await expect(firstPage.locator('.comment-thread')).toHaveCount(1);
+    await expect(firstPage.locator('.comment-replies')).toContainText('回复 @评论乙');
+  } finally {
+    await first.close();
+    await second.close();
+  }
 });

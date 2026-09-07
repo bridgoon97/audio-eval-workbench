@@ -5,6 +5,7 @@ export type Task = {
   kind: string;
   mode: string;
   status: string;
+  owner: string;
   can_manage: boolean;
   sample_count: number;
   completed: number;

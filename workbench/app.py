@@ -52,6 +52,10 @@ class SampleInput(BaseModel):
     provenance: str = "PRIVATE local verification"
 
 
+class MembersInput(BaseModel):
+    users: list[str] = Field(default_factory=list)
+
+
 class RoleInput(BaseModel):
     role: str
 
@@ -437,6 +441,29 @@ def create_app(
             )
         return {"id": task_id}
 
+    @app.patch("/api/tasks/{task_id}")
+    def edit_task(task_id: str, body: TaskInput, request: Request):
+        u = user(request)
+        if body.mode not in ("development", "blind") or body.kind not in (
+            "算法版本",
+            "VPU 支路",
+            "级联链路",
+            "竞品算法",
+            "竞品整机",
+        ):
+            raise HTTPException(422, "无效任务类型")
+        with mutation_lock, connect(database) as db:
+            t = task_access(db, task_id, u, True)
+            if t["status"] != "draft":
+                raise HTTPException(409, "发布后任务名称、类型和模式保持冻结")
+            if not body.title.strip():
+                raise HTTPException(422, "任务名称不能为空")
+            db.execute(
+                "UPDATE tasks SET title=?,kind=?,mode=? WHERE id=?",
+                (body.title.strip(), body.kind, body.mode, task_id),
+            )
+        return {"ok": True}
+
     @app.get("/api/tasks/{task_id}")
     def task_detail(task_id: str, request: Request):
         u = user(request)
@@ -492,6 +519,30 @@ def create_app(
             except sqlite3.IntegrityError:
                 raise HTTPException(409, "同名样本已存在")
         return {"id": sample_id}
+
+    @app.patch("/api/samples/{sample_id}")
+    def edit_sample(sample_id: str, body: SampleInput, request: Request):
+        u = user(request)
+        if body.provenance not in (
+            "PUBLIC reproducible",
+            "DECLASSIFIED real-device",
+            "PRIVATE local verification",
+        ):
+            raise HTTPException(422, "请选择数据来源级别")
+        with mutation_lock, connect(database) as db:
+            s, t = sample_access(db, sample_id, u, True)
+            if t["status"] != "draft":
+                raise HTTPException(409, "发布后片段名称、场景和来源保持冻结")
+            if not body.name.strip():
+                raise HTTPException(422, "片段名称不能为空")
+            try:
+                db.execute(
+                    "UPDATE samples SET name=?,scene=?,provenance=? WHERE id=?",
+                    (body.name.strip(), body.scene, body.provenance, s["id"]),
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, "同名片段已存在")
+        return {"ok": True}
 
     @app.post("/api/samples/{sample_id}/tracks")
     def upload_track(
@@ -712,6 +763,46 @@ def create_app(
                     "INSERT OR IGNORE INTO members VALUES(?,?)", (task_id, member)
                 )
             db.execute("UPDATE tasks SET status='active' WHERE id=?", (task_id,))
+        return {"ok": True}
+
+    @app.patch("/api/tasks/{task_id}/members")
+    def update_members(task_id: str, body: MembersInput, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            t = task_access(db, task_id, u, True)
+            if t["status"] == "closed":
+                raise HTTPException(409, "已关闭任务的参与人员保持冻结")
+            requested = set(body.users) | {t["owner"]}
+            if any(
+                not db.execute("SELECT 1 FROM users WHERE id=?", (member,)).fetchone()
+                for member in requested
+            ):
+                raise HTTPException(422, "参与者不存在")
+            existing = {
+                row[0]
+                for row in db.execute(
+                    "SELECT user_id FROM members WHERE task_id=?", (task_id,)
+                )
+            }
+            for removed in existing - requested:
+                contributed = db.execute(
+                    "SELECT 1 FROM samples s LEFT JOIN comments c ON c.sample_id=s.id AND c.user_id=? "
+                    "LEFT JOIN ratings r ON r.sample_id=s.id AND r.user_id=? "
+                    "WHERE s.task_id=? AND (c.id IS NOT NULL OR r.user_id IS NOT NULL) LIMIT 1",
+                    (removed, removed, task_id),
+                ).fetchone()
+                if contributed:
+                    name = db.execute(
+                        "SELECT name FROM users WHERE id=?", (removed,)
+                    ).fetchone()[0]
+                    raise HTTPException(409, f"{name} 已提交评论或判断，不能移出任务")
+            for added in requested - existing:
+                db.execute("INSERT INTO members VALUES(?,?)", (task_id, added))
+            for removed in existing - requested:
+                db.execute(
+                    "DELETE FROM members WHERE task_id=? AND user_id=?",
+                    (task_id, removed),
+                )
         return {"ok": True}
 
     @app.post("/api/tasks/{task_id}/close")
