@@ -195,3 +195,58 @@ test('同事获授组织者权限后可上传、删除及恢复自己的任务',
   await page.locator('.task-card').click();
   await expect(page.locator('.track')).toHaveCount(3);
 });
+
+test('角色指南默认入口、章节搜索、完整下载与窄屏阅读', async ({ page }) => {
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  await page.request.post('/api/users', {
+    data: { name: '指南评测者', password: 'guide-password-only', role: 'reviewer' },
+  });
+  for (const [name, password, role, heading] of [
+    ['浏览器测试', 'test-password-only', '管理员', '首次启动与局域网部署'],
+    ['同事上传者', 'colleague-password', '组织者', '准备一组公平的比较'],
+    ['指南评测者', 'guide-password-only', '评测者', '登录并找到分配的任务'],
+  ]) {
+    await page.request.post('/api/login', { data: { name, password } });
+    await page.goto('/');
+    await page.getByRole('button', { name: '使用指南', exact: true }).click();
+    await expect(
+      page
+        .getByRole('group', { name: '选择指南角色' })
+        .getByRole('button', { name: new RegExp(role + '.*当前角色') }),
+    ).toHaveAttribute('aria-pressed', 'true');
+    await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
+    await page.keyboard.press('Escape');
+  }
+  await page.getByRole('button', { name: '使用指南', exact: true }).click();
+  await page
+    .getByRole('group', { name: '选择指南角色' })
+    .getByRole('button', { name: '组织者', exact: true })
+    .click();
+  await page.getByLabel('搜索当前角色指南').fill('共享目录');
+  await expect(
+    page.getByRole('heading', { name: '单个上传与共享目录', exact: true }),
+  ).toBeVisible();
+  await page.getByLabel('搜索当前角色指南').fill('无此关键词xyz');
+  await expect(page.getByRole('heading', { name: '没有匹配的章节' })).toBeVisible();
+  await page.getByRole('button', { name: '清除搜索' }).click();
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '下载完整手册' }).click();
+  const download = await downloadPromise;
+  expect(download.suggestedFilename()).toBe('听鉴分角色使用手册.md');
+  const markdown = fs.readFileSync((await download.path())!, 'utf8');
+  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.3.1'])
+    expect(markdown).toContain(text);
+  const footer = await page.locator('.guide-footer').boundingBox();
+  expect(footer!.y + footer!.height).toBeLessThanOrEqual(768);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+  await page
+    .getByRole('navigation', { name: '指南章节' })
+    .getByRole('button', { name: '同步试听与快捷键' })
+    .click();
+  await expect(page.getByRole('heading', { name: '同步试听与快捷键' })).toBeVisible();
+});

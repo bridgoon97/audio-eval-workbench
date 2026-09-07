@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, type Analysis, type Sample, type Task, type User } from './types';
+import { UserGuide } from './UserGuide';
 import { BatchImport } from './BatchImport';
 import { Waveform } from './Waveform';
 import './style.css';
@@ -610,7 +611,7 @@ function App() {
               </div>
             )}
             <div className="dashboard-footer">
-              <span>听鉴 0.3 · 本地优先</span>
+              <span>听鉴 0.3.1 · 本地优先</span>
               {user.role !== 'reviewer' && (
                 <button
                   className="text-button"
@@ -1560,33 +1561,7 @@ function App() {
               </form>
             </>
           )}
-          {modal === 'help' && (
-            <div className="help">
-              <h3>一次比较，四个步骤</h3>
-              <ol>
-                <li>创建任务，为每个片段导入至少两个等长 WAV。</li>
-                <li>使用原始相对电平试听，拖动波形框选片段并保存标注。</li>
-                <li>创建同事账号、发布任务，同事通过浏览器独立提交。</li>
-                <li>关闭并揭晓，点击评论回到同一片段，共同复盘。</li>
-              </ol>
-              <h3>快捷键</h3>
-              <p>
-                <kbd>空格</kbd> 播放 / 暂停　<kbd>1–6</kbd> 切换候选
-              </p>
-              <p>
-                <kbd>L</kbd> 循环选区　<kbd>C</kbd> 编辑评论
-              </p>
-              <h3>局域网访问</h3>
-              <p>
-                启动程序时加 <code>--lan</code>，同事访问 <code>http://主机IP:8765</code>
-                。主机保持开机并允许此端口通过防火墙。Windows 文件共享权限不会自动成为网页权限。
-              </p>
-              <p>
-                这是开发预览版：16 kHz、单通道或 4 通道 WAV，每题最多 6
-                路；只提供探索性偏好判断，尚未实现标准 MUSHRA、延迟自动检测或响度匹配。
-              </p>
-            </div>
-          )}
+          {modal === 'help' && <UserGuide role={user.role} />}
           {modal === 'report' && report && (
             <div className="report">
               <p className="muted">

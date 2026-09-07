@@ -208,7 +208,7 @@ def create_app(
         with connect(database) as db:
             return {
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
-                "version": "0.3.0",
+                "version": "0.3.1",
             }
 
     @app.post("/api/setup")
