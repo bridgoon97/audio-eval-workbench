@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY, sample_id TEXT NOT NULL R
 CREATE TABLE IF NOT EXISTS aliases(user_id TEXT REFERENCES users(id), sample_id TEXT REFERENCES samples(id), track_id TEXT REFERENCES tracks(id), position INTEGER NOT NULL, PRIMARY KEY(user_id,track_id), UNIQUE(user_id,sample_id,position));
 CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY, sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), track_id TEXT REFERENCES tracks(id), start INTEGER NOT NULL, end INTEGER NOT NULL, body TEXT NOT NULL, tag TEXT NOT NULL, parent TEXT REFERENCES comments(id), created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ratings(sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), choice TEXT NOT NULL, reason TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY(sample_id,user_id));
+CREATE TABLE IF NOT EXISTS review_assignments(task_id TEXT NOT NULL REFERENCES tasks(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(task_id,user_id));
 """
 
 
@@ -39,6 +40,13 @@ def init(path):
     with connect(path) as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
+        # 无损迁移：旧数据中的非 owner 成员是当时被分配的评测者，迁入受邀名单；
+        # owner 的自动成员行只是访问便利，不构成评测义务。幂等，可重复执行。
+        db.execute(
+            "INSERT OR IGNORE INTO review_assignments(task_id,user_id) "
+            "SELECT m.task_id,m.user_id FROM members m JOIN tasks t ON t.id=m.task_id "
+            "WHERE m.user_id != t.owner"
+        )
 
 
 def password_hash(password):

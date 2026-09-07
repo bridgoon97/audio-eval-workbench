@@ -145,6 +145,7 @@ function App() {
     null,
   );
   const [members, setMembers] = useState<User[]>([]);
+  const [progress, setProgress] = useState<ReportPayload['参与进度'] | null>(null);
   const [report, setReport] = useState<ReportPayload | null>(null);
   const [dark, setDark] = useState(localStorage.getItem('theme') === 'dark');
   const [filter, setFilter] = useState('');
@@ -840,7 +841,21 @@ function App() {
                         })
                       }
                     >
-                      参与人员
+                      受邀评测者
+                    </button>
+                    <button
+                      onClick={() =>
+                        void run(async () => {
+                          const data = await api<{ 参与进度: ReportPayload['参与进度'] }>(
+                            '/tasks/' + task.id + '/progress',
+                          );
+                          setProgress(data['参与进度']);
+                          setModal('progress');
+                        })
+                      }
+                    >
+                      <Activity size={17} />
+                      评测进度
                     </button>
                     <button onClick={() => setModal('close')}>
                       <Check size={17} />
@@ -1307,7 +1322,8 @@ function App() {
               new: '新建评测任务',
               'edit-task': '编辑评测任务',
               'edit-sample': '编辑音频片段',
-              members: '调整参与人员',
+              members: '受邀评测者',
+              progress: '评测进度',
               batch: '按版本目录批量导入',
               'edit-track': '管理草稿候选',
               sample: '添加音频片段',
@@ -1602,30 +1618,75 @@ function App() {
                   });
                   await openTask(task.id);
                   setModal('');
-                  setNotice('参与人员已更新；在线同事将在约 5 秒内看到变化。');
+                  setNotice('受邀评测者已更新；在线同事将在约 5 秒内看到变化。');
                 });
               }}
             >
               <p>
-                发布进行中仍可增加参与者。只可移除尚未提交评论或偏好判断的人；任务创建者始终保留。关闭任务后名单冻结。
+                勾选的同事即受邀完成评测；负责人自动拥有访问权限，但不自动受邀。只可移除尚未提交评论或偏好判断的人；关闭任务后名单冻结。
               </p>
-              {members.map((member) => (
-                <label className="checkbox" key={member.id}>
-                  <input
-                    type="checkbox"
-                    name="users"
-                    value={member.id}
-                    defaultChecked={task.members?.includes(member.id) || member.id === task.owner}
-                    disabled={member.id === task.owner}
-                  />
-                  {member.name}
-                  {member.id === task.owner ? '（任务创建者）' : ''}
-                </label>
-              ))}
+              {members.map((member) =>
+                member.id === task.owner ? (
+                  <label className="checkbox" key={member.id}>
+                    <input
+                      type="checkbox"
+                      value={member.id}
+                      checked={task.review_assignments?.includes(member.id) || false}
+                      disabled
+                    />
+                    {member.name}（任务创建者，自动拥有访问权限）
+                  </label>
+                ) : (
+                  <label className="checkbox" key={member.id}>
+                    <input
+                      type="checkbox"
+                      name="users"
+                      value={member.id}
+                      defaultChecked={task.review_assignments?.includes(member.id)}
+                    />
+                    {member.name}
+                  </label>
+                ),
+              )}
               <button className="primary full" disabled={busy}>
-                保存参与人员
+                保存受邀评测者
               </button>
             </form>
+          )}
+          {modal === 'progress' && progress && (
+            <div className="task-progress">
+              <p className="muted">
+                收集期间可随时确认受邀同事的完成情况；此处只显示完成数量与状态，不含任何偏好内容。
+              </p>
+              <div className="progress-numbers">
+                <span>
+                  受邀评测者<strong>{progress.受邀评测者}</strong>
+                </span>
+                <span>
+                  已完成<strong>{progress.已完成}</strong>
+                </span>
+                <span>
+                  进行中<strong>{progress.进行中}</strong>
+                </span>
+                <span>
+                  未开始<strong>{progress.未开始}</strong>
+                </span>
+              </div>
+              <div className="progress-rows">
+                {progress.成员.map((m) => (
+                  <div key={m.ID}>
+                    <strong>{m.名称}</strong>
+                    <span>
+                      {m.已提交片段数}/{task?.samples?.length || 0} 片段 · {m.状态}
+                    </span>
+                  </div>
+                ))}
+                {!progress.成员.length && <p className="muted">还没有受邀评测者。</p>}
+              </div>
+              <small>
+                已完成＝已提交全部片段；进行中＝已提交部分片段；未开始＝尚未提交。评论不算提交。
+              </small>
+            </div>
           )}
           {modal === 'track' && (
             <form
@@ -1787,19 +1848,23 @@ function App() {
                 <h3>参与进度</h3>
                 <div className="progress-numbers">
                   <span>
-                    总参与者<strong>{report['参与进度'].总参与者}</strong>
+                    受邀评测者<strong>{report['参与进度'].受邀评测者}</strong>
                   </span>
                   <span>
-                    已提交<strong>{report['参与进度'].已提交}</strong>
+                    已完成<strong>{report['参与进度'].已完成}</strong>
                   </span>
                   <span>
-                    未提交<strong>{report['参与进度'].未提交}</strong>
+                    进行中<strong>{report['参与进度'].进行中}</strong>
+                  </span>
+                  <span>
+                    未开始<strong>{report['参与进度'].未开始}</strong>
                   </span>
                 </div>
-                <p>已提交：{report['参与进度'].已提交名单.join('、') || '—'}</p>
-                <p>未提交：{report['参与进度'].未提交名单.join('、') || '—'}</p>
+                <p>已完成：{report['参与进度'].已完成名单.join('、') || '—'}</p>
+                <p>进行中：{report['参与进度'].进行中名单.join('、') || '—'}</p>
+                <p>未开始：{report['参与进度'].未开始名单.join('、') || '—'}</p>
                 <small>
-                  名单来自任务成员表；每人每片段至多一票，评论与回复不算提交。负责人在成员表中即计入，不会被额外补记或漏计。
+                  受邀名单来自评测分配；负责人自动拥有访问权限，但不自动受邀。已完成＝已提交全部片段；进行中＝部分片段；未开始＝尚未提交；评论不算提交。
                 </small>
               </section>
               <section>

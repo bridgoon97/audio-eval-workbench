@@ -779,7 +779,7 @@ def test_nested_replies_keep_exact_parent(env):
 
 
 def test_progress_and_vote_summary_rules(env):
-    """参与进度、票数分母、幂等提交与分歧分类的可证伪规则。"""
+    """受邀口径、三态完成度、票数分母、幂等提交与分歧分类的可证伪规则。"""
     app, a, root = env
     first, first_id = reviewer(app, a, "参与者一")
     second, second_id = reviewer(app, a, "参与者二")
@@ -806,20 +806,50 @@ def test_progress_and_vote_summary_rules(env):
     assert second.post(f"/api/samples/{s2}/rating", json={"choice": tracks2[0]}).status_code == 200
     assert first.post(f"/api/samples/{s3}/rating", json={"choice": tracks3[0]}).status_code == 200
 
+    # 负责人未受邀：受邀名单只有 3 位同事，owner 不出现在任何进度名单。
+    progress = a.get(f"/api/tasks/{t}/progress").json()["参与进度"]
+    assert progress["受邀评测者"] == 3
+    assert {m["名称"]: (m["已提交片段数"], m["状态"]) for m in progress["成员"]} == {
+        "参与者一": (3, "已完成"),
+        "参与者二": (2, "进行中"),
+        "参与者三": (0, "未开始"),
+    }
+    assert progress["已完成"] == 1 and progress["进行中"] == 1 and progress["未开始"] == 1
+    assert owner_id not in [m["ID"] for m in progress["成员"]]
+    assert all("组织者" not in names for names in progress.values() if isinstance(names, list))
+
+    # 显式把负责人加入受邀名单才产生评测义务；移除后义务随之消失，访问权限保留。
+    assert (
+        a.patch(
+            f"/api/tasks/{t}/members",
+            json={"users": [first_id, second_id, third_id, owner_id]},
+        ).status_code
+        == 200
+    )
+    progress = a.get(f"/api/tasks/{t}/progress").json()["参与进度"]
+    assert progress["受邀评测者"] == 4
+    assert {"名称": "组织者", "已提交片段数": 0, "状态": "未开始"} in [
+        {k: m[k] for k in ("名称", "已提交片段数", "状态")} for m in progress["成员"]
+    ]
+    assert (
+        a.patch(
+            f"/api/tasks/{t}/members", json={"users": [first_id, second_id, third_id]}
+        ).status_code
+        == 200
+    )
+    progress = a.get(f"/api/tasks/{t}/progress").json()["参与进度"]
+    assert progress["受邀评测者"] == 3
+    assert owner_id in a.get(f"/api/tasks/{t}").json()["members"]
+
     assert a.post(f"/api/tasks/{t}/close").status_code == 200
     report = a.get(f"/api/tasks/{t}/report").json()
     progress = report["参与进度"]
-    # 发布时负责人自动进入成员表，因此按“被要求评分”计入未提交，不漏算也不重复算。
-    assert progress["总参与者"] == 4
-    assert progress["已提交"] == 2 and progress["未提交"] == 2
-    assert set(progress["已提交名单"]) == {"参与者一", "参与者二"}
-    assert set(progress["未提交名单"]) == {"参与者三", "组织者"}
-    assert {m["名称"]: m["已提交片段数"] for m in progress["成员"]} == {
-        "参与者一": 3,
-        "参与者二": 2,
-        "参与者三": 0,
-        "组织者": 0,
-    }
+    assert progress["受邀评测者"] == 3
+    assert progress["已完成"] == 1 and progress["进行中"] == 1 and progress["未开始"] == 1
+    assert progress["已完成名单"] == ["参与者一"]
+    assert progress["进行中名单"] == ["参与者二"]
+    assert progress["未开始名单"] == ["参与者三"]
+    assert owner_id not in [m["ID"] for m in progress["成员"]]
 
     views = {s["id"]: s for s in report["样本"]}
     assert views[s1]["分母"] == 2 and views[s2]["分母"] == 2 and views[s3]["分母"] == 1
@@ -848,13 +878,75 @@ def test_progress_and_vote_summary_rules(env):
     views = {s["id"]: s for s in a.get(f"/api/tasks/{t}/report").json()["样本"]}
     assert views[s2]["分歧"] is True
 
-    # 进度只依据成员表：负责人被移出成员表后不得被补记为缺失或参与者。
-    with sqlite3.connect(root / "workbench.sqlite3") as db:
-        db.execute("DELETE FROM members WHERE task_id=? AND user_id=?", (t, owner_id))
-    progress = a.get(f"/api/tasks/{t}/report").json()["参与进度"]
-    assert progress["总参与者"] == 3
-    assert owner_id not in [m["ID"] for m in progress["成员"]]
-    assert "组织者" not in progress["未提交名单"]
+
+def test_active_progress_visibility_and_no_preference_leak(env):
+    """active 进度仅管理者可读，且不携带任何偏好内容；关闭后复盘同口径。"""
+    app, a, _ = env
+    first, first_id = reviewer(app, a, "进度甲")
+    second, second_id = reviewer(app, a, "进度乙")
+    third, third_id = reviewer(app, a, "进度丙")
+    outsider, _ = reviewer(app, a, "进度局外")
+    t, s, tracks = task(a)
+    s2, tracks2 = sample_with_tracks(a, t, "秘密第二片段")
+    publish(a, t, [first_id, second_id, third_id])
+    first.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
+    first.post(f"/api/samples/{s2}/rating", json={"choice": tracks2[0]})
+    second.post(f"/api/samples/{s}/rating", json={"choice": "tie"})
+    third.post(
+        f"/api/samples/{s}/comments", json={"start": 0, "end": 100, "body": "盲评中的评论"}
+    )
+
+    body = a.get(f"/api/tasks/{t}/progress")
+    assert body.status_code == 200
+    text = body.text
+    progress = body.json()["参与进度"]
+    assert (progress["受邀评测者"], progress["已完成"], progress["进行中"], progress["未开始"]) == (
+        3,
+        1,
+        1,
+        1,
+    )
+    # 不泄露：真实候选名、track ID、choice、评论文本都不得出现。
+    assert "秘密" not in text and "第二片段" not in text
+    assert tracks[0] not in text and tracks2[0] not in text
+    assert "tie" not in text
+    assert "盲评中的评论" not in text
+    # active 期间普通成员、未授权用户、未登录均不可读。
+    assert first.get(f"/api/tasks/{t}/progress").status_code == 403
+    assert outsider.get(f"/api/tasks/{t}/progress").status_code == 403
+    assert TestClient(app).get(f"/api/tasks/{t}/progress").status_code == 401
+
+    a.post(f"/api/tasks/{t}/close")
+    # 关闭后复盘使用同一口径；进度端点仍仅限管理者。
+    report = first.get(f"/api/tasks/{t}/report").json()["参与进度"]
+    assert (report["已完成"], report["进行中"], report["未开始"]) == (1, 1, 1)
+    assert report["已完成名单"] == ["进度甲"]
+    assert first.get(f"/api/tasks/{t}/progress").status_code == 403
+    assert a.get(f"/api/tasks/{t}/progress").status_code == 200
+
+
+def test_legacy_members_migrate_without_owner_obligation(env):
+    """旧库无损迁移：非 owner 成员成为受邀评测者，owner 不因自动成员行受邀。"""
+    app, a, folder = env
+    _, first_id = reviewer(app, a, "旧成员一")
+    _, second_id = reviewer(app, a, "旧成员二")
+    t = a.post("/api/tasks", json={"title": "迁移任务", "mode": "development"}).json()["id"]
+    sample_with_tracks(a, t, "迁移片段")
+    publish(a, t, [first_id, second_id])
+    a.post(f"/api/tasks/{t}/close")
+    # 模拟 0.5 旧库：review_assignments 尚不存在任何行。
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute("DELETE FROM review_assignments")
+    restarted = create_app(folder)
+    c = TestClient(restarted)
+    c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
+    # 访问不破坏；受邀名单恢复为两位非 owner 成员，owner 不在其中。
+    assert c.get(f"/api/tasks/{t}").status_code == 200
+    progress = c.get(f"/api/tasks/{t}/report").json()["参与进度"]
+    assert progress["受邀评测者"] == 2
+    assert {m["名称"] for m in progress["成员"]} == {"旧成员一", "旧成员二"}
+    assert progress["未开始"] == 2 and progress["未开始名单"] == ["旧成员一", "旧成员二"]
+    assert not any(m["名称"] == "组织者" for m in progress["成员"])
 
 
 def test_active_blind_summary_and_exports_stay_sealed(env):
@@ -873,6 +965,11 @@ def test_active_blind_summary_and_exports_stay_sealed(env):
         assert member.get(f"/api/tasks/{t}/{path}").status_code == 403
         assert outsider.get(f"/api/tasks/{t}/{path}").status_code == 403
         assert TestClient(app).get(f"/api/tasks/{t}/{path}").status_code == 401
+    # 进度不同：active 期间管理者可读（仅数量与状态），其他人不可读。
+    assert a.get(f"/api/tasks/{t}/progress").status_code == 200
+    assert member.get(f"/api/tasks/{t}/progress").status_code == 403
+    assert outsider.get(f"/api/tasks/{t}/progress").status_code == 403
+    assert TestClient(app).get(f"/api/tasks/{t}/progress").status_code == 401
     a.post(f"/api/tasks/{t}/close")
     # 关闭后成员可查看汇总（既有规则），导出仍仅限任务管理者。
     assert member.get(f"/api/tasks/{t}/report").status_code == 200
@@ -881,6 +978,8 @@ def test_active_blind_summary_and_exports_stay_sealed(env):
         assert member.get(f"/api/tasks/{t}/{path}").status_code == 403
         assert outsider.get(f"/api/tasks/{t}/{path}").status_code == 403
     assert outsider.get(f"/api/tasks/{t}/report").status_code == 403
+    assert member.get(f"/api/tasks/{t}/progress").status_code == 403
+    assert a.get(f"/api/tasks/{t}/progress").status_code == 200
 
 
 def test_tag_summary_counts_root_comments_only_and_locates_samples(env):
@@ -937,7 +1036,15 @@ def test_export_formats_content_and_compatibility(env):
     assert data["任务"]["status"] == "closed" and data["任务"]["mode"] == "blind"
     assert data["生成时间"]
     progress = data["参与进度"]
-    assert (progress["总参与者"], progress["已提交"], progress["未提交"]) == (3, 2, 1)
+    # 受邀名单只含两位被分配同事；负责人未受邀，不出现在进度中。
+    assert (progress["受邀评测者"], progress["已完成"], progress["进行中"], progress["未开始"]) == (
+        2,
+        1,
+        1,
+        0,
+    )
+    assert progress["已完成名单"] == ["导出甲"] and progress["进行中名单"] == ["导出乙"]
+    assert not any(m["名称"] == "组织者" for m in progress["成员"])
     indoor = next(s for s in data["样本"] if s["id"] == s1)
     outdoor = next(s for s in data["样本"] if s["id"] == s2)
     assert indoor["分母"] == 2 and outdoor["分母"] == 1
@@ -962,9 +1069,17 @@ def test_export_formats_content_and_compatibility(env):
     assert any(row[4] == "无明显差异" and row[6] == "1" and row[7] == "2" for row in indoor_rows)
     assert any(row[4] == "室内候选甲" and row[8] == "50.0%（1/2）" for row in indoor_rows)
     assert any(row[9].startswith("存在分歧") for row in indoor_rows)
-    assert any(row[4] == "总参与者" and row[6] == "3" for row in rows)
-    assert any(row[4] == "组织者" and row[6] == "0" and row[9] == "未提交" for row in rows)
-    assert any(row[4] == "导出乙" and row[6] == "1" and row[9] == "已提交" for row in rows)
+    assert any(row[4] == "受邀评测者" and row[6] == "2" for row in rows)
+    assert any(row[4] == "进行中人数" and row[6] == "1" for row in rows)
+    assert any(
+        row[4] == "导出甲" and row[6] == "2" and row[7] == "2" and row[9] == "已完成"
+        for row in rows
+    )
+    assert any(
+        row[4] == "导出乙" and row[6] == "1" and row[7] == "2" and row[9] == "进行中"
+        for row in rows
+    )
+    assert not any(row[0] == "参与进度" and row[4] == "组织者" for row in rows)
     assert any(row[5] == "残噪" and row[6] == "1" and s1 in row[9] for row in rows)
 
     markdown = a.get(f"/api/tasks/{t}/export.md").text
@@ -973,5 +1088,54 @@ def test_export_formats_content_and_compatibility(env):
     assert "有效提交人数（分母）：2" in markdown
     assert "50.0%（1/2）" in markdown
     assert "仅统计根评论" in markdown and "描述性提示" in markdown
-    assert "未提交 1 人" in markdown
+    assert "受邀评测者 2 人；已完成 1 人；进行中 1 人；未开始 0 人" in markdown
+    assert "负责人自动拥有访问权限，但不自动成为受邀评测者" in markdown
     assert tracks1[0] in markdown and s1 in markdown
+
+
+def test_csv_formula_injection_sanitized(env):
+    """危险起始字符的文本单元必须变成 Excel 纯文本；数值单元不受影响。"""
+    app, a, _ = env
+    danger, danger_id = reviewer(app, a, "=HYPERLINK(\"http://evil.example\")")
+    t = a.post("/api/tasks", json={"title": "=SUM(A1:A10)", "mode": "development"}).json()["id"]
+    s = a.post(f"/api/tasks/{t}/samples", json={"name": "-2+3|片段"}).json()["id"]
+    tracks = []
+    for i, name in enumerate(("@候选一", "+候选二")):
+        r = a.post(
+            f"/api/samples/{s}/tracks",
+            data={"name": name, "version": "v"},
+            files={"file": ("x.wav", demo_wav(i, 0), "audio/wav")},
+        )
+        tracks.append(r.json()["id"])
+    publish(a, t, [danger_id])
+    danger.post(
+        f"/api/samples/{s}/comments",
+        json={"start": 0, "end": 100, "body": "危险标签", "tag": "=注入标签"},
+    )
+    danger.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
+    a.post(f"/api/tasks/{t}/close")
+
+    raw = a.get(f"/api/tasks/{t}/export.csv").content
+    assert raw[:3] == b"\xef\xbb\xbf" and b"\r\n" in raw
+    rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"))))
+    cells = {cell for row in rows for cell in row}
+    # 危险文本全部加单引号前缀，Excel 按纯文本处理且保留可读内容。
+    for dangerous in (
+        "=SUM(A1:A10)",
+        '=HYPERLINK("http://evil.example")',
+        "-2+3|片段",
+        "@候选一",
+        "+候选二",
+        "=注入标签",
+    ):
+        assert f"'{dangerous}" in cells, dangerous
+        assert dangerous not in cells, dangerous
+    # 数值单元保持数值含义，未被转义。
+    vote_rows = [row for row in rows if row[0] == "逐片段偏好" and row[4] == "'@候选一"]
+    assert vote_rows and vote_rows[0][6] == "1" and vote_rows[0][7] == "1"
+    assert "'1" not in cells and "'2" not in cells
+    # Markdown 与 JSON 不做 Excel 专用转义。
+    markdown = a.get(f"/api/tasks/{t}/export.md").text
+    assert "=SUM(A1:A10)" in markdown and "'=SUM(A1:A10)" not in markdown
+    data = json.loads(a.get(f"/api/tasks/{t}/export").text)
+    assert data["任务"]["title"] == "=SUM(A1:A10)"

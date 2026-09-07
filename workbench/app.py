@@ -43,17 +43,28 @@ def share_text(count, denominator):
     return f"{100 * count / denominator:.1f}%（{count}/{denominator}）"
 
 
+def csv_safe(value):
+    """在 CSV 序列化边界防止 Excel 公式注入：文本单元若以 = + - @ 或
+    制表/回车/换行（含前导空白后）开头，加单引号前缀变为纯文本；
+    数值单元保持数值含义，不做转换。"""
+    if isinstance(value, str) and value.lstrip()[:1] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+        return "'" + value
+    return value
+
+
 def task_summary(db, task_id):
     """复盘汇总。口径固定：
-    - 参与名单只来自 members 表；负责人只有在成员表里才计入，不会被额外补记为缺失。
-    - “已提交”指该成员在本任务提交过至少一个片段的偏好；评论和回复不算提交。
+    - 受邀评测者名单只来自 review_assignments；负责人自动拥有访问权限，
+      但不因 owner 身份或自动成员行成为受邀评测者。
+    - 完成度三态：已完成＝已提交全部片段（片段总数>0）；进行中＝已提交
+      部分片段；未开始＝尚未提交。评论和回复不算提交。
     - 每个片段的分母是该片段的有效提交人数（ratings 每人每片段至多一行）。
     - 分歧＝同一片段出现两种及以上不同偏好，仅描述，不做显著性判断。
     - 标签只统计根评论，回复楼层不计入。
     """
-    members = db.execute(
-        "SELECT u.id AS id, u.name AS name FROM members m JOIN users u ON u.id=m.user_id "
-        "WHERE m.task_id=? ORDER BY u.name, u.id",
+    assigned = db.execute(
+        "SELECT u.id AS id, u.name AS name FROM review_assignments a JOIN users u ON u.id=a.user_id "
+        "WHERE a.task_id=? ORDER BY u.name, u.id",
         (task_id,),
     ).fetchall()
     samples = db.execute(
@@ -68,22 +79,30 @@ def task_summary(db, task_id):
     ):
         choices.setdefault(row["sample_id"], []).append(row["choice"])
         rated.setdefault(row["user_id"], set()).add(row["sample_id"])
-    done = [m for m in members if rated.get(m["id"])]
-    missed = [m for m in members if not rated.get(m["id"])]
+
+    def state_of(count):
+        if len(samples) and count == len(samples):
+            return "已完成"
+        return "进行中" if count else "未开始"
+
+    states = {"已完成": [], "进行中": [], "未开始": []}
+    members_view = []
+    for m in assigned:
+        count = len(rated.get(m["id"], ()))
+        state = state_of(count)
+        states[state].append(m["name"])
+        members_view.append(
+            {"ID": m["id"], "名称": m["name"], "已提交片段数": count, "状态": state}
+        )
     progress = {
-        "总参与者": len(members),
-        "已提交": len(done),
-        "未提交": len(missed),
-        "已提交名单": [m["name"] for m in done],
-        "未提交名单": [m["name"] for m in missed],
-        "成员": [
-            {
-                "ID": m["id"],
-                "名称": m["name"],
-                "已提交片段数": len(rated.get(m["id"], ())),
-            }
-            for m in members
-        ],
+        "受邀评测者": len(assigned),
+        "已完成": len(states["已完成"]),
+        "进行中": len(states["进行中"]),
+        "未开始": len(states["未开始"]),
+        "已完成名单": states["已完成"],
+        "进行中名单": states["进行中"],
+        "未开始名单": states["未开始"],
+        "成员": members_view,
     }
     per_sample = {}
     for sample in samples:
@@ -151,9 +170,10 @@ def results_csv(value) -> bytes:
     rows += [
         ["参与进度", "", "", "", label, "", progress[key], "", "", note]
         for label, key, note in (
-            ("总参与者", "总参与者", "名单来自任务成员表"),
-            ("已提交人数", "已提交", "提交过至少一个片段的偏好"),
-            ("未提交人数", "未提交", "评论不算提交"),
+            ("受邀评测者", "受邀评测者", "名单来自评测分配，负责人不自动受邀"),
+            ("已完成人数", "已完成", "已提交全部片段"),
+            ("进行中人数", "进行中", "已提交部分片段"),
+            ("未开始人数", "未开始", "尚未提交任何偏好"),
         )
     ]
     for member in progress["成员"]:
@@ -168,7 +188,7 @@ def results_csv(value) -> bytes:
                 member["已提交片段数"],
                 len(samples),
                 share_text(member["已提交片段数"], len(samples)) if samples else "—",
-                "已提交" if member["已提交片段数"] else "未提交",
+                member["状态"],
             ]
         )
     for sample in samples:
@@ -213,7 +233,7 @@ def results_csv(value) -> bytes:
         )
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\r\n")
-    writer.writerows(rows)
+    writer.writerows([[csv_safe(cell) for cell in row] for row in rows])
     return buffer.getvalue().encode("utf-8-sig")
 
 
@@ -242,14 +262,17 @@ def results_markdown(value) -> str:
         "",
         "## 参与进度",
         "",
-        (
-            f"- 总参与者 {progress['总参与者']} 人；已提交 {progress['已提交']} 人；"
-            f"未提交 {progress['未提交']} 人。"
-        ),
-        f"- 已提交：{'、'.join(progress['已提交名单']) or '—'}",
-        f"- 未提交：{'、'.join(progress['未提交名单']) or '—'}",
+        "受邀名单来自评测分配；负责人自动拥有访问权限，但不自动成为受邀评测者。",
         "",
-        "| 成员 | 已提交片段 | 状态 |",
+        (
+            f"- 受邀评测者 {progress['受邀评测者']} 人；已完成 {progress['已完成']} 人；"
+            f"进行中 {progress['进行中']} 人；未开始 {progress['未开始']} 人。"
+        ),
+        f"- 已完成：{'、'.join(progress['已完成名单']) or '—'}",
+        f"- 进行中：{'、'.join(progress['进行中名单']) or '—'}",
+        f"- 未开始：{'、'.join(progress['未开始名单']) or '—'}",
+        "",
+        "| 受邀评测者 | 已提交片段 | 状态 |",
         "| --- | --- | --- |",
     ]
     for member in progress["成员"]:
@@ -764,6 +787,16 @@ def create_app(
                 if t["can_manage"]
                 else []
             )
+            t["review_assignments"] = (
+                [
+                    r[0]
+                    for r in db.execute(
+                        "SELECT user_id FROM review_assignments WHERE task_id=?", (task_id,)
+                    )
+                ]
+                if t["can_manage"]
+                else []
+            )
             return t
 
     @app.post("/api/tasks/{task_id}/samples")
@@ -1023,11 +1056,17 @@ def create_app(
             ).fetchall()
             if not rows or any(r["n"] < 2 for r in rows):
                 raise HTTPException(422, "每个样本至少需要两个版本")
-            for member in set(body.users + [u["id"]]):
+            # body.users 才是受邀评测者；owner 自动获得访问权限，但不构成评测义务。
+            for member in set(body.users):
                 if not db.execute(
                     "SELECT 1 FROM users WHERE id=?", (member,)
                 ).fetchone():
                     raise HTTPException(422, "评测者不存在")
+                db.execute(
+                    "INSERT OR IGNORE INTO review_assignments VALUES(?,?)",
+                    (task_id, member),
+                )
+            for member in set(body.users) | {u["id"]}:
                 db.execute(
                     "INSERT OR IGNORE INTO members VALUES(?,?)", (task_id, member)
                 )
@@ -1041,7 +1080,7 @@ def create_app(
             t = task_access(db, task_id, u, True)
             if t["status"] == "closed":
                 raise HTTPException(409, "已关闭任务的参与人员保持冻结")
-            requested = set(body.users) | {t["owner"]}
+            requested = set(body.users)
             if any(
                 not db.execute("SELECT 1 FROM users WHERE id=?", (member,)).fetchone()
                 for member in requested
@@ -1053,7 +1092,9 @@ def create_app(
                     "SELECT user_id FROM members WHERE task_id=?", (task_id,)
                 )
             }
-            for removed in existing - requested:
+            # owner 的访问权限无条件保留；只有真正失去访问的人才需要移除保护。
+            losing_access = existing - requested - {t["owner"]}
+            for removed in losing_access:
                 contributed = db.execute(
                     "SELECT 1 FROM samples s LEFT JOIN comments c ON c.sample_id=s.id AND c.user_id=? "
                     "LEFT JOIN ratings r ON r.sample_id=s.id AND r.user_id=? "
@@ -1067,9 +1108,27 @@ def create_app(
                     raise HTTPException(409, f"{name} 已提交评论或判断，不能移出任务")
             for added in requested - existing:
                 db.execute("INSERT INTO members VALUES(?,?)", (task_id, added))
-            for removed in existing - requested:
+            for removed in losing_access:
                 db.execute(
                     "DELETE FROM members WHERE task_id=? AND user_id=?",
+                    (task_id, removed),
+                )
+            # 同步受邀评测者名单：勾选即受邀；owner 不再被强制加入；
+            # 已贡献者无法被移出访问，因此也不会从受邀名单中丢失。
+            assigned = {
+                row[0]
+                for row in db.execute(
+                    "SELECT user_id FROM review_assignments WHERE task_id=?", (task_id,)
+                )
+            }
+            for added in requested - assigned:
+                db.execute(
+                    "INSERT OR IGNORE INTO review_assignments VALUES(?,?)",
+                    (task_id, added),
+                )
+            for removed in assigned - requested:
+                db.execute(
+                    "DELETE FROM review_assignments WHERE task_id=? AND user_id=?",
                     (task_id, removed),
                 )
         return {"ok": True}
@@ -1083,6 +1142,21 @@ def create_app(
                 raise HTTPException(409, "只能关闭已发布任务")
             db.execute("UPDATE tasks SET status='closed' WHERE id=?", (task_id,))
         return {"ok": True}
+
+    @app.get("/api/tasks/{task_id}/progress")
+    def task_progress(task_id: str, request: Request):
+        # 收集期间的管理者进度：只含受邀名单、每人已提交片段数与三态状态，
+        # 不含 choice、候选 ID/名称、票数或评论内容等盲评信息。
+        u = user(request)
+        with connect(database) as db:
+            t = task_access(db, task_id, u, True)
+            if t["status"] == "draft":
+                raise HTTPException(409, "任务发布后才有评测进度")
+            summary = task_summary(db, task_id)
+        return {
+            "任务": {"id": task_id, "status": t["status"], "模式": t["mode"]},
+            "参与进度": summary["参与进度"],
+        }
 
     @app.get("/api/samples/{sample_id}")
     def sample_detail(sample_id: str, request: Request):

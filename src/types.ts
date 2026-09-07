@@ -11,6 +11,7 @@ export type Task = {
   completed: number;
   samples?: Sample[];
   members?: string[];
+  review_assignments?: string[];
 };
 export type Track = {
   id: string;

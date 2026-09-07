@@ -426,10 +426,10 @@ test('草稿信息可修正、发布后增补成员、评论按楼层回复', as
     page.locator('.task-card').filter({ hasText: '评论线程与增补成员测试' }),
   ).toBeVisible();
   await page.locator('.task-card').filter({ hasText: '评论线程与增补成员测试' }).click();
-  await page.getByRole('button', { name: '参与人员', exact: true }).click();
+  await page.getByRole('button', { name: '受邀评测者', exact: true }).click();
   await page.getByRole('checkbox', { name: '评论乙', exact: true }).check();
   await page.getByRole('checkbox', { name: '待移除成员', exact: true }).uncheck();
-  await page.getByRole('button', { name: '保存参与人员' }).click();
+  await page.getByRole('button', { name: '保存受邀评测者' }).click();
 
   const first = await browser.newContext();
   const second = await browser.newContext();
@@ -591,17 +591,34 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
     await second.close();
   }
 
+  // 关闭前：管理者通过“评测进度”确认完成情况（只含数量与状态，无偏好内容）。
+  await page.goto('/');
+  await page.locator('.task-card').filter({ hasText: '复盘验收任务' }).click();
+  await page.getByRole('button', { name: '评测进度' }).click();
+  const live = page.locator('.progress-numbers span');
+  await expect(live.nth(0)).toHaveText('受邀评测者2');
+  await expect(live.nth(1)).toHaveText('已完成1');
+  await expect(live.nth(2)).toHaveText('进行中0');
+  await expect(live.nth(3)).toHaveText('未开始1');
+  await expect(page.locator('.progress-rows')).toContainText('复盘乙2/2 片段 · 已完成');
+  await expect(page.locator('.progress-rows')).toContainText('复盘甲0/2 片段 · 未开始');
+  await expect(page.locator('.task-progress')).not.toContainText('候选A');
+  await page.keyboard.press('Escape');
+
   await page.request.post(`/api/tasks/${created.id}/close`);
   await page.goto('/');
   await page.locator('.task-card').filter({ hasText: '复盘验收任务' }).click();
   await page.getByRole('button', { name: '查看结果' }).click();
 
   const progress = page.locator('.progress-numbers span');
-  await expect(progress.nth(0)).toHaveText('总参与者3');
-  await expect(progress.nth(1)).toHaveText('已提交2');
-  await expect(progress.nth(2)).toHaveText('未提交1');
-  await expect(page.locator('.review-progress')).toContainText('已提交：复盘乙、浏览器测试');
-  await expect(page.locator('.review-progress')).toContainText('未提交：复盘甲');
+  await expect(progress.nth(0)).toHaveText('受邀评测者2');
+  await expect(progress.nth(1)).toHaveText('已完成1');
+  await expect(progress.nth(2)).toHaveText('进行中0');
+  await expect(progress.nth(3)).toHaveText('未开始1');
+  await expect(page.locator('.review-progress')).toContainText('已完成：复盘乙');
+  await expect(page.locator('.review-progress')).toContainText('未开始：复盘甲');
+  // 负责人未受邀，不出现在进度名单中。
+  await expect(page.locator('.review-progress')).not.toContainText('浏览器测试');
 
   const disputed = page.locator('.review-sample').filter({ hasText: '有分歧片段' });
   const consistent = page.locator('.review-sample').filter({ hasText: '一致片段' });

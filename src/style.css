@@ -1341,6 +1341,21 @@ kbd {
   margin: 6px 0 0;
   font-size: 13px;
 }
+.progress-rows {
+  margin: 12px 0;
+}
+.progress-rows > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding: 9px 0;
+  font-size: 13px;
+}
+.progress-rows span {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 .report section > small {
   color: var(--muted);
 }

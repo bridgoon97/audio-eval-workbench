@@ -5,12 +5,14 @@ import type { Sample } from './types';
 export type VoteRow = { ID: string; 名称: string; 票数: number };
 export type SampleSummary = { 分母: number; 票数: VoteRow[]; 分歧: boolean };
 export type ProgressSummary = {
-  总参与者: number;
-  已提交: number;
-  未提交: number;
-  已提交名单: string[];
-  未提交名单: string[];
-  成员: { ID: string; 名称: string; 已提交片段数: number }[];
+  受邀评测者: number;
+  已完成: number;
+  进行中: number;
+  未开始: number;
+  已完成名单: string[];
+  进行中名单: string[];
+  未开始名单: string[];
+  成员: { ID: string; 名称: string; 已提交片段数: number; 状态: string }[];
 };
 export type TagSummary = {
   标签: string;
