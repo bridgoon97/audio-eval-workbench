@@ -236,7 +236,7 @@ test('角色指南默认入口、章节搜索、完整下载与窄屏阅读', as
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toBe('听鉴分角色使用手册.md');
   const markdown = fs.readFileSync((await download.path())!, 'utf8');
-  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.3.1'])
+  for (const text of ['## 管理员', '## 组织者', '## 评测者', '## 通用操作与常见问题', '0.4.0'])
     expect(markdown).toContain(text);
   const footer = await page.locator('.guide-footer').boundingBox();
   expect(footer!.y + footer!.height).toBeLessThanOrEqual(768);
@@ -249,4 +249,134 @@ test('角色指南默认入口、章节搜索、完整下载与窄屏阅读', as
     .getByRole('button', { name: '同步试听与快捷键' })
     .click();
   await expect(page.getByRole('heading', { name: '同步试听与快捷键' })).toBeVisible();
+});
+
+test('自动密码、HTTP 复制回退与现有账号重置', async ({ page, browser }) => {
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: '团队成员', exact: true }).click();
+  const first = await page.getByLabel('初始密码').inputValue();
+  expect(first).toMatch(/^[A-Za-z0-9_-]{24}$/);
+  await page.getByRole('button', { name: '生成随机密码', exact: true }).click();
+  const generated = await page.getByLabel('初始密码').inputValue();
+  expect(generated).not.toBe(first);
+  await page.getByLabel('同事登录地址').fill('http://192.0.2.10:8765');
+  await page.getByLabel('账号', { exact: true }).fill('随机密码同事');
+  await page.getByRole('button', { name: '创建账号', exact: true }).click();
+  await expect(page.getByLabel('本次登录凭证内容')).toHaveValue(
+    `听鉴登录地址：http://192.0.2.10:8765\n账号：随机密码同事\n密码：${generated}`,
+  );
+  // 模拟 HTTP LAN 的剪贴板限制，必须保留可手动复制的文本。
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    document.execCommand = () => false;
+  });
+  await page.getByRole('button', { name: '复制登录凭证' }).click();
+  await expect(page.getByText('已选中文本，请按 Ctrl+C（Mac 为 ⌘C）复制。')).toBeVisible();
+  const colleague = await browser.newContext();
+  try {
+    expect(
+      (
+        await colleague.request.post('http://127.0.0.1:8877/api/login', {
+          data: { name: '随机密码同事', password: generated },
+        })
+      ).status(),
+    ).toBe(200);
+    await page.getByRole('button', { name: '重置 随机密码同事 的密码' }).click();
+    const replacement = await page.getByLabel('将生效的新密码').inputValue();
+    await page.getByLabel('输入账号名称确认').fill('随机密码同事');
+    await page.getByRole('button', { name: '确认重置密码', exact: true }).click();
+    await expect(page.getByLabel('本次登录凭证内容')).toHaveValue(
+      `听鉴登录地址：http://192.0.2.10:8765\n账号：随机密码同事\n密码：${replacement}`,
+    );
+    expect((await colleague.request.get('http://127.0.0.1:8877/api/me')).status()).toBe(401);
+    expect(
+      (
+        await colleague.request.post('http://127.0.0.1:8877/api/login', {
+          data: { name: '随机密码同事', password: generated },
+        })
+      ).status(),
+    ).toBe(401);
+    expect(
+      (
+        await colleague.request.post('http://127.0.0.1:8877/api/login', {
+          data: { name: '随机密码同事', password: replacement },
+        })
+      ).status(),
+    ).toBe(200);
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '团队成员', exact: true }).click();
+    await expect(page.getByLabel('本次登录凭证内容')).toHaveCount(0);
+    const local = await page.evaluate(() => JSON.stringify(localStorage));
+    expect(local).not.toContain(generated);
+    expect(local).not.toContain(replacement);
+  } finally {
+    await colleague.close();
+  }
+});
+
+test('同事不刷新网页即可收到角色和任务变化，保留未提交标注', async ({ page, browser }) => {
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  await page.request.post('/api/users', {
+    data: { name: '实时同步同事', password: 'sync-test-password', role: 'reviewer' },
+  });
+  const members = await (await page.request.get('/api/users')).json();
+  const member = members.find((u: { name: string }) => u.name === '实时同步同事');
+  const context = await browser.newContext();
+  const colleague = await context.newPage();
+  try {
+    await colleague.goto('http://127.0.0.1:8877');
+    await colleague.getByLabel('账号', { exact: true }).fill('实时同步同事');
+    await colleague.getByLabel('密码', { exact: true }).fill('sync-test-password');
+    await colleague.getByRole('button', { name: '进入工作台', exact: true }).click();
+    await expect(colleague.getByRole('button', { name: '新建评测', exact: true })).toHaveCount(0);
+    await page.request.patch(`/api/users/${member.id}/role`, { data: { role: 'organizer' } });
+    await expect(colleague.getByRole('button', { name: '新建评测', exact: true })).toBeVisible({
+      timeout: 12000,
+    });
+    const task = await (await page.request.post('/api/demo')).json();
+    await page.request.post(`/api/tasks/${task.id}/publish`, {
+      data: { users: [member.id], alignment_confirmed: true },
+    });
+    await expect(colleague.locator('.task-card')).toHaveCount(1, { timeout: 12000 });
+    await colleague.locator('.task-card').click();
+    await colleague.locator('#comment').fill('尚未提交的听感不能被自动刷新清空');
+    await colleague.getByLabel('起点', { exact: true }).fill('1.2');
+    await colleague.getByLabel('终点', { exact: true }).fill('1.8');
+    await page.request.post(`/api/tasks/${task.id}/close`);
+    await expect(colleague.getByRole('button', { name: '查看结果', exact: true })).toBeVisible({
+      timeout: 12000,
+    });
+    await expect(colleague.locator('#comment')).toHaveValue('尚未提交的听感不能被自动刷新清空');
+    await expect(colleague.getByLabel('起点', { exact: true })).toHaveValue('1.2');
+    await colleague.getByRole('button', { name: '服务信息 · 0.4.0' }).click();
+    await expect(colleague.getByText('数据编号', { exact: true })).toBeVisible();
+    await expect(colleague.getByText('数据目录（仅管理员可见）')).toHaveCount(0);
+    await colleague.keyboard.press('Escape');
+    await page.request.delete(`/api/tasks/${task.id}`, {
+      data: { title: '合成音试听 · 熟悉工作台' },
+    });
+    await expect(colleague.locator('.task-card')).toHaveCount(0, { timeout: 12000 });
+    await expect(colleague.getByText('当前任务已移除或访问权限已变更，列表已同步。')).toBeVisible({
+      timeout: 12000,
+    });
+  } finally {
+    await context.close();
+  }
+});
+
+test('服务与网页版本不一致时给出明确刷新提示', async ({ page }) => {
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  await page.route('**/api/status', (route) =>
+    route.fulfill({ json: { needs_setup: false, version: '0.3.0' } }),
+  );
+  await page.goto('/');
+  await expect(page.getByRole('alert')).toContainText('页面版本 0.4.0 与服务版本 0.3.0 不一致');
+  await expect(page.getByRole('button', { name: '重新加载页面' })).toBeVisible();
 });

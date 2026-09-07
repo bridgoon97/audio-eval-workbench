@@ -19,7 +19,6 @@ import {
   Plus,
   Repeat2,
   Settings2,
-  ShieldCheck,
   Sun,
   Upload,
   Users,
@@ -27,6 +26,8 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, type Analysis, type Sample, type Task, type User } from './types';
+import packageInfo from '../package.json';
+import { TeamMembers } from './TeamMembers';
 import { UserGuide } from './UserGuide';
 import { BatchImport } from './BatchImport';
 import { Waveform } from './Waveform';
@@ -104,6 +105,14 @@ function Modal({
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
+  const [serverVersion, setServerVersion] = useState('');
+  const [serverInfo, setServerInfo] = useState<{
+    version: string;
+    instance_id: string;
+    data_id: string;
+    data_directory?: string;
+  } | null>(null);
+  const [syncMessage, setSyncMessage] = useState('每 5 秒同步');
   const [setup, setSetup] = useState(false);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [task, setTask] = useState<Task | null>(null);
@@ -149,6 +158,7 @@ function App() {
   const initialize = async () => {
     const status = await api('/status');
     setSetup(status.needs_setup);
+    setServerVersion(status.version);
     if (!status.needs_setup) {
       try {
         setUser(await api('/me'));
@@ -165,6 +175,94 @@ function App() {
       setReady(true);
     });
   }, []);
+  const live = useRef({ user, task, sample, engine, busy, batchBusy });
+  live.current = { user, task, sample, engine, busy, batchBusy };
+  const syncing = useRef(false);
+  const synchronize = async () => {
+    const current = live.current;
+    if (!current.user || syncing.current || current.busy || current.batchBusy) return;
+    syncing.current = true;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 10000);
+    const read = <T,>(path: string) => api<T>(path, 'GET', undefined, controller.signal);
+    try {
+      const [nextUser, nextTasks, status] = await Promise.all([
+        read<User>('/me'),
+        read<Task[]>('/tasks'),
+        read<{ version: string }>('/status'),
+      ]);
+      if (live.current.user?.id !== current.user.id) return;
+      setServerVersion(status.version);
+      setUser((previous) =>
+        previous?.role === nextUser.role && previous.name === nextUser.name ? previous : nextUser,
+      );
+      setTasks(nextTasks);
+      if (current.task && live.current.task?.id === current.task.id) {
+        const visibleTask = nextTasks.find((t) => t.id === current.task!.id);
+        if (!visibleTask) {
+          live.current.engine?.stop();
+          setPlaying(false);
+          setTask(null);
+          setSample(null);
+          setModal('');
+          setNotice('当前任务已移除或访问权限已变更，列表已同步。');
+        } else {
+          const nextTask = await read<Task>('/tasks/' + current.task.id);
+          if (
+            live.current.user?.id !== current.user.id ||
+            live.current.task?.id !== current.task.id
+          )
+            return;
+          if (
+            nextTask.status !== current.task.status ||
+            nextTask.can_manage !== current.task.can_manage
+          )
+            setModal('');
+          setTask(nextTask);
+          if (current.sample && live.current.sample?.id === current.sample.id) {
+            const nextSample = await read<Sample>('/samples/' + current.sample.id);
+            if (
+              live.current.user?.id === current.user.id &&
+              live.current.sample?.id === current.sample.id
+            )
+              setSample(nextSample);
+          }
+        }
+      }
+      setSyncMessage('已同步 · ' + new Date().toLocaleTimeString());
+    } catch (e) {
+      if (live.current.user?.id !== current.user?.id) return;
+      if ((e as Error & { status?: number }).status === 401) {
+        live.current.engine?.stop();
+        setPlaying(false);
+        setUser(null);
+        setTask(null);
+        setSample(null);
+        setModal('');
+        setTasks([]);
+        setError('登录已失效或密码已重置，请重新登录。');
+      } else setSyncMessage('连接暂时失败，稍后重试或点击同步');
+    } finally {
+      window.clearTimeout(timeout);
+      syncing.current = false;
+    }
+  };
+  const syncLatest = useRef(synchronize);
+  syncLatest.current = synchronize;
+  useEffect(() => {
+    if (!user?.id) return;
+    const sync = () => {
+      if (document.visibilityState !== 'hidden') void syncLatest.current();
+    };
+    const timer = window.setInterval(sync, 5000);
+    window.addEventListener('focus', sync);
+    document.addEventListener('visibilitychange', sync);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', sync);
+      document.removeEventListener('visibilitychange', sync);
+    };
+  }, [user?.id]);
   const run = async (action: () => Promise<void>) => {
     setError('');
     setNotice('');
@@ -492,10 +590,35 @@ function App() {
             工作空间 <ChevronRight size={15} />
             <span>{task ? task.title : '评测任务'}</span>
           </div>
-          <span className="top-note">
-            <ShieldCheck size={15} /> 数据留在主机
-          </span>
+          <div className="sync-tools">
+            <button className="text-button" onClick={() => void synchronize()} title={syncMessage}>
+              同步
+            </button>
+            <span className="sync-state" role="status">
+              {syncMessage}
+            </span>
+            <button
+              className="text-button"
+              onClick={() =>
+                void run(async () => {
+                  setServerInfo(await api('/server-info'));
+                  setModal('system');
+                })
+              }
+            >
+              服务信息 · {serverVersion || '连接中'}
+            </button>
+          </div>
         </header>
+        {serverVersion && serverVersion !== packageInfo.version && (
+          <div className="banner error" role="alert">
+            <span>
+              页面版本 {packageInfo.version} 与服务版本 {serverVersion}{' '}
+              不一致。请先保存标注，再重新加载；若服务版本仍旧，请检查主机是否还在运行旧程序。
+            </span>
+            <button onClick={() => window.location.reload()}>重新加载页面</button>
+          </div>
+        )}
         {(error || notice) && (
           <div
             role={error ? 'alert' : 'status'}
@@ -611,7 +734,7 @@ function App() {
               </div>
             )}
             <div className="dashboard-footer">
-              <span>听鉴 0.3.1 · 本地优先</span>
+              <span>听鉴 {serverVersion || packageInfo.version} · 本地优先</span>
               {user.role !== 'reviewer' && (
                 <button
                   className="text-button"
@@ -1183,6 +1306,7 @@ function App() {
               close: '关闭并揭晓',
               users: '团队成员',
               help: '使用指南',
+              system: '当前服务信息',
               report: '评测结果',
               trash: '任务回收站',
               'delete-task': '删除评测任务',
@@ -1489,77 +1613,36 @@ function App() {
             </>
           )}
           {modal === 'users' && (
-            <>
-              <div className="member-list">
-                {members.map((m) => (
-                  <div key={m.id}>
-                    <span>{m.name}</span>
-                    {m.role === 'admin' ? (
-                      <span className="muted">管理员</span>
-                    ) : (
-                      <select
-                        aria-label={`${m.name}的角色`}
-                        value={m.role}
-                        disabled={busy}
-                        onChange={(e) => {
-                          const role = e.target.value;
-                          void run(async () => {
-                            await api('/users/' + m.id + '/role', 'PATCH', { role });
-                            setMembers(await api('/users'));
-                          });
-                        }}
-                      >
-                        <option value="reviewer">评测者</option>
-                        <option value="organizer">组织者（可上传任务）</option>
-                      </select>
-                    )}
-                  </div>
-                ))}
-              </div>
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  const form = e.currentTarget;
-                  const f = Object.fromEntries(new FormData(form));
-                  void run(async () => {
-                    await api('/users', 'POST', f);
-                    setMembers(await api('/users'));
-                    form.reset();
-                    setNotice('账号已创建。请单独告知其账号与密码。');
-                  });
-                }}
-              >
-                <h3>添加团队成员</h3>
-                <p className="muted">
-                  组织者可创建、上传和管理自己的任务，以及邀请已有账号参与；不能管理他人的任务或下载全站备份。调整角色后请同事刷新页面。
-                </p>
-                <label>
-                  角色
-                  <select name="role">
-                    <option value="reviewer">评测者：参与分配的任务</option>
-                    <option value="organizer">组织者：可创建和上传任务</option>
-                  </select>
-                </label>
-                <label>
-                  账号
-                  <input name="name" required />
-                </label>
-                <label>
-                  初始密码
-                  <input
-                    type="password"
-                    name="password"
-                    required
-                    minLength={10}
-                    placeholder="至少 10 个字符"
-                  />
-                </label>
-                <button className="primary full" disabled={busy}>
-                  <Plus size={17} />
-                  创建账号
-                </button>
-              </form>
-            </>
+            <TeamMembers members={members} onChange={setMembers} onBusy={setBusy} />
+          )}
+          {modal === 'system' && serverInfo && (
+            <div className="server-info">
+              <p>
+                管理员与同事应核对同一服务地址和数据编号。程序重启会改变实例编号；版本不同或数据编号不同，说明当前页面连接的服务需要核实。
+              </p>
+              <dl>
+                <dt>访问地址</dt>
+                <dd>{window.location.origin}</dd>
+                <dt>服务版本</dt>
+                <dd>{serverInfo.version}</dd>
+                <dt>页面版本</dt>
+                <dd>{packageInfo.version}</dd>
+                <dt>运行实例</dt>
+                <dd>{serverInfo.instance_id}</dd>
+                <dt>数据编号</dt>
+                <dd>{serverInfo.data_id}</dd>
+                {serverInfo.data_directory && (
+                  <>
+                    <dt>数据目录（仅管理员可见）</dt>
+                    <dd>{serverInfo.data_directory}</dd>
+                  </>
+                )}
+              </dl>
+              <p className="muted">
+                更换 exe
+                不会关闭旧服务。请先退出旧程序，再用同一数据目录启动新版；只关闭浏览器不会停止服务。
+              </p>
+            </div>
           )}
           {modal === 'help' && <UserGuide role={user.role} />}
           {modal === 'report' && report && (

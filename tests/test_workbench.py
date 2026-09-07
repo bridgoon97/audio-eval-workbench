@@ -614,3 +614,70 @@ def test_existing_database_adds_recycle_bin_without_changing_tasks(env):
         c.request("DELETE", f"/api/tasks/{t}", json={"title": "测试任务"}).status_code
         == 200
     )
+
+
+def test_password_reset_revokes_sessions_and_preserves_work(env):
+    app, a, _ = env
+    c, member = reviewer(app, a, "需要重置")
+    second = TestClient(app)
+    second.post(
+        "/api/login", json={"name": "需要重置", "password": "reviewer-test-only"}
+    )
+    other, _ = reviewer(app, a, "其他同事")
+    t, s, tracks = task(a)
+    publish(a, t, [member])
+    c.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
+    payload = {"password": "new-random-test-only-2026", "confirm_name": "需要重置"}
+    route = f"/api/users/{member}/password"
+    assert c.post(route, json=payload).status_code == 403
+    assert (
+        a.post(route, json={**payload, "confirm_name": "其他同事"}).status_code == 422
+    )
+    assert c.get("/api/me").status_code == 200
+    result = a.post(route, json=payload)
+    assert result.status_code == 200
+    assert payload["password"] not in result.text
+    assert c.get("/api/me").status_code == 401
+    assert second.get("/api/me").status_code == 401
+    assert other.get("/api/me").status_code == 200
+    assert a.get("/api/me").status_code == 200
+    assert (
+        c.post(
+            "/api/login", json={"name": "需要重置", "password": "reviewer-test-only"}
+        ).status_code
+        == 401
+    )
+    assert (
+        c.post(
+            "/api/login", json={"name": "需要重置", "password": payload["password"]}
+        ).status_code
+        == 200
+    )
+    assert c.get(f"/api/samples/{s}").json()["rating"]["choice"] == tracks[0]
+    with sqlite3.connect(app.state.database) as db:
+        stored = db.execute(
+            "SELECT password FROM users WHERE id=?", (member,)
+        ).fetchone()[0]
+    assert stored != payload["password"]
+    admin_id = a.get("/api/me").json()["id"]
+    assert (
+        a.post(
+            f"/api/users/{admin_id}/password",
+            json={**payload, "confirm_name": "组织者"},
+        ).status_code
+        == 409
+    )
+
+
+def test_service_identity_and_page_cache_boundary(env):
+    app, a, folder = env
+    c, _ = reviewer(app, a, "服务核对")
+    admin_info = a.get("/api/server-info").json()
+    colleague_info = c.get("/api/server-info").json()
+    assert admin_info["version"] == a.get("/api/status").json()["version"]
+    assert colleague_info["data_id"] == admin_info["data_id"]
+    assert colleague_info["instance_id"] == admin_info["instance_id"]
+    assert "data_directory" not in colleague_info
+    assert admin_info["data_directory"] == str(folder.resolve())
+    assert TestClient(app).get("/api/server-info").status_code == 401
+    assert a.get("/").headers["cache-control"] == "no-store"

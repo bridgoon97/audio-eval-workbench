@@ -1886,3 +1886,60 @@ kbd {
     font-size: 20px;
   }
 }
+
+.credential-card {
+  padding: 16px;
+  margin-bottom: 18px;
+  border-radius: 12px;
+  border: 1px solid var(--accent);
+  background: var(--tint);
+}
+.credential-card h3 {
+  margin: 0 0 8px;
+}
+.credential-card textarea {
+  width: 100%;
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+}
+.team-members .actions {
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+.team-members .member-list > div {
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.team-members .member-list > div > span:first-child {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.team-members .member-list select {
+  max-width: 195px;
+}
+
+.sync-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.sync-state {
+  font-size: 11px;
+  color: var(--muted);
+}
+.server-info dd {
+  margin: 4px 0 16px;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+}
+.server-info dt {
+  font-weight: 700;
+}
+@media (max-width: 800px) {
+  .sync-state {
+    display: none;
+  }
+  .sync-tools {
+    gap: 8px;
+  }
+}

@@ -50,16 +50,28 @@ export type Sample = {
   rating?: { choice: string; reason: string } | null;
 };
 export type Analysis = { peaks: number[][]; spectrogram: number[][] };
-export async function api<T = any>(path: string, method = 'GET', body?: unknown): Promise<T> {
+export async function api<T = any>(
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  signal?: AbortSignal,
+): Promise<T> {
   const response = await fetch('/api' + path, {
+    cache: 'no-store',
+    signal,
     method,
     headers: body instanceof FormData ? undefined : { 'Content-Type': 'application/json' },
     body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body),
   });
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
-    throw new Error(
-      typeof data.detail === 'string' ? data.detail : `请求失败（${response.status}），请核对输入`,
+    throw Object.assign(
+      new Error(
+        typeof data.detail === 'string'
+          ? data.detail
+          : `请求失败（${response.status}），请核对输入`,
+      ),
+      { status: response.status },
     );
   }
   return response.json();

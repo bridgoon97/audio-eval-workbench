@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from .audio import analyze, decode_audio, demo_wav
 from .db import connect, init, password_hash, verify
+from .version import VERSION
 
 
 def uid():
@@ -53,6 +54,11 @@ class SampleInput(BaseModel):
 
 class RoleInput(BaseModel):
     role: str
+
+
+class ResetPasswordInput(BaseModel):
+    password: str = Field(min_length=10, max_length=200)
+    confirm_name: str
 
 
 class DeleteTaskInput(BaseModel):
@@ -103,6 +109,7 @@ def create_app(
     app = FastAPI(title="听鉴音频评测工作台", docs_url=None, redoc_url=None)
     app.state.database = database
     app.state.setup_file = setup_file
+    app.state.instance_id = secrets.token_hex(6)
     mutation_lock = threading.RLock()
     attempts: dict[str, list[float]] = {}
 
@@ -124,7 +131,11 @@ def create_app(
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'"
         )
-        if request.url.path.startswith("/api"):
+        if (
+            request.url.path.startswith("/api")
+            or request.url.path == "/"
+            or request.url.path.endswith(".html")
+        ):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -208,8 +219,23 @@ def create_app(
         with connect(database) as db:
             return {
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
-                "version": "0.3.1",
+                "version": VERSION,
+                "instance_id": app.state.instance_id,
             }
+
+    @app.get("/api/server-info")
+    def server_info(request: Request):
+        u = user(request)
+        result = {
+            "version": VERSION,
+            "instance_id": app.state.instance_id,
+            "data_id": hashlib.sha256(str(data_dir.resolve()).encode()).hexdigest()[
+                :12
+            ],
+        }
+        if u["role"] == "admin":
+            result["data_directory"] = str(data_dir.resolve())
+        return result
 
     @app.post("/api/setup")
     def setup(body: Login):
@@ -237,7 +263,7 @@ def create_app(
             if len(recent) >= 20:
                 raise HTTPException(429, "登录尝试过多，请稍后再试")
             attempts[address] = recent + [time.time()]
-        with connect(database) as db:
+        with mutation_lock, connect(database) as db:
             u = db.execute("SELECT * FROM users WHERE name=?", (body.name,)).fetchone()
             if not u or not verify(body.password, u["password"]):
                 raise HTTPException(401, "账号或密码错误")
@@ -305,6 +331,26 @@ def create_app(
                 )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "账号名称已存在")
+        return {"ok": True}
+
+    @app.post("/api/users/{user_id}/password")
+    def reset_password(user_id: str, body: ResetPasswordInput, request: Request):
+        admin(request)
+        with mutation_lock, connect(database) as db:
+            target = db.execute(
+                "SELECT name,role FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            if not target:
+                raise HTTPException(404, "账号不存在")
+            if target["role"] == "admin":
+                raise HTTPException(409, "此入口仅用于重置同事账号，不修改管理员密码")
+            if body.confirm_name != target["name"]:
+                raise HTTPException(422, "请输入完整账号名称确认重置")
+            db.execute(
+                "UPDATE users SET password=? WHERE id=?",
+                (password_hash(body.password), user_id),
+            )
+            db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
         return {"ok": True}
 
     @app.patch("/api/users/{user_id}/role")
