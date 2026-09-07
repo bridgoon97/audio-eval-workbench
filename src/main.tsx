@@ -1623,31 +1623,20 @@ function App() {
               }}
             >
               <p>
-                勾选的同事即受邀完成评测；负责人自动拥有访问权限，但不自动受邀。只可移除尚未提交评论或偏好判断的人；关闭任务后名单冻结。
+                勾选的同事即受邀完成评测，只有受邀评测者的评分计入结果；负责人自动拥有访问权限，是否参与由勾选决定。只可移除尚未提交评论或偏好判断的人；关闭任务后名单冻结。
               </p>
-              {members.map((member) =>
-                member.id === task.owner ? (
-                  <label className="checkbox" key={member.id}>
-                    <input
-                      type="checkbox"
-                      value={member.id}
-                      checked={task.review_assignments?.includes(member.id) || false}
-                      disabled
-                    />
-                    {member.name}（任务创建者，自动拥有访问权限）
-                  </label>
-                ) : (
-                  <label className="checkbox" key={member.id}>
-                    <input
-                      type="checkbox"
-                      name="users"
-                      value={member.id}
-                      defaultChecked={task.review_assignments?.includes(member.id)}
-                    />
-                    {member.name}
-                  </label>
-                ),
-              )}
+              {members.map((member) => (
+                <label className="checkbox" key={member.id}>
+                  <input
+                    type="checkbox"
+                    name="users"
+                    value={member.id}
+                    defaultChecked={task.review_assignments?.includes(member.id)}
+                  />
+                  {member.name}
+                  {member.id === task.owner ? '（任务创建者，自动拥有访问权限）' : ''}
+                </label>
+              ))}
               <button className="primary full" disabled={busy}>
                 保存受邀评测者
               </button>
@@ -1760,6 +1749,10 @@ function App() {
                     {m.name}
                   </label>
                 ))}
+              <label className="checkbox">
+                <input type="checkbox" name="users" value={user?.id} />
+                我也参与评测（提交偏好并计入进度）
+              </label>
               {members.length <= 1 && (
                 <p className="muted">目前只有你；可先到“团队成员”创建账号。</p>
               )}

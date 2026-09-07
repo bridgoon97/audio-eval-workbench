@@ -36,7 +36,8 @@ test('首次使用、合成音播放、片段标注、发布判断和重开', as
     true,
   );
   await page.getByRole('button', { name: '发布评测', exact: true }).click();
-  await page.getByRole('checkbox').check();
+  await page.getByRole('checkbox', { name: '我也参与评测（提交偏好并计入进度）' }).check();
+  await page.locator('input[name="alignment"]').check();
   await page.getByRole('button', { name: '发布并锁定任务' }).click();
   await page.getByRole('button', { name: '偏好判断', exact: true }).click();
   await page.getByRole('button', { name: '无明显差异', exact: true }).click();
@@ -531,8 +532,20 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
     data: { users: [id('复盘甲'), id('复盘乙')], alignment_confirmed: true },
   });
 
-  // 管理员（页面会话）独立提交：片段一留标签评论并投候选A，片段二投候选A。
-  // 复盘甲全程不提交，用于验证未提交名单。
+  // 未受邀负责人首次评分被拒绝（403），且不产生评分行。
+  const rejected = await page.request.post(`/api/samples/${samples[0].id}/rating`, {
+    data: { choice: samples[0].tracks[0] },
+  });
+  expect(rejected.status()).toBe(403);
+
+  // 负责人显式加入受邀名单后即可评分并计入进度与分母。
+  const me = await (await page.request.get('/api/me')).json();
+  await page.request.patch(`/api/tasks/${created.id}/members`, {
+    data: { users: [id('复盘甲'), id('复盘乙'), me.id] },
+  });
+
+  // 管理员（已受邀，页面会话）独立提交：片段一留标签评论并投候选A，片段二投候选A。
+  // 复盘甲全程不提交，用于验证未开始名单。
   await page.request.post(`/api/samples/${samples[0].id}/comments`, {
     data: { start: 0, end: 100, body: '字尾残噪明显', tag: '残噪' },
   });
@@ -596,8 +609,8 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
   await page.locator('.task-card').filter({ hasText: '复盘验收任务' }).click();
   await page.getByRole('button', { name: '评测进度' }).click();
   const live = page.locator('.progress-numbers span');
-  await expect(live.nth(0)).toHaveText('受邀评测者2');
-  await expect(live.nth(1)).toHaveText('已完成1');
+  await expect(live.nth(0)).toHaveText('受邀评测者3');
+  await expect(live.nth(1)).toHaveText('已完成2');
   await expect(live.nth(2)).toHaveText('进行中0');
   await expect(live.nth(3)).toHaveText('未开始1');
   await expect(page.locator('.progress-rows')).toContainText('复盘乙2/2 片段 · 已完成');
@@ -611,14 +624,12 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
   await page.getByRole('button', { name: '查看结果' }).click();
 
   const progress = page.locator('.progress-numbers span');
-  await expect(progress.nth(0)).toHaveText('受邀评测者2');
-  await expect(progress.nth(1)).toHaveText('已完成1');
+  await expect(progress.nth(0)).toHaveText('受邀评测者3');
+  await expect(progress.nth(1)).toHaveText('已完成2');
   await expect(progress.nth(2)).toHaveText('进行中0');
   await expect(progress.nth(3)).toHaveText('未开始1');
-  await expect(page.locator('.review-progress')).toContainText('已完成：复盘乙');
+  await expect(page.locator('.review-progress')).toContainText('已完成：复盘乙、浏览器测试');
   await expect(page.locator('.review-progress')).toContainText('未开始：复盘甲');
-  // 负责人未受邀，不出现在进度名单中。
-  await expect(page.locator('.review-progress')).not.toContainText('浏览器测试');
 
   const disputed = page.locator('.review-sample').filter({ hasText: '有分歧片段' });
   const consistent = page.locator('.review-sample').filter({ hasText: '一致片段' });
@@ -631,6 +642,9 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
   );
   await expect(consistent.locator('.result-row').filter({ hasText: '候选A' })).toContainText(
     '100.0%（2/2）',
+  );
+  await expect(disputed.locator('.result-row').filter({ hasText: '候选B' })).toContainText(
+    '50.0%（1/2）',
   );
   await expect(disputed.locator('.result-row').filter({ hasText: '无明显差异' })).toContainText(
     '0.0%（0/2）',

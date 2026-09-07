@@ -44,10 +44,12 @@ def share_text(count, denominator):
 
 
 def csv_safe(value):
-    """在 CSV 序列化边界防止 Excel 公式注入：文本单元若以 = + - @ 或
-    制表/回车/换行（含前导空白后）开头，加单引号前缀变为纯文本；
+    """在 CSV 序列化边界防止 Excel 公式注入：原始首字符为制表/回车/换行，
+    或去除前导空白后以 = + - @ 开头的文本单元，加单引号前缀变为纯文本；
     数值单元保持数值含义，不做转换。"""
-    if isinstance(value, str) and value.lstrip()[:1] in ("=", "+", "-", "@", "\t", "\r", "\n"):
+    if isinstance(value, str) and (
+        value[:1] in ("\t", "\r", "\n") or value.lstrip()[:1] in ("=", "+", "-", "@")
+    ):
         return "'" + value
     return value
 
@@ -72,10 +74,12 @@ def task_summary(db, task_id):
     ).fetchall()
     rated: dict[str, set[str]] = {}
     choices: dict[str, list[str]] = {}
+    # 票数与分母只统计受邀评测者的评分；旧库异常数据中的未受邀评分不进入汇总。
     for row in db.execute(
         "SELECT r.sample_id, r.user_id, r.choice FROM ratings r "
-        "JOIN samples s ON s.id=r.sample_id WHERE s.task_id=?",
-        (task_id,),
+        "JOIN samples s ON s.id=r.sample_id WHERE s.task_id=? AND r.user_id IN "
+        "(SELECT user_id FROM review_assignments WHERE task_id=?)",
+        (task_id, task_id),
     ):
         choices.setdefault(row["sample_id"], []).append(row["choice"])
         rated.setdefault(row["user_id"], set()).add(row["sample_id"])
@@ -1127,6 +1131,17 @@ def create_app(
                     (task_id, added),
                 )
             for removed in assigned - requested:
+                contributed = db.execute(
+                    "SELECT 1 FROM samples s LEFT JOIN comments c ON c.sample_id=s.id AND c.user_id=? "
+                    "LEFT JOIN ratings r ON r.sample_id=s.id AND r.user_id=? "
+                    "WHERE s.task_id=? AND (c.id IS NOT NULL OR r.user_id IS NOT NULL) LIMIT 1",
+                    (removed, removed, task_id),
+                ).fetchone()
+                if contributed:
+                    name = db.execute(
+                        "SELECT name FROM users WHERE id=?", (removed,)
+                    ).fetchone()[0]
+                    raise HTTPException(409, f"{name} 已提交评论或判断，不能移出受邀名单")
                 db.execute(
                     "DELETE FROM review_assignments WHERE task_id=? AND user_id=?",
                     (task_id, removed),
@@ -1298,6 +1313,16 @@ def create_app(
                 ):
                     return {"ok": True}
                 raise HTTPException(409, "判断已提交并锁定；请在复盘评论中补充")
+            # 幂等重试优先保持原有语义；首次提交仅限受邀评测者，
+            # 未受邀的负责人/管理员不会产生评分行。
+            if not db.execute(
+                "SELECT 1 FROM review_assignments WHERE task_id=? AND user_id=?",
+                (t["id"], u["id"]),
+            ).fetchone():
+                raise HTTPException(
+                    403,
+                    "只有受邀评测者可以提交评分；负责人请在发布或受邀名单中勾选自己",
+                )
             db.execute(
                 "INSERT INTO ratings VALUES(?,?,?,?,?)",
                 (sample_id, u["id"], body.choice, body.reason, now()),

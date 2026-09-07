@@ -41,11 +41,17 @@ def init(path):
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
         # 无损迁移：旧数据中的非 owner 成员是当时被分配的评测者，迁入受邀名单；
-        # owner 的自动成员行只是访问便利，不构成评测义务。幂等，可重复执行。
+        # owner 的自动成员行只是访问便利，不构成评测义务。凡已产生评分的用户
+        # （含 owner/admin）同样迁入受邀名单，历史有效证据不丢失。
+        # 两条迁移均幂等，可重复执行，不改变任何访问权限。
         db.execute(
             "INSERT OR IGNORE INTO review_assignments(task_id,user_id) "
             "SELECT m.task_id,m.user_id FROM members m JOIN tasks t ON t.id=m.task_id "
             "WHERE m.user_id != t.owner"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO review_assignments(task_id,user_id) "
+            "SELECT s.task_id,r.user_id FROM ratings r JOIN samples s ON s.id=r.sample_id"
         )
 
 

@@ -12,7 +12,7 @@ import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 
-from workbench.app import create_app
+from workbench.app import create_app, csv_safe
 from workbench.audio import decode_audio, demo_wav
 
 
@@ -276,7 +276,8 @@ def test_mutated_asset_is_detected(env):
 def test_backup_restore_includes_votes_and_audio_excludes_sessions(env, tmp_path):
     _, a, _ = env
     t, s, tracks = task(a)
-    publish(a, t)
+    owner_id = a.get("/api/me").json()["id"]
+    publish(a, t, [owner_id])
     a.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
     a.post(
         f"/api/samples/{s}/comments",
@@ -818,7 +819,19 @@ def test_progress_and_vote_summary_rules(env):
     assert owner_id not in [m["ID"] for m in progress["成员"]]
     assert all("组织者" not in names for names in progress.values() if isinstance(names, list))
 
-    # 显式把负责人加入受邀名单才产生评测义务；移除后义务随之消失，访问权限保留。
+    # 未受邀负责人首次提交评分被拒绝，且不产生评分行。
+    rejected = a.post(f"/api/samples/{s1}/rating", json={"choice": "tie"})
+    assert rejected.status_code == 403
+    with sqlite3.connect(root / "workbench.sqlite3") as db:
+        assert (
+            db.execute(
+                "SELECT count(*) FROM ratings WHERE sample_id=? AND user_id=?",
+                (s1, owner_id),
+            ).fetchone()[0]
+            == 0
+        )
+
+    # 显式把负责人加入受邀名单后即可评分，并计入进度与片段分母。
     assert (
         a.patch(
             f"/api/tasks/{t}/members",
@@ -826,41 +839,44 @@ def test_progress_and_vote_summary_rules(env):
         ).status_code
         == 200
     )
+    assert a.post(f"/api/samples/{s3}/rating", json={"choice": "tie"}).status_code == 200
     progress = a.get(f"/api/tasks/{t}/progress").json()["参与进度"]
     assert progress["受邀评测者"] == 4
-    assert {"名称": "组织者", "已提交片段数": 0, "状态": "未开始"} in [
+    assert {"名称": "组织者", "已提交片段数": 1, "状态": "进行中"} in [
         {k: m[k] for k in ("名称", "已提交片段数", "状态")} for m in progress["成员"]
     ]
-    assert (
-        a.patch(
-            f"/api/tasks/{t}/members", json={"users": [first_id, second_id, third_id]}
-        ).status_code
-        == 200
+
+    # 负责人已贡献后不能被移出受邀名单（沿用贡献者移除保护），访问权限始终保留。
+    blocked = a.patch(
+        f"/api/tasks/{t}/members", json={"users": [first_id, second_id, third_id]}
     )
-    progress = a.get(f"/api/tasks/{t}/progress").json()["参与进度"]
-    assert progress["受邀评测者"] == 3
+    assert blocked.status_code == 409 and "组织者" in blocked.text
     assert owner_id in a.get(f"/api/tasks/{t}").json()["members"]
 
     assert a.post(f"/api/tasks/{t}/close").status_code == 200
     report = a.get(f"/api/tasks/{t}/report").json()
     progress = report["参与进度"]
-    assert progress["受邀评测者"] == 3
-    assert progress["已完成"] == 1 and progress["进行中"] == 1 and progress["未开始"] == 1
+    assert progress["受邀评测者"] == 4
+    assert progress["已完成"] == 1 and progress["进行中"] == 2 and progress["未开始"] == 1
     assert progress["已完成名单"] == ["参与者一"]
-    assert progress["进行中名单"] == ["参与者二"]
+    assert progress["进行中名单"] == ["参与者二", "组织者"]
     assert progress["未开始名单"] == ["参与者三"]
-    assert owner_id not in [m["ID"] for m in progress["成员"]]
 
     views = {s["id"]: s for s in report["样本"]}
-    assert views[s1]["分母"] == 2 and views[s2]["分母"] == 2 and views[s3]["分母"] == 1
+    assert views[s1]["分母"] == 2 and views[s2]["分母"] == 2 and views[s3]["分母"] == 2
     assert {v["ID"]: v["票数"] for v in views[s1]["票数"]} == {
         tracks1[0]: 1,
         tracks1[1]: 0,
         "tie": 1,
     }
+    assert {v["ID"]: v["票数"] for v in views[s3]["票数"]} == {
+        tracks3[0]: 1,
+        tracks3[1]: 0,
+        "tie": 1,
+    }
     assert views[s1]["分歧"] is True
     assert views[s2]["分歧"] is False
-    assert views[s3]["分歧"] is False
+    assert views[s3]["分歧"] is True
 
     # 故意改变一票：分歧分类随之变化（两个方向都验证）。
     with sqlite3.connect(root / "workbench.sqlite3") as db:
@@ -1100,7 +1116,9 @@ def test_csv_formula_injection_sanitized(env):
     t = a.post("/api/tasks", json={"title": "=SUM(A1:A10)", "mode": "development"}).json()["id"]
     s = a.post(f"/api/tasks/{t}/samples", json={"name": "-2+3|片段"}).json()["id"]
     tracks = []
-    for i, name in enumerate(("@候选一", "+候选二")):
+    for i, name in enumerate(
+        ("@候选一", "   =SUM(1,1)", "\t普通文本", "\r普通文本", "\n普通文本")
+    ):
         r = a.post(
             f"/api/samples/{s}/tracks",
             data={"name": name, "version": "v"},
@@ -1125,13 +1143,18 @@ def test_csv_formula_injection_sanitized(env):
         '=HYPERLINK("http://evil.example")',
         "-2+3|片段",
         "@候选一",
-        "+候选二",
+        "   =SUM(1,1)",
         "=注入标签",
+        "\t普通文本",
+        "\r普通文本",
+        "\n普通文本",
     ):
         assert f"'{dangerous}" in cells, dangerous
         assert dangerous not in cells, dangerous
     # 数值单元保持数值含义，未被转义。
     vote_rows = [row for row in rows if row[0] == "逐片段偏好" and row[4] == "'@候选一"]
+    formula_rows = [row for row in rows if row[0] == "逐片段偏好" and row[4] == "'   =SUM(1,1)"]
+    assert formula_rows and formula_rows[0][6] == "0" and formula_rows[0][7] == "1"
     assert vote_rows and vote_rows[0][6] == "1" and vote_rows[0][7] == "1"
     assert "'1" not in cells and "'2" not in cells
     # Markdown 与 JSON 不做 Excel 专用转义。
@@ -1139,3 +1162,117 @@ def test_csv_formula_injection_sanitized(env):
     assert "=SUM(A1:A10)" in markdown and "'=SUM(A1:A10)" not in markdown
     data = json.loads(a.get(f"/api/tasks/{t}/export").text)
     assert data["任务"]["title"] == "=SUM(A1:A10)"
+
+
+def test_unassigned_manager_cannot_rate(env):
+    """未受邀 owner/admin 首次评分 403 且不产生评分行；显式受邀后恢复。"""
+    app, a, root = env
+    # 角色接口不提供提权到 admin（既有设计）；直接以 admin 角色创建第二管理员。
+    assert (
+        a.post(
+            "/api/users",
+            json={"name": "副管理员", "password": "second-admin-pass", "role": "admin"},
+        ).status_code
+        == 200
+    )
+    second_admin = TestClient(app)
+    assert (
+        second_admin.post(
+            "/api/login", json={"name": "副管理员", "password": "second-admin-pass"}
+        ).status_code
+        == 200
+    )
+    second_admin_id = second_admin.get("/api/me").json()["id"]
+    t, s, tracks = task(a)
+    publish(a, t)
+    owner_id = a.get("/api/me").json()["id"]
+
+    for client, uid in ((a, owner_id), (second_admin, second_admin_id)):
+        rejected = client.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
+        assert rejected.status_code == 403
+        with sqlite3.connect(root / "workbench.sqlite3") as db:
+            assert (
+                db.execute(
+                    "SELECT count(*) FROM ratings WHERE sample_id=? AND user_id=?",
+                    (s, uid),
+                ).fetchone()[0]
+                == 0
+            )
+    # 幂等重试语义不受影响：受邀后首次提交成功，重复同一请求返回 ok，改选被锁。
+    assert (
+        a.patch(
+            f"/api/tasks/{t}/members", json={"users": [owner_id, second_admin_id]}
+        ).status_code
+        == 200
+    )
+    assert a.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]}).status_code == 200
+    assert a.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]}).status_code == 200
+    assert a.post(f"/api/samples/{s}/rating", json={"choice": "tie"}).status_code == 409
+    a.post(f"/api/tasks/{t}/close")
+
+    # 防御异常数据：库中未受邀评分不得静默进入新汇总（分母只追溯受邀名单）。
+    outsider_id = reviewer(app, a, "异常评分者")[1]
+    with sqlite3.connect(root / "workbench.sqlite3") as db:
+        db.execute(
+            "INSERT INTO ratings VALUES(?,?,?,?,?)",
+            (s, outsider_id, tracks[1], "", "2026-01-01T00:00:00+00:00"),
+        )
+    report = a.get(f"/api/tasks/{t}/report").json()
+    view = report["样本"][0]
+    assert view["分母"] == 1
+    assert {v["ID"]: v["票数"] for v in view["票数"]} == {
+        tracks[0]: 1,
+        tracks[1]: 0,
+        "tie": 0,
+    }
+    assert {m["名称"] for m in report["参与进度"]["成员"]} == {"组织者", "副管理员"}
+
+
+def test_legacy_owner_rating_migrates_and_counts(env):
+    """旧库 owner 已有评分：重启迁移后 owner 成为受邀者且历史票保留。"""
+    app, a, folder = env
+    member, member_id = reviewer(app, a, "旧成员")
+    t, s, tracks = task(a, "development")
+    publish(a, t, [member_id])
+    member.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
+    a.post(f"/api/tasks/{t}/close")
+    owner_id = a.get("/api/me").json()["id"]
+    # 模拟 0.5 旧库：owner 直接留下的评分行，且未出现在受邀名单中。
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute(
+            "INSERT INTO ratings VALUES(?,?,?,?,?)",
+            (s, owner_id, "tie", "旧库遗留", "2026-01-01T00:00:00+00:00"),
+        )
+        db.execute("DELETE FROM review_assignments WHERE user_id=?", (owner_id,))
+    restarted = create_app(folder)
+    c = TestClient(restarted)
+    c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
+    assert c.get(f"/api/tasks/{t}").status_code == 200
+    report = c.get(f"/api/tasks/{t}/report").json()
+    progress = report["参与进度"]
+    assert {m["名称"]: (m["已提交片段数"], m["状态"]) for m in progress["成员"]} == {
+        "旧成员": (1, "已完成"),
+        "组织者": (1, "已完成"),
+    }
+    view = report["样本"][0]
+    assert view["分母"] == 2
+    assert {v["ID"]: v["票数"] for v in view["票数"]} == {
+        tracks[0]: 1,
+        tracks[1]: 0,
+        "tie": 1,
+    }
+
+
+def test_csv_safe_control_characters():
+    """控制字符与“前导空白+公式”必须转义；普通文本与数值不受影响。"""
+    assert csv_safe("\t普通文本") == "'\t普通文本"
+    assert csv_safe("\r普通文本") == "'\r普通文本"
+    assert csv_safe("\n普通文本") == "'\n普通文本"
+    assert csv_safe("   =SUM(1,1)") == "'   =SUM(1,1)"
+    assert csv_safe("=危险") == "'=危险"
+    assert csv_safe("+1") == "'+1"
+    assert csv_safe("-1") == "'-1"
+    assert csv_safe("@x") == "'@x"
+    assert csv_safe("普通文本") == "普通文本"
+    assert csv_safe(" x=y") == " x=y"
+    assert csv_safe("5") == "5" and csv_safe(5) == 5 and csv_safe(0) == 0
