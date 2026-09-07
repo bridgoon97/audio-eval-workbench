@@ -183,7 +183,8 @@ test('同事获授组织者权限后可上传、删除及恢复自己的任务',
   await expect(page.getByRole('button', { name: '批量导入', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '发布评测', exact: true }).click();
   await expect(page.getByText('浏览器测试', { exact: true })).toBeVisible();
-  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.locator('.overlay')).toHaveCount(0);
   await page.getByRole('button', { name: '删除任务', exact: true }).click();
   await page.getByLabel('输入完整任务名称确认').fill('合成音试听 · 熟悉工作台');
   await page.getByRole('button', { name: '确认移入回收站' }).click();
@@ -192,7 +193,8 @@ test('同事获授组织者权限后可上传、删除及恢复自己的任务',
   await expect(page.locator('.trash-row')).toHaveCount(1);
   await page.getByRole('button', { name: '恢复任务', exact: true }).click();
   await expect(page.getByText('回收站为空', { exact: true })).toBeVisible();
-  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+  await expect(page.locator('.overlay')).toHaveCount(0);
   await page.locator('.task-card').click();
   await expect(page.locator('.track')).toHaveCount(3);
 });
