@@ -51,6 +51,14 @@ class SampleInput(BaseModel):
     provenance: str = "PRIVATE local verification"
 
 
+class RoleInput(BaseModel):
+    role: str
+
+
+class DeleteTaskInput(BaseModel):
+    title: str
+
+
 class TrackInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     version: str = Field(default="未知", max_length=200)
@@ -137,11 +145,24 @@ def create_app(
             raise HTTPException(403, "需要管理员权限")
         return u
 
-    def task_access(db, task_id, u, manage=False):
+    def organizer(request):
+        u = user(request)
+        if u["role"] not in ("admin", "organizer"):
+            raise HTTPException(403, "需要组织者权限，请联系管理员开通")
+        return u
+
+    def task_access(db, task_id, u, manage=False, include_deleted=False):
         t = db.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         if not t:
             raise HTTPException(404, "任务不存在")
-        owner = u["role"] == "admin" or t["owner"] == u["id"]
+        owner = u["role"] == "admin" or (
+            t["owner"] == u["id"] and u["role"] == "organizer"
+        )
+        deleted = db.execute(
+            "SELECT 1 FROM deleted_tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if deleted and (not include_deleted or not owner):
+            raise HTTPException(404, "任务已移入回收站")
         if manage and not owner:
             raise HTTPException(403, "仅组织者可以修改任务")
         if not owner:
@@ -151,7 +172,7 @@ def create_app(
             ).fetchone()
             if not member or t["status"] == "draft":
                 raise HTTPException(403, "没有此任务的访问权限")
-        return dict(t)
+        return {**dict(t), "can_manage": owner}
 
     def sample_access(db, sample_id, u, manage=False):
         s = db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
@@ -187,7 +208,7 @@ def create_app(
         with connect(database) as db:
             return {
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
-                "version": "0.2.0",
+                "version": "0.3.0",
             }
 
     @app.post("/api/setup")
@@ -261,7 +282,7 @@ def create_app(
 
     @app.get("/api/users")
     def users(request: Request):
-        admin(request)
+        organizer(request)
         with connect(database) as db:
             return [
                 dict(x)
@@ -271,7 +292,10 @@ def create_app(
     @app.post("/api/users")
     def create_user(body: UserInput, request: Request):
         admin(request)
-        if body.role not in ("reviewer", "admin") or len(body.password) < 10:
+        if (
+            body.role not in ("reviewer", "organizer", "admin")
+            or len(body.password) < 10
+        ):
             raise HTTPException(422, "请选择有效角色，密码至少 10 个字符")
         try:
             with connect(database) as db:
@@ -283,15 +307,59 @@ def create_app(
             raise HTTPException(409, "账号名称已存在")
         return {"ok": True}
 
+    @app.patch("/api/users/{user_id}/role")
+    def update_role(user_id: str, body: RoleInput, request: Request):
+        admin(request)
+        if body.role not in ("reviewer", "organizer"):
+            raise HTTPException(422, "请选择评测者或组织者")
+        with mutation_lock, connect(database) as db:
+            target = db.execute(
+                "SELECT role FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            if not target:
+                raise HTTPException(404, "账号不存在")
+            if target["role"] == "admin":
+                raise HTTPException(409, "此入口不能修改管理员角色")
+            db.execute("UPDATE users SET role=? WHERE id=?", (body.role, user_id))
+        return {"ok": True}
+
+    @app.delete("/api/tasks/{task_id}")
+    def delete_task(task_id: str, body: DeleteTaskInput, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            t = task_access(db, task_id, u, True, include_deleted=True)
+            if body.title != t["title"]:
+                raise HTTPException(422, "请输入完整任务名称确认删除")
+            db.execute(
+                "INSERT OR IGNORE INTO deleted_tasks VALUES(?,?,?)",
+                (task_id, u["id"], now()),
+            )
+        return {"ok": True}
+
+    @app.post("/api/tasks/{task_id}/restore")
+    def restore_task(task_id: str, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            task_access(db, task_id, u, True, include_deleted=True)
+            db.execute("DELETE FROM deleted_tasks WHERE task_id=?", (task_id,))
+        return {"ok": True}
+
     @app.get("/api/tasks")
-    def task_list(request: Request):
+    def task_list(request: Request, deleted: bool = False):
         u = user(request)
         with connect(database) as db:
             rows = db.execute("SELECT * FROM tasks ORDER BY created DESC").fetchall()
             result = []
             for row in rows:
                 try:
-                    t = task_access(db, row["id"], u)
+                    is_deleted = bool(
+                        db.execute(
+                            "SELECT 1 FROM deleted_tasks WHERE task_id=?", (row["id"],)
+                        ).fetchone()
+                    )
+                    if is_deleted != deleted:
+                        continue
+                    t = task_access(db, row["id"], u, include_deleted=deleted)
                 except HTTPException:
                     continue
                 t["sample_count"] = db.execute(
@@ -306,7 +374,7 @@ def create_app(
 
     @app.post("/api/tasks")
     def create_task(body: TaskInput, request: Request):
-        u = admin(request)
+        u = organizer(request)
         if body.mode not in ("development", "blind") or body.kind not in (
             "算法版本",
             "VPU 支路",
@@ -351,7 +419,7 @@ def create_app(
                         "SELECT user_id FROM members WHERE task_id=?", (task_id,)
                     )
                 ]
-                if u["role"] == "admin"
+                if t["can_manage"]
                 else []
             )
             return t
@@ -805,7 +873,9 @@ def create_app(
 
     @app.get("/api/tasks/{task_id}/export")
     def export(task_id: str, request: Request):
-        u = admin(request)
+        u = user(request)
+        with connect(database) as db:
+            task_access(db, task_id, u, True)
         value = report(task_id, u)
         return Response(
             json.dumps(value, ensure_ascii=False, indent=2),
@@ -846,7 +916,7 @@ def create_app(
 
     @app.post("/api/demo")
     def demo(request: Request):
-        u = admin(request)
+        u = organizer(request)
         with mutation_lock, connect(database) as db:
             task_id = uid()
             db.execute(

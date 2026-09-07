@@ -475,3 +475,142 @@ def test_anonymous_wav_is_deterministic_and_preserves_float_samples():
     reference, _ = sf.read(io.BytesIO(original), dtype="float32")
     assert sr == 16000
     np.testing.assert_array_equal(decoded, reference)
+
+
+def test_organizer_owns_tasks_without_site_privileges(env):
+    app, a, _ = env
+    org, org_id = reviewer(app, a, "同事组织者")
+    other, other_id = reviewer(app, a, "另一位同事")
+    assert org.post("/api/tasks", json={"title": "尚未授权"}).status_code == 403
+    assert (
+        a.patch(f"/api/users/{org_id}/role", json={"role": "organizer"}).status_code
+        == 200
+    )
+    t, s, _ = task(org)
+    assert org.get(f"/api/tasks/{t}").json()["can_manage"] is True
+    assert other.get(f"/api/tasks/{t}").status_code == 403
+    assert org.get("/api/users").status_code == 200
+    assert org.get("/api/backup").status_code == 403
+    assert (
+        org.post(
+            "/api/users", json={"name": "越权账号", "password": "1234567890"}
+        ).status_code
+        == 403
+    )
+    assert (
+        org.patch(f"/api/users/{other_id}/role", json={"role": "organizer"}).status_code
+        == 403
+    )
+    assert (
+        a.patch(f"/api/users/{other_id}/role", json={"role": "organizer"}).status_code
+        == 200
+    )
+    foreign, _, _ = task(other)
+    assert (
+        org.request(
+            "DELETE", f"/api/tasks/{foreign}", json={"title": "测试任务"}
+        ).status_code
+        == 403
+    )
+    publish(org, t, [other_id])
+    assert other.get(f"/api/tasks/{t}").json()["can_manage"] is False
+    assert other.post(f"/api/tasks/{t}/close").status_code == 403
+    assert org.get(f"/api/samples/{s}").json()["blind"] is True
+    assert org.get(f"/api/tasks/{t}/export").status_code == 403
+    assert org.post(f"/api/tasks/{t}/close").status_code == 200
+    assert org.get(f"/api/tasks/{t}/export").status_code == 200
+    assert other.get(f"/api/tasks/{t}/export").status_code == 403
+    # 现有会话在降权后立即失去管理权限。
+    assert (
+        a.patch(f"/api/users/{org_id}/role", json={"role": "reviewer"}).status_code
+        == 200
+    )
+    assert (
+        org.request("DELETE", f"/api/tasks/{t}", json={"title": "测试任务"}).status_code
+        == 403
+    )
+
+
+def test_task_trash_blocks_all_access_and_restores_evidence(env):
+    app, a, _ = env
+    c, member = reviewer(app, a, "参与者")
+    t, s, tracks = task(a)
+    publish(a, t, [member])
+    assert (
+        c.post(
+            f"/api/samples/{s}/comments",
+            json={
+                "track_id": tracks[0],
+                "start": 0,
+                "end": 160,
+                "body": "应保留的标注",
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        c.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]}).status_code
+        == 200
+    )
+    assert (
+        c.request("DELETE", f"/api/tasks/{t}", json={"title": "测试任务"}).status_code
+        == 403
+    )
+    assert (
+        a.request("DELETE", f"/api/tasks/{t}", json={"title": "错误名称"}).status_code
+        == 422
+    )
+    assert (
+        a.request("DELETE", f"/api/tasks/{t}", json={"title": "测试任务"}).status_code
+        == 200
+    )
+    assert (
+        a.request("DELETE", f"/api/tasks/{t}", json={"title": "测试任务"}).status_code
+        == 200
+    )
+    assert not a.get("/api/tasks").json()
+    assert len(a.get("/api/tasks?deleted=true").json()) == 1
+    assert not c.get("/api/tasks?deleted=true").json()
+    for client in (a, c):
+        for path in (
+            f"/api/tasks/{t}",
+            f"/api/samples/{s}",
+            f"/api/audio/{tracks[0]}",
+            f"/api/audio/{tracks[0]}/analysis",
+            f"/api/tasks/{t}/report",
+            f"/api/tasks/{t}/export",
+        ):
+            assert client.get(path).status_code == 404
+        assert (
+            client.post(
+                f"/api/samples/{s}/comments",
+                json={"start": 0, "end": 160, "body": "不能追加"},
+            ).status_code
+            == 404
+        )
+    assert c.post(f"/api/tasks/{t}/restore").status_code == 404
+    assert a.post(f"/api/tasks/{t}/restore").status_code == 200
+    restored = c.get(f"/api/samples/{s}").json()
+    assert restored["rating"]["choice"] == tracks[0]
+    assert restored["comments"][0]["body"] == "应保留的标注"
+    assert c.get(f"/api/tasks/{t}").json()["status"] == "active"
+    assert (
+        a.patch(f"/api/tracks/{tracks[0]}", json={"name": "仍然冻结"}).status_code
+        == 409
+    )
+    assert c.get(f"/api/audio/{tracks[0]}").status_code == 200
+
+
+def test_existing_database_adds_recycle_bin_without_changing_tasks(env):
+    app, a, folder = env
+    t, s, _ = task(a)
+    with sqlite3.connect(app.state.database) as db:
+        db.execute("DROP TABLE deleted_tasks")
+    restarted = create_app(folder)
+    c = TestClient(restarted)
+    c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
+    assert c.get(f"/api/tasks/{t}").json()["samples"][0]["id"] == s
+    assert (
+        c.request("DELETE", f"/api/tasks/{t}", json={"title": "测试任务"}).status_code
+        == 200
+    )

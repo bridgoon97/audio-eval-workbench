@@ -158,3 +158,40 @@ test('版本目录预览、原子导入与草稿候选管理', async ({ page }) 
     fs.rmSync(folder, { recursive: true, force: true });
   }
 });
+
+test('同事获授组织者权限后可上传、删除及恢复自己的任务', async ({ page }) => {
+  await page.goto('/');
+  await page.getByLabel('账号', { exact: true }).fill('浏览器测试');
+  await page.getByLabel('密码', { exact: true }).fill('test-password-only');
+  await page.getByRole('button', { name: '进入工作台', exact: true }).click();
+  await page.getByRole('button', { name: '团队成员', exact: true }).click();
+  await page.getByLabel('账号', { exact: true }).fill('同事上传者');
+  await page.getByLabel('初始密码').fill('colleague-password');
+  await page.getByRole('button', { name: '创建账号', exact: true }).click();
+  await page.getByLabel('同事上传者的角色').selectOption('organizer');
+  await expect(page.getByLabel('同事上传者的角色')).toHaveValue('organizer');
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '退出登录' }).click();
+  await page.getByLabel('账号', { exact: true }).fill('同事上传者');
+  await page.getByLabel('密码', { exact: true }).fill('colleague-password');
+  await page.getByRole('button', { name: '进入工作台', exact: true }).click();
+  await expect(page.getByRole('button', { name: '新建评测', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '团队成员', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: '下载完整备份（含音频）' })).toHaveCount(0);
+  await page.getByRole('button', { name: '创建合成音演示' }).click();
+  await expect(page.getByRole('button', { name: '批量导入', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '发布评测', exact: true }).click();
+  await expect(page.getByText('浏览器测试', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await page.getByRole('button', { name: '删除任务', exact: true }).click();
+  await page.getByLabel('输入完整任务名称确认').fill('合成音试听 · 熟悉工作台');
+  await page.getByRole('button', { name: '确认移入回收站' }).click();
+  await expect(page.locator('.task-card')).toHaveCount(0);
+  await page.getByRole('button', { name: '回收站', exact: true }).click();
+  await expect(page.locator('.trash-row')).toHaveCount(1);
+  await page.getByRole('button', { name: '恢复任务', exact: true }).click();
+  await expect(page.getByText('回收站为空', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await page.locator('.task-card').click();
+  await expect(page.locator('.track')).toHaveCount(3);
+});

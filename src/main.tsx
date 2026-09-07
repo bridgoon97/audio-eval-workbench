@@ -127,6 +127,7 @@ function App() {
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState('');
+  const [trashed, setTrashed] = useState<Task[]>([]);
   const [batchBusy, setBatchBusy] = useState(false);
   const [editTrack, setEditTrack] = useState<{ id: string; name: string; version: string } | null>(
     null,
@@ -462,7 +463,9 @@ function App() {
             <span className="avatar">{user.name.slice(0, 1)}</span>
             <div>
               <strong>{user.name}</strong>
-              <small>{user.role === 'admin' ? '组织者' : '评测者'}</small>
+              <small>
+                {{ admin: '管理员', organizer: '组织者', reviewer: '评测者' }[user.role]}
+              </small>
             </div>
             <button
               className="icon"
@@ -518,7 +521,7 @@ function App() {
                 <h1>评测任务</h1>
                 <p className="muted">把同一段声音的不同答案，放在一起听。</p>
               </div>
-              {user.role === 'admin' && (
+              {user.role !== 'reviewer' && (
                 <button className="primary" onClick={() => setModal('new')}>
                   <Plus size={18} />
                   新建评测
@@ -561,7 +564,7 @@ function App() {
                 <AudioLines size={48} />
                 <h2>从一组音频开始</h2>
                 <p>导入同一片段的多个算法版本，或先用合成音熟悉操作。</p>
-                {user.role === 'admin' && (
+                {user.role !== 'reviewer' && (
                   <button
                     onClick={() =>
                       void run(async () => {
@@ -607,7 +610,20 @@ function App() {
               </div>
             )}
             <div className="dashboard-footer">
-              <span>听鉴 0.2 · 本地优先</span>
+              <span>听鉴 0.3 · 本地优先</span>
+              {user.role !== 'reviewer' && (
+                <button
+                  className="text-button"
+                  onClick={() =>
+                    void run(async () => {
+                      setTrashed(await api('/tasks?deleted=true'));
+                      setModal('trash');
+                    })
+                  }
+                >
+                  回收站
+                </button>
+              )}
               {user.role === 'admin' && (
                 <>
                   <button
@@ -659,7 +675,7 @@ function App() {
                 </p>
               </div>
               <div className="actions">
-                {user.role === 'admin' && task.status === 'draft' && (
+                {task.can_manage && task.status === 'draft' && (
                   <>
                     <button onClick={() => setModal('batch')}>批量导入</button>
                     <button onClick={() => setModal('sample')}>
@@ -680,11 +696,14 @@ function App() {
                     </button>
                   </>
                 )}
-                {user.role === 'admin' && task.status === 'active' && (
+                {task.can_manage && task.status === 'active' && (
                   <button onClick={() => setModal('close')}>
                     <Check size={17} />
                     关闭并揭晓
                   </button>
+                )}
+                {task.can_manage && (
+                  <button onClick={() => setModal('delete-task')}>删除任务</button>
                 )}
                 {task.status === 'closed' && (
                   <button
@@ -739,9 +758,7 @@ function App() {
                   <Upload size={42} />
                   <h2>添加第一段音频</h2>
                   <p>一个片段对应同一时间范围的多个版本。</p>
-                  {user.role === 'admin' && (
-                    <button onClick={() => setModal('sample')}>添加片段</button>
-                  )}
+                  {task.can_manage && <button onClick={() => setModal('sample')}>添加片段</button>}
                 </div>
               ) : (
                 <>
@@ -800,7 +817,7 @@ function App() {
                               {selected === i && <span className="listening">当前试听</span>}
                             </button>
                             <span className="track-version">{tr.version}</span>
-                            {user.role === 'admin' && task.status === 'draft' && (
+                            {task.can_manage && task.status === 'draft' && (
                               <button
                                 className="text-button"
                                 aria-label={`管理候选 ${tr.name}`}
@@ -840,7 +857,7 @@ function App() {
                           )}
                         </article>
                       ))}
-                      {user.role === 'admin' && task.status === 'draft' && (
+                      {task.can_manage && task.status === 'draft' && (
                         <button className="add-track" onClick={() => setModal('track')}>
                           <Plus size={18} />
                           导入这个片段的另一个版本
@@ -1166,6 +1183,8 @@ function App() {
               users: '团队成员',
               help: '使用指南',
               report: '评测结果',
+              trash: '任务回收站',
+              'delete-task': '删除评测任务',
             }[modal] || ''
           }
           onClose={() => {
@@ -1225,6 +1244,65 @@ function App() {
                 删除这个候选
               </button>
             </form>
+          )}
+          {modal === 'delete-task' && task && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const title = new FormData(e.currentTarget).get('title');
+                void run(async () => {
+                  await api('/tasks/' + task.id, 'DELETE', { title });
+                  engine?.stop();
+                  setTask(null);
+                  setSample(null);
+                  setModal('');
+                  await refreshTasks();
+                  setNotice('任务已移入回收站，可在任务首页恢复。');
+                });
+              }}
+            >
+              <p>
+                「{task.title}
+                」将从任务列表移除，所有成员将无法继续访问或提交。音频、标注和评分保留，恢复后回到删除前的状态。
+              </p>
+              <label>
+                输入完整任务名称确认
+                <input name="title" required autoComplete="off" />
+              </label>
+              <button className="primary full" disabled={busy}>
+                确认移入回收站
+              </button>
+            </form>
+          )}
+          {modal === 'trash' && (
+            <div>
+              <p className="muted">
+                此处显示你有权管理的已删除任务。恢复保留原有发布状态和成员；回收站不释放磁盘空间。
+              </p>
+              {!trashed.length && <p>回收站为空</p>}
+              {trashed.map((t) => (
+                <div className="trash-row" key={t.id}>
+                  <div>
+                    <strong>{t.title}</strong>
+                    <p className="muted">
+                      {stateName[t.status]} · {t.sample_count} 个片段
+                    </p>
+                  </div>
+                  <button
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        await api('/tasks/' + t.id + '/restore', 'POST');
+                        setTrashed(await api('/tasks?deleted=true'));
+                        await refreshTasks();
+                      })
+                    }
+                  >
+                    恢复任务
+                  </button>
+                </div>
+              ))}
+            </div>
           )}
           {modal === 'new' && (
             <form
@@ -1415,7 +1493,25 @@ function App() {
                 {members.map((m) => (
                   <div key={m.id}>
                     <span>{m.name}</span>
-                    <span className="muted">{m.role === 'admin' ? '组织者' : '评测者'}</span>
+                    {m.role === 'admin' ? (
+                      <span className="muted">管理员</span>
+                    ) : (
+                      <select
+                        aria-label={`${m.name}的角色`}
+                        value={m.role}
+                        disabled={busy}
+                        onChange={(e) => {
+                          const role = e.target.value;
+                          void run(async () => {
+                            await api('/users/' + m.id + '/role', 'PATCH', { role });
+                            setMembers(await api('/users'));
+                          });
+                        }}
+                      >
+                        <option value="reviewer">评测者</option>
+                        <option value="organizer">组织者（可上传任务）</option>
+                      </select>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1425,14 +1521,24 @@ function App() {
                   const form = e.currentTarget;
                   const f = Object.fromEntries(new FormData(form));
                   void run(async () => {
-                    await api('/users', 'POST', { ...f, role: 'reviewer' });
+                    await api('/users', 'POST', f);
                     setMembers(await api('/users'));
                     form.reset();
-                    setNotice('评测者已创建。请单独告知其账号与密码。');
+                    setNotice('账号已创建。请单独告知其账号与密码。');
                   });
                 }}
               >
-                <h3>添加评测者</h3>
+                <h3>添加团队成员</h3>
+                <p className="muted">
+                  组织者可创建、上传和管理自己的任务，以及邀请已有账号参与；不能管理他人的任务或下载全站备份。调整角色后请同事刷新页面。
+                </p>
+                <label>
+                  角色
+                  <select name="role">
+                    <option value="reviewer">评测者：参与分配的任务</option>
+                    <option value="organizer">组织者：可创建和上传任务</option>
+                  </select>
+                </label>
                 <label>
                   账号
                   <input name="name" required />
@@ -1508,7 +1614,7 @@ function App() {
                   })}
                 </section>
               ))}
-              {user.role === 'admin' && (
+              {task?.can_manage && (
                 <a className="button primary" href={'/api/tasks/' + task?.id + '/export'}>
                   <Download size={17} />
                   导出证据 JSON（无音频）

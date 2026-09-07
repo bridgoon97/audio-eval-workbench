@@ -1713,3 +1713,12 @@ kbd {
     grid-template-columns: 1fr;
   }
 }
+
+.trash-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
