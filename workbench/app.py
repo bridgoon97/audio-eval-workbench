@@ -9,7 +9,7 @@ import sqlite3
 import threading
 import time
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -34,6 +34,57 @@ def now():
 STATUS_NAMES = {"draft": "准备中", "active": "评测进行中", "closed": "已揭晓"}
 MODE_NAMES = {"development": "开发诊断", "blind": "隐藏版本评测"}
 CSV_HEADER = ["部分", "条目ID", "片段ID", "片段名称", "条目", "标签", "数值", "分母", "百分比", "说明"]
+
+# 自助申请与设备登录：申请状态机 pending -> approved|rejected|expired，终态不可被普通重试反转。
+DEVICE_COOKIE = "device"
+DEVICE_TTL = 180 * 86400  # 设备令牌绝对过期：180 天，不滑动续期。
+CLAIM_GRACE = 15 * 60  # 领取重试窗口：批准后首次领取 15 分钟内可重试并轮换令牌。
+APPLICATION_STATES = ("pending", "approved", "rejected", "expired")
+STATE_NAMES = {"pending": "待审批", "approved": "已批准", "rejected": "已拒绝", "expired": "已过期"}
+
+
+def client_ip(request):
+    """恒用 socket 对端地址作为审计与限流依据。
+    不读取任何转发头：uvicorn 以 proxy_headers=False 启动（见 cli.py），
+    X-Forwarded-For 等字段一律不信任，因此伪造请求头不能绕过限流，
+    也不能参与身份判断。部署在可信反代后时，peer 是代理地址，限流按代理共亨口径，宁可偏严。"""
+    return request.client.host if request.client else "local"
+
+
+def simplify_device(user_agent):
+    """把 User-Agent 缩减为“浏览器 · 系统”两级摘要；绝不返回原始 UA 噪声。"""
+    ua = (user_agent or "").strip()
+    if not ua:
+        return "未知客户端"
+    browser = ""
+    for token, name in (
+        ("Edg/", "Edge"),
+        ("OPR/", "Opera"),
+        ("Chrome/", "Chrome"),
+        ("Firefox/", "Firefox"),
+        ("Version/", "Safari"),
+    ):
+        index = ua.find(token)
+        if index >= 0:
+            major = ua[index + len(token) :].split(".")[0]
+            browser = f"{name} {major}" if major[:1].isdigit() else name
+            break
+    system = ""
+    for token, name in (
+        ("Windows NT", "Windows"),
+        ("Mac OS X", "macOS"),
+        ("Android", "Android"),
+        ("iPhone", "iOS"),
+        ("iPad", "iPadOS"),
+        ("X11", "Linux"),
+        ("Linux", "Linux"),
+    ):
+        if token in ua:
+            system = name
+            break
+    if not browser and not system:
+        return "未知客户端"
+    return " · ".join(part for part in (browser, system) if part)
 
 
 def share_text(count, denominator):
@@ -389,6 +440,37 @@ class RatingInput(BaseModel):
     reason: str = Field(default="", max_length=2000)
 
 
+class ApplyInput(BaseModel):
+    display_name: str = Field(min_length=1, max_length=60)
+    employee_id: str = Field(default="", max_length=60)
+    email: str = Field(default="", max_length=120)
+    invite_code: str = Field(min_length=6, max_length=200)
+    claim_secret: str = Field(min_length=32, max_length=200)
+
+
+class ClaimInput(BaseModel):
+    application_id: str = Field(min_length=8, max_length=64)
+    claim_secret: str = Field(min_length=32, max_length=200)
+
+
+class InviteInput(BaseModel):
+    purpose: str = Field(default="", max_length=120)
+    kind: str = "team"
+    task_id: str = ""
+    expires_days: int = Field(default=7, ge=1, le=365)
+    max_uses: int = Field(default=5, ge=1, le=500)
+
+
+class InviteToggle(BaseModel):
+    active: bool
+
+
+class ApproveInput(BaseModel):
+    role: str = "reviewer"
+    name: str = Field(default="", max_length=60)
+    task_ids: list[str] = Field(default_factory=list)
+
+
 def create_app(
     data_dir: Path,
     static_dir: Path | None = None,
@@ -411,7 +493,21 @@ def create_app(
     app.state.setup_file = setup_file
     app.state.instance_id = secrets.token_hex(6)
     mutation_lock = threading.RLock()
-    attempts: dict[str, list[float]] = {}
+    attempts: dict[tuple, list[float]] = {}
+
+    def rate_limit(bucket, address, limit, window, message):
+        """按 socket 对端限流，防双击与撞库；不区分转发头，无法被伪造请求头绕过。"""
+        with mutation_lock:
+            stamp = time.time()
+            recent = [t for t in attempts.get((bucket, address), []) if t > stamp - window]
+            if len(recent) >= limit:
+                attempts[(bucket, address)] = recent
+                raise HTTPException(429, message)
+            recent.append(stamp)
+            attempts[(bucket, address)] = recent
+            if len(attempts) > 4096:  # 丢弃完全过期的桶，防止匿名限流表无限增长。
+                for key in [k for k, v in attempts.items() if all(t <= stamp - window for t in v)]:
+                    del attempts[key]
 
     @app.middleware("http")
     async def boundaries(request: Request, call_next):
@@ -424,6 +520,11 @@ def create_app(
                 return JSONResponse({"detail": "不允许跨站写入"}, status_code=403)
             if request.headers.get("sec-fetch-site") == "cross-site":
                 return JSONResponse({"detail": "不允许跨站写入"}, status_code=403)
+            # 严格内容类型：所有接口只接受 JSON 或 multipart；
+            # 经典表单/text/plain 跨站写入在到达业务前即被拒绝。
+            content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+            if content_type in ("text/plain", "application/x-www-form-urlencoded"):
+                return JSONResponse({"detail": "不支持的内容类型"}, status_code=415)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -440,21 +541,62 @@ def create_app(
         return response
 
     def user(request):
-        token = hashlib.sha256(request.cookies.get("session", "").encode()).hexdigest()
-        with connect(database) as db:
-            row = db.execute(
-                "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?",
-                (token, time.time()),
-            ).fetchone()
-        if not row:
-            raise HTTPException(401, "请登录后继续")
-        return dict(row)
+        """身份解析：优先会话 Cookie，其次设备令牌 Cookie。
+        IP 从不参与身份判断：相同 IP、不同浏览器没有 Cookie 就不能登录。"""
+        token = request.cookies.get("session", "")
+        if token:
+            token_hash = hashlib.sha256(token.encode()).hexdigest()
+            with connect(database) as db:
+                row = db.execute(
+                    "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?",
+                    (token_hash, time.time()),
+                ).fetchone()
+            if row:
+                u = dict(row)
+                u["_auth_seed"] = "session:" + token_hash
+                return u
+        device_token = request.cookies.get(DEVICE_COOKIE, "")
+        if device_token:
+            digest = hashlib.sha256(device_token.encode()).hexdigest()
+            with connect(database) as db:
+                row = db.execute(
+                    "SELECT u.*, d.id AS device_row, d.last_used AS device_last_used, d.last_ip AS device_last_ip "
+                    "FROM devices d JOIN users u ON u.id=d.user_id "
+                    "WHERE d.token_hash=? AND d.revoked=0 AND d.expires>?",
+                    (digest, time.time()),
+                ).fetchone()
+            if row:
+                u = dict(row)
+                u["_auth_seed"] = "device:" + digest
+                # 审计：最近使用时间节流更新（60 秒一次）；IP 变化立即记录，
+                # 只作为风险提示，从不影响身份判断或会话有效性。
+                address = client_ip(request)
+                if (
+                    u["device_last_used"] is None
+                    or time.time() - u["device_last_used"] > 60
+                    or u["device_last_ip"] != address
+                ):
+                    with connect(database) as db:
+                        db.execute(
+                            "UPDATE devices SET last_used=?, last_ip=? WHERE id=? AND revoked=0",
+                            (time.time(), address, u["device_row"]),
+                        )
+                return u
+        raise HTTPException(401, "请登录后继续")
 
     def admin(request):
         u = user(request)
         if u["role"] != "admin":
             raise HTTPException(403, "需要管理员权限")
         return u
+
+    def require_csrf(request, u):
+        """敏感管理操作的二次 CSRF 校验：令牌由会话/设备 Cookie 哈希派生，
+        只通过 /api/me 交给同源页面；跨站攻击者拿不到 Cookie，也读不到响应。"""
+        expected = hashlib.sha256(("csrf:" + u["_auth_seed"]).encode()).hexdigest()
+        presented = request.headers.get("x-csrf-token", "")
+        if not secrets.compare_digest(presented, expected):
+            raise HTTPException(403, "安全校验失败，请刷新页面后重试")
 
     def organizer(request):
         u = user(request)
@@ -559,14 +701,25 @@ def create_app(
     def login(body: Login, request: Request, response: Response):
         address = request.client.host if request.client else "local"
         with mutation_lock:
-            recent = [x for x in attempts.get(address, []) if x > time.time() - 300]
+            recent = [x for x in attempts.get(("login", address), []) if x > time.time() - 300]
             if len(recent) >= 20:
                 raise HTTPException(429, "登录尝试过多，请稍后再试")
-            attempts[address] = recent + [time.time()]
+            attempts[("login", address)] = recent + [time.time()]
         with mutation_lock, connect(database) as db:
             u = db.execute("SELECT * FROM users WHERE name=?", (body.name,)).fetchone()
             if not u or not verify(body.password, u["password"]):
                 raise HTTPException(401, "账号或密码错误")
+            # 成功登录重置该地址的失败尝试计数：限流只针对暴力猜测，
+            # 不惩罚输错几次后正常进入的同事。
+            attempts.pop(("login", address), None)
+            # 会话轮换：登录成功时废弃请求中携带的旧会话，再签发全新令牌，
+            # 防止会话固定攻击；同一用户的其他设备会话不受影响。
+            old = request.cookies.get("session", "")
+            if old:
+                db.execute(
+                    "DELETE FROM sessions WHERE token=?",
+                    (hashlib.sha256(old.encode()).hexdigest(),),
+                )
             token = secrets.token_urlsafe(32)
             db.execute("DELETE FROM sessions WHERE expires<?", (time.time(),))
             db.execute(
@@ -598,13 +751,470 @@ def create_app(
                     ).hexdigest(),
                 ),
             )
+            # 退出即撤销本浏览器设备令牌，刷新后不会免密重新进入。
+            presented = request.cookies.get(DEVICE_COOKIE, "")
+            if presented:
+                db.execute(
+                    "UPDATE devices SET revoked=1 WHERE token_hash=?",
+                    (hashlib.sha256(presented.encode()).hexdigest(),),
+                )
         response.delete_cookie("session")
+        response.delete_cookie(DEVICE_COOKIE)
         return {"ok": True}
 
     @app.get("/api/me")
     def me(request: Request):
         u = user(request)
-        return {k: u[k] for k in ("id", "name", "role")}
+        result = {k: u[k] for k in ("id", "name", "role")}
+        # CSRF 令牌：由当前凭证哈希派生，交给同源页面在敏感操作请求头中回传。
+        result["csrf_token"] = hashlib.sha256(("csrf:" + u["_auth_seed"]).encode()).hexdigest()
+        if u["role"] == "admin":
+            with connect(database) as db:
+                result["pending_applications"] = db.execute(
+                    "SELECT count(*) FROM applications WHERE status='pending'"
+                ).fetchone()[0]
+        return result
+
+    # ---------- 自助申请与免密设备登录 ----------
+    # 身份边界：IP 只用于审计与限流，从不参与登录判断；
+    # 申请编号、领取秘密、邀请明文与设备令牌分离，仅哈希入库。
+
+    @app.post("/api/apply")
+    def apply(body: ApplyInput, request: Request):
+        address = client_ip(request)
+        rate_limit("apply", address, 10, 300, "提交过于频繁，请稍后再试")
+        display = body.display_name.strip()
+        if not display:
+            raise HTTPException(422, "请填写显示名称")
+        claim_hash = hashlib.sha256(body.claim_secret.encode()).hexdigest()
+        with mutation_lock, connect(database) as db:
+            if not db.execute("SELECT 1 FROM users").fetchone():
+                raise HTTPException(409, "服务尚未完成初始化，请稍后再试")
+            # 幂等重试：同一领取秘密始终对应同一条申请，双击或重放不会产生多条记录。
+            existing = db.execute(
+                "SELECT id, status FROM applications WHERE claim_hash=?", (claim_hash,)
+            ).fetchone()
+            if existing:
+                return {"id": existing["id"], "status": existing["status"]}
+            key, _, secret = body.invite_code.strip().partition(".")
+            invite = (
+                db.execute("SELECT * FROM invites WHERE token_key=?", (key,)).fetchone()
+                if key and secret
+                else None
+            )
+            valid = bool(invite)
+            if valid:
+                try:
+                    valid = verify(secret, invite["token_hash"])
+                except ValueError:
+                    valid = False
+            # 只校验资格，不消耗次数（消耗发生在批准时）；无效原因不区分细节，
+            # 不暴露邀请码是否存在、是否停用、是否过期或是否用尽。
+            if valid:
+                valid = (
+                    invite["active"] == 1
+                    and invite["expires"] > now()
+                    and invite["used_count"] < invite["max_uses"]
+                )
+            if valid and invite["kind"] == "task":
+                valid = bool(
+                    db.execute(
+                        "SELECT 1 FROM tasks WHERE id=? AND id NOT IN (SELECT task_id FROM deleted_tasks)",
+                        (invite["task_id"],),
+                    ).fetchone()
+                )
+            if not valid:
+                raise HTTPException(422, "邀请凭证无效或已失效，请向管理员核对")
+            application_id = uid()
+            db.execute(
+                "INSERT INTO applications VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'',NULL,NULL)",
+                (
+                    application_id,
+                    claim_hash,
+                    display,
+                    body.employee_id.strip(),
+                    body.email.strip(),
+                    invite["id"],
+                    "pending",
+                    address,
+                    simplify_device(request.headers.get("user-agent")),
+                    now(),
+                    None,
+                    None,
+                ),
+            )
+        return {"id": application_id, "status": "pending"}
+
+    @app.post("/api/apply/status")
+    def apply_status(body: ClaimInput, request: Request):
+        address = client_ip(request)
+        rate_limit("status", address, 120, 300, "查询过于频繁，请稍后再试")
+        with mutation_lock, connect(database) as db:
+            row = db.execute(
+                "SELECT a.id, a.claim_hash, a.status, i.active AS invite_active, i.expires AS invite_expires, "
+                "i.used_count AS invite_used, i.max_uses AS invite_max FROM applications a "
+                "JOIN invites i ON i.id=a.invite_id WHERE a.id=?",
+                (body.application_id,),
+            ).fetchone()
+            if not row or not secrets.compare_digest(
+                hashlib.sha256(body.claim_secret.encode()).hexdigest(), row["claim_hash"]
+            ):
+                raise HTTPException(403, "申请编号或领取信息不正确")
+            status = row["status"]
+            # 申请自身没有独立有效期；其等待资格随邀请失效而结束（pending -> expired）。
+            if status == "pending" and (
+                row["invite_active"] != 1
+                or row["invite_expires"] <= now()
+                or row["invite_used"] >= row["invite_max"]
+            ):
+                db.execute(
+                    "UPDATE applications SET status='expired', decided=? WHERE id=? AND status='pending'",
+                    (now(), row["id"]),
+                )
+                status = "expired"
+        return {"id": body.application_id, "status": status}
+
+    @app.post("/api/apply/claim")
+    def apply_claim(body: ClaimInput, request: Request, response: Response):
+        address = client_ip(request)
+        rate_limit("claim", address, 20, 300, "领取尝试过于频繁，请稍后再试")
+        device_info = simplify_device(request.headers.get("user-agent"))
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        with mutation_lock, connect(database) as db:
+            row = db.execute(
+                "SELECT * FROM applications WHERE id=?", (body.application_id,)
+            ).fetchone()
+            if not row or not secrets.compare_digest(
+                hashlib.sha256(body.claim_secret.encode()).hexdigest(), row["claim_hash"]
+            ):
+                raise HTTPException(403, "申请编号或领取信息不正确")
+            if row["status"] == "pending":
+                raise HTTPException(409, "申请还在等待管理员批准")
+            if row["status"] != "approved" or not row["user_id"]:
+                raise HTTPException(409, "申请未处于可领取状态")
+            if not row["device_id"]:
+                # 首次领取：签发随机高熵设备令牌；仅哈希入库，明文只通过 Cookie 下发。
+                device_id = uid()
+                db.execute(
+                    "INSERT INTO devices VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        device_id,
+                        row["user_id"],
+                        digest,
+                        now(),
+                        time.time(),
+                        time.time(),
+                        time.time() + DEVICE_TTL,
+                        0,
+                        address,
+                        address,
+                        device_info,
+                    ),
+                )
+                db.execute(
+                    "UPDATE applications SET device_id=? WHERE id=?",
+                    (device_id, row["id"]),
+                )
+            else:
+                # 重试领取：同一申请同一设备行，轮换令牌并立即作废旧令牌；
+                # 窗口关闭后领取秘密不再可用，设备 Cookie 是唯一凭证。
+                device = db.execute(
+                    "SELECT claimed_at FROM devices WHERE id=?", (row["device_id"],)
+                ).fetchone()
+                if not device or time.time() - device["claimed_at"] > CLAIM_GRACE:
+                    raise HTTPException(
+                        409,
+                        "登录状态已在原浏览器生效；如需在新浏览器登录，请联系管理员重置密码或撤销设备",
+                    )
+                db.execute(
+                    "UPDATE devices SET token_hash=?, claimed_at=?, last_used=NULL, last_ip=?, device=?, expires=? WHERE id=? AND revoked=0",
+                    (digest, time.time(), address, device_info, time.time() + DEVICE_TTL, row["device_id"]),
+                )
+        response.set_cookie(
+            DEVICE_COOKIE,
+            token,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="lax",
+            max_age=DEVICE_TTL,
+            path="/",
+        )
+        return {"ok": True, "status": "approved"}
+
+    @app.get("/api/invites")
+    def invite_list(request: Request):
+        admin(request)
+        with connect(database) as db:
+            rows = db.execute(
+                "SELECT i.id, i.purpose, i.kind, i.task_id, t.title AS task_title, i.expires, "
+                "i.max_uses, i.used_count, i.active, i.created FROM invites i "
+                "LEFT JOIN tasks t ON t.id=i.task_id ORDER BY i.created DESC, i.id"
+            ).fetchall()
+        # 列表不含 token_key、盐和哈希，更不可能恢复明文。
+        return [dict(row) for row in rows]
+
+    @app.post("/api/invites")
+    def create_invite(body: InviteInput, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        if body.kind not in ("team", "task"):
+            raise HTTPException(422, "请选择邀请类型")
+        task_id = ""
+        if body.kind == "task":
+            with connect(database) as db:
+                if not db.execute(
+                    "SELECT 1 FROM tasks WHERE id=? AND id NOT IN (SELECT task_id FROM deleted_tasks)",
+                    (body.task_id,),
+                ).fetchone():
+                    raise HTTPException(404, "任务不存在")
+            task_id = body.task_id
+        # 高熵凭证 = 可识别片段 + 机密片段；库中只存片段与带独立盐的 scrypt 哈希，
+        # 明文只在本次响应出现一次，之后任何接口都无法取回。
+        code = secrets.token_urlsafe(6) + "." + secrets.token_urlsafe(18)
+        key, _, secret = code.partition(".")
+        invite_id = uid()
+        expires = (
+            datetime.now(UTC).replace(microsecond=0) + timedelta(days=body.expires_days)
+        ).isoformat()
+        with mutation_lock, connect(database) as db:
+            db.execute(
+                "INSERT INTO invites VALUES(?,?,?,?,?,?,?,?,0,1,?,?)",
+                (
+                    invite_id,
+                    body.purpose.strip(),
+                    body.kind,
+                    task_id or None,
+                    key,
+                    password_hash(secret),
+                    expires,
+                    body.max_uses,
+                    now(),
+                    u["id"],
+                ),
+            )
+        return {"id": invite_id, "code": code, "expires": expires}
+
+    @app.patch("/api/invites/{invite_id}")
+    def update_invite(invite_id: str, body: InviteToggle, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        with mutation_lock, connect(database) as db:
+            if not db.execute("SELECT 1 FROM invites WHERE id=?", (invite_id,)).fetchone():
+                raise HTTPException(404, "邀请不存在")
+            db.execute("UPDATE invites SET active=? WHERE id=?", (1 if body.active else 0, invite_id))
+        return {"ok": True}
+
+    @app.get("/api/applications")
+    def application_list(request: Request, status: str = ""):
+        admin(request)
+        sql = (
+            "SELECT a.id, a.display_name, a.employee_id, a.email, a.created, a.ip, a.device, a.status, "
+            "a.decided, a.user_id, a.device_id, du.name AS decided_by_name, i.purpose, i.kind AS invite_kind, "
+            "i.task_id AS invite_task_id, t.title AS invite_task_title FROM applications a "
+            "JOIN invites i ON i.id=a.invite_id LEFT JOIN tasks t ON t.id=i.task_id "
+            "LEFT JOIN users du ON du.id=a.decided_by"
+        )
+        params = ()
+        if status in APPLICATION_STATES:
+            sql += " WHERE a.status=?"
+            params = (status,)
+        sql += " ORDER BY a.created DESC, a.id"
+        with connect(database) as db:
+            rows = db.execute(sql, params).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "display_name": row["display_name"],
+                "employee_id": row["employee_id"],
+                "email": row["email"],
+                "created": row["created"],
+                "ip": row["ip"],
+                "device": row["device"],
+                "status": row["status"],
+                "decided": row["decided"],
+                "decided_by": row["decided_by_name"],
+                "user_id": row["user_id"],
+                "claimed": bool(row["device_id"]),
+                "invite": {
+                    "purpose": row["purpose"],
+                    "kind": row["invite_kind"],
+                    "task_id": row["invite_task_id"],
+                    "task_title": row["invite_task_title"],
+                },
+            }
+            for row in rows
+        ]
+
+    @app.post("/api/applications/{application_id}/approve")
+    def approve(application_id: str, body: ApproveInput, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        if body.role not in ("reviewer", "organizer"):
+            raise HTTPException(422, "请选择评测者或组织者角色")
+        tasks = sorted({t for t in body.task_ids if t})
+        with mutation_lock:
+            with connect(database) as db:
+                row = db.execute(
+                    "SELECT a.*, i.kind AS invite_kind, i.task_id AS invite_task_id, i.active AS invite_active, "
+                    "i.expires AS invite_expires, i.used_count AS invite_used, i.max_uses AS invite_max "
+                    "FROM applications a JOIN invites i ON i.id=a.invite_id WHERE a.id=?",
+                    (application_id,),
+                ).fetchone()
+                if not row:
+                    raise HTTPException(404, "申请不存在")
+                if row["status"] != "pending":
+                    # 终态不可反转：同决策重试幂等返回，其他情形显式冲突。
+                    if row["status"] == "approved":
+                        resolved = (body.name or "").strip() or row["display_name"].strip()
+                        snapshot = json.dumps(
+                            {"name": resolved, "role": body.role, "tasks": tasks},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if row["decision"] == snapshot:
+                            return {"ok": True, "already": True, "user_id": row["user_id"]}
+                    if (
+                        row["status"] == "rejected"
+                        and not tasks
+                        and body.role == "reviewer"
+                        and not (body.name or "").strip()
+                    ):
+                        return {"ok": True, "already": True}
+                    raise HTTPException(409, "该申请已" + STATE_NAMES[row["status"]])
+                resolved_name = (body.name or "").strip() or row["display_name"].strip()
+                if not resolved_name or len(resolved_name) > 60:
+                    raise HTTPException(422, "请填写有效的账号名称")
+                snapshot = json.dumps(
+                    {"name": resolved_name, "role": body.role, "tasks": tasks},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if row["invite_kind"] == "task" and tasks != [row["invite_task_id"]]:
+                    raise HTTPException(422, "任务邀请只能批准到受邀任务")
+                if row["invite_kind"] != "task":
+                    for task_id in tasks:
+                        t = db.execute(
+                            "SELECT status FROM tasks WHERE id=? AND id NOT IN (SELECT task_id FROM deleted_tasks)",
+                            (task_id,),
+                        ).fetchone()
+                        if not t:
+                            raise HTTPException(404, "受邀任务不存在")
+                        if t["status"] != "active":
+                            raise HTTPException(422, "只能分配正在评测中的任务")
+                if db.execute(
+                    "SELECT 1 FROM users WHERE name=?", (resolved_name,)
+                ).fetchone():
+                    raise HTTPException(409, "账号名称已存在，请修改后重试")
+                expired = (
+                    row["invite_active"] != 1
+                    or row["invite_expires"] <= now()
+                    or row["invite_used"] >= row["invite_max"]
+                )
+            if expired:
+                with connect(database) as db:
+                    db.execute(
+                        "UPDATE applications SET status='expired', decided=? WHERE id=? AND status='pending'",
+                        (now(), application_id),
+                    )
+                raise HTTPException(409, "邀请凭证已失效或次数用尽，申请已自动过期")
+            # 批准事务：消耗邀请次数（SQL 级上限约束）→ 建账号 → 入成员与受邀名单 →
+            # 落申请终态。任一步失败整体回滚，不会留下半批准用户、超用邀请或孤立令牌。
+            user_id = uid()
+            with connect(database) as db:
+                consumed = db.execute(
+                    "UPDATE invites SET used_count=used_count+1 WHERE id=? AND active=1 AND used_count<max_uses AND expires>?",
+                    (row["invite_id"], now()),
+                ).rowcount
+                if consumed != 1:
+                    raise HTTPException(409, "邀请凭证状态已变化，请刷新后重试")
+                # 被批准账号初始不设置可用口令：随机值哈希后即刻丢弃，
+                # 只能通过设备 Cookie 免密登录；必要时管理员可用既有重置口令流程。
+                db.execute(
+                    "INSERT INTO users VALUES(?,?,?,?)",
+                    (user_id, resolved_name, password_hash(secrets.token_urlsafe(32)), body.role),
+                )
+                for task_id in tasks:
+                    db.execute("INSERT OR IGNORE INTO members VALUES(?,?)", (task_id, user_id))
+                    db.execute(
+                        "INSERT OR IGNORE INTO review_assignments VALUES(?,?)", (task_id, user_id)
+                    )
+                db.execute(
+                    "UPDATE applications SET status='approved', user_id=?, decision=?, decided=?, decided_by=? WHERE id=? AND status='pending'",
+                    (user_id, snapshot, now(), u["id"], application_id),
+                )
+        return {"ok": True, "user_id": user_id, "already": False}
+
+    @app.post("/api/applications/{application_id}/reject")
+    def reject(application_id: str, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        with mutation_lock, connect(database) as db:
+            row = db.execute(
+                "SELECT status FROM applications WHERE id=?", (application_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(404, "申请不存在")
+            if row["status"] == "rejected":
+                return {"ok": True, "already": True}
+            if row["status"] != "pending":
+                raise HTTPException(409, "该申请已" + STATE_NAMES[row["status"]])
+            # 拒绝不消耗邀请使用次数。
+            db.execute(
+                "UPDATE applications SET status='rejected', decided=?, decided_by=? WHERE id=?",
+                (now(), u["id"], application_id),
+            )
+        return {"ok": True, "already": False}
+
+    @app.get("/api/users/{user_id}/devices")
+    def device_list(user_id: str, request: Request):
+        admin(request)
+        with connect(database) as db:
+            if not db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+                raise HTTPException(404, "账号不存在")
+            rows = db.execute(
+                "SELECT id, created, last_used, expires, revoked, first_ip, last_ip, device "
+                "FROM devices WHERE user_id=? ORDER BY created DESC, id",
+                (user_id,),
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "created": row["created"],
+                "last_used": (
+                    datetime.fromtimestamp(row["last_used"], UTC).isoformat()
+                    if row["last_used"]
+                    else None
+                ),
+                "expires": datetime.fromtimestamp(row["expires"], UTC).isoformat(),
+                "revoked": bool(row["revoked"]),
+                "first_ip": row["first_ip"],
+                "last_ip": row["last_ip"],
+                "device": row["device"] or "未知客户端",
+            }
+            for row in rows
+        ]
+
+    @app.delete("/api/devices/{device_id}")
+    def revoke_device(device_id: str, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        with mutation_lock, connect(database) as db:
+            if not db.execute("SELECT 1 FROM devices WHERE id=?", (device_id,)).fetchone():
+                raise HTTPException(404, "设备不存在")
+            # 撤销幂等：重复撤销同样返回成功；下一次请求立即失效。
+            db.execute("UPDATE devices SET revoked=1 WHERE id=?", (device_id,))
+        return {"ok": True}
+
+    @app.delete("/api/users/{user_id}/devices")
+    def revoke_all_devices(user_id: str, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        with mutation_lock, connect(database) as db:
+            if not db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+                raise HTTPException(404, "账号不存在")
+            db.execute("UPDATE devices SET revoked=1 WHERE user_id=? AND revoked=0", (user_id,))
+        return {"ok": True}
 
     @app.get("/api/users")
     def users(request: Request):

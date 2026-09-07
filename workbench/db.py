@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS aliases(user_id TEXT REFERENCES users(id), sample_id 
 CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY, sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), track_id TEXT REFERENCES tracks(id), start INTEGER NOT NULL, end INTEGER NOT NULL, body TEXT NOT NULL, tag TEXT NOT NULL, parent TEXT REFERENCES comments(id), created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ratings(sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), choice TEXT NOT NULL, reason TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY(sample_id,user_id));
 CREATE TABLE IF NOT EXISTS review_assignments(task_id TEXT NOT NULL REFERENCES tasks(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(task_id,user_id));
+-- 自助申请：设备令牌、邀请凭证与申请记录。所有凭证只保存哈希；
+-- 邀请哈希内嵌独立盐（password_hash 格式 salt:digest），列表与备份均无法恢复明文。
+CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT UNIQUE NOT NULL, created TEXT NOT NULL, claimed_at REAL NOT NULL, last_used REAL, expires REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, first_ip TEXT NOT NULL DEFAULT '', last_ip TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS invites(id TEXT PRIMARY KEY, purpose TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, task_id TEXT REFERENCES tasks(id), token_key TEXT UNIQUE NOT NULL, token_hash TEXT NOT NULL, expires TEXT NOT NULL, max_uses INTEGER NOT NULL, used_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL, created_by TEXT REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, claim_hash TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, employee_id TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', invite_id TEXT NOT NULL REFERENCES invites(id), status TEXT NOT NULL DEFAULT 'pending', ip TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, decided TEXT, decided_by TEXT REFERENCES users(id), decision TEXT NOT NULL DEFAULT '', user_id TEXT REFERENCES users(id), device_id TEXT REFERENCES devices(id));
 """
 
 

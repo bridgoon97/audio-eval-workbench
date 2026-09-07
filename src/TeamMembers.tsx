@@ -11,10 +11,12 @@ export function TeamMembers({
   members,
   onChange,
   onBusy,
+  onDevices,
 }: {
   members: User[];
   onChange: (members: User[]) => void;
   onBusy: (busy: boolean) => void;
+  onDevices?: (user: User) => void;
 }) {
   const [password, setPassword] = useState(generatePassword);
   const [visible, setVisible] = useState(false);
@@ -132,6 +134,14 @@ export function TeamMembers({
                   <option value="reviewer">评测者</option>
                   <option value="organizer">组织者（可上传任务）</option>
                 </select>
+                <button
+                  type="button"
+                  disabled={busy || !!target}
+                  aria-label={`管理 ${m.name} 的登录设备`}
+                  onClick={() => onDevices?.(m)}
+                >
+                  登录设备
+                </button>
                 <button
                   type="button"
                   disabled={busy || !!target}
