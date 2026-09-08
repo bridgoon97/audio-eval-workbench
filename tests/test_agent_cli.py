@@ -1200,32 +1200,32 @@ def test_apply_rejects_tampered_mapping(tmp_path, server):
         )
     assert client.get("/api/tasks").json() == []
 
-    # mapping 中途修改：先把 mapping 恢复为 prepare 的合法内容，完成草稿建立
-    # state 绑定；再改动任何字段 → SHA 不一致被拒。
-    good_mapping = json.loads((out / "mapping.json").read_text(encoding="utf-8"))
-    good_mapping.pop("samples", None)
-    # 从 prepare 输出恢复：重新 prepare 一份干净的（原 mapping 已被前序场景污染）。
-    clean_dir = tmp_path / "prepared-clean"
-    clean_mapping = prepare_assets(_manifest, tmp_path / "work", clean_dir)
-    mapping_path.write_text(
-        json.dumps(clean_mapping, ensure_ascii=False), encoding="utf-8"
-    )
-    state3 = tmp_path / "state3.json"
+    # mapping SHA 绑定与中途修改拒绝由 test_mapping_sha_binding_rejects_midway_changes 覆盖。
+
+
+def test_mapping_sha_binding_rejects_midway_changes(tmp_path, server):
+    """失败项 4：mapping SHA 绑定 state——中途任何修改停止，草稿不受影响。"""
+    base, app = server
+    manifest_path, _manifest, out = prepare_media_and_mapping(tmp_path)
+    mapping_path = out / "mapping.json"
+    state = tmp_path / "state.json"
+    # 完整草稿编排（合法 mapping），state 记录 mapping SHA。
     agent_tasks.run_apply(
-        manifest_path, base, "编排组织者", "organizer-agent-pass", state3, mapping_path
+        manifest_path, base, "编排组织者", "organizer-agent-pass", state, mapping_path
     )
+    state_payload = json.loads(state.read_text(encoding="utf-8"))
+    assert state_payload["mapping_sha256"]
+    task_id = state_payload["task_id"]
+
+    # 中途修改 mapping（改 conversion_note）→ SHA 不一致拒绝。
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     mapping["conversion_note"] = "被中途改动"
     mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(AgentError, match="不一致"):
         agent_tasks.run_apply(
-            manifest_path,
-            base,
-            "编排组织者",
-            "organizer-agent-pass",
-            state3,
-            mapping_path,
+            manifest_path, base, "编排组织者", "organizer-agent-pass", state, mapping_path
         )
-    payload3 = json.loads(state3.read_text(encoding="utf-8"))
-    detail3 = client.get(f"/api/tasks/{payload3['task_id']}").json()
-    assert detail3["samples"][0]["track_count"] == 2  # 服务端草稿未被改动
+    client = TestClient(app)
+    client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
+    detail = client.get(f"/api/tasks/{task_id}").json()
+    assert detail["samples"][0]["track_count"] == 2
