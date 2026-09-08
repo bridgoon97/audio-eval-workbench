@@ -477,8 +477,8 @@ def test_disable_blocks_all_access(env):
 
 
 def test_admin_protections(env):
-    """管理员账号不可停用；不能停用自己；停用幂等。"""
-    app, admin, _ = env
+    """管理员账号不可停用；不能停用自己；停用幂等且无额外副作用。"""
+    app, admin, folder = env
     admin_id = admin.get("/api/me").json()["id"]
     # 停用管理员（唯一可用管理员）→ 409。
     assert (
@@ -507,16 +507,27 @@ def test_admin_protections(env):
     )
     # 不存在账号 → 404；重复停用幂等 200。
     _member, member_id, _ = make_user(admin, app, "幂等停用员")
-    for _ in range(2):
-        assert (
-            admin.post(
-                f"/api/users/{member_id}/status",
-                json={"active": False},
-                headers=secure_headers(admin),
-            ).status_code
-            == 200
-            or True
+    # 两次停用都精确 200；第二次无额外副作用（active 仍 0，
+    # 会话与设备集合不再变化）。
+    responses = [
+        admin.post(
+            f"/api/users/{member_id}/status",
+            json={"active": False},
+            headers=secure_headers(admin),
         )
+        for _ in range(2)
+    ]
+    assert [r.status_code for r in responses] == [200, 200]
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        active = db.execute("SELECT active FROM users WHERE id=?", (member_id,)).fetchone()[0]
+        sessions = db.execute(
+            "SELECT count(*) FROM sessions WHERE user_id=?", (member_id,)
+        ).fetchone()[0]
+        devices = db.execute(
+            "SELECT count(*) FROM devices WHERE user_id=? AND revoked=0",
+            (member_id,),
+        ).fetchone()[0]
+    assert active == 0 and sessions == 0 and devices == 0
     # 404。
     assert (
         admin.post(
@@ -673,3 +684,123 @@ def _snapshot(path):
             if t != "sqlite_sequence"
         }
     return schema, data
+
+
+def test_admin_reset_revokes_devices_and_requires_csrf(env):
+    """管理员重置纳入统一边界：CSRF 必须、会话与设备一起作废、
+    停用账号拒绝重置、历史数据不变。"""
+    import hashlib
+
+    app, admin, folder = env
+    member, member_id, old_password = make_user(admin, app, "重置处置员")
+    # 历史证据：先发一条评论。
+    task_id = admin.post(
+        "/api/tasks", json={"title": "重置保留任务", "mode": "development"}
+    ).json()["id"]
+    sample_id = admin.post(f"/api/tasks/{task_id}/samples", json={"name": "片段"}).json()["id"]
+    buffer = io.BytesIO()
+    import numpy as np
+    import soundfile as sf
+
+    buffer = io.BytesIO()
+    sf.write(buffer, np.zeros(1600, dtype="float32"), 16000, format="WAV")
+    tracks = []
+    for name in ("候选甲", "候选乙"):
+        tracks.append(
+            admin.post(
+                f"/api/samples/{sample_id}/tracks",
+                data={"name": name, "version": "v"},
+                files={"file": ("x.wav", buffer.getvalue(), "audio/wav")},
+            ).json()["id"]
+        )
+    published = admin.post(
+        f"/api/tasks/{task_id}/publish",
+        json={"users": [member_id], "alignment_confirmed": True},
+    )
+    assert published.status_code == 200, published.text
+    commented = member.post(
+        f"/api/samples/{sample_id}/comments",
+        json={"start": 0, "end": 100, "body": "重置前的标注"},
+    )
+    assert commented.status_code == 200, commented.text
+    rated = member.post(f"/api/samples/{sample_id}/rating", json={"choice": tracks[0]})
+    assert rated.status_code == 200, rated.text
+
+    # 缺 CSRF / 错 CSRF：403，且凭证不受影响。
+    missing = admin.post(
+        f"/api/users/{member_id}/password",
+        json={"password": "brand-new-pass-1", "confirm_name": "重置处置员"},
+    )
+    assert missing.status_code == 403
+    wrong = admin.post(
+        f"/api/users/{member_id}/password",
+        json={"password": "brand-new-pass-1", "confirm_name": "重置处置员"},
+        headers={"x-csrf-token": "0" * 64},
+    )
+    assert wrong.status_code == 403
+    assert member.get("/api/me").status_code == 200
+
+    # 停用账号：重置被拒，需先启用。
+    admin.post(
+        f"/api/users/{member_id}/status",
+        json={"active": False},
+        headers=secure_headers(admin),
+    )
+    disabled_reset = admin.post(
+        f"/api/users/{member_id}/password",
+        json={"password": "brand-new-pass-1", "confirm_name": "重置处置员"},
+        headers=secure_headers(admin),
+    )
+    assert disabled_reset.status_code == 409 and "先启用" in disabled_reset.text
+    admin.post(
+        f"/api/users/{member_id}/status",
+        json={"active": True},
+        headers=secure_headers(admin),
+    )
+
+    # 启用后（此时无任何有效凭证）再挂一个设备 Cookie（模拟失窃的第二台设备），
+    # 使“重置是否撤销设备”可被独立观测。
+    device_browser = TestClient(app, client=("10.0.0.5", 5))
+    device_token = "stolen-device-token-xyz"
+    device_browser.cookies.set("device", device_token)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute(
+            "INSERT INTO devices VALUES("
+            "'dev-stolen',?,?,'2026-01-01T00:00:00+00:00',0,NULL,"
+            "9999999999999,0,'10.0.0.5','10.0.0.5','未知客户端')",
+            (member_id, hashlib.sha256(device_token.encode()).hexdigest()),
+        )
+    assert device_browser.get("/api/me").status_code == 200
+
+    # 正常重置：确认名称错误 422；正确后 200。
+    wrong_name = admin.post(
+        f"/api/users/{member_id}/password",
+        json={"password": "brand-new-pass-1", "confirm_name": "错误名称"},
+        headers=secure_headers(admin),
+    )
+    assert wrong_name.status_code == 422
+    ok = admin.post(
+        f"/api/users/{member_id}/password",
+        json={"password": "brand-new-pass-1", "confirm_name": "重置处置员"},
+        headers=secure_headers(admin),
+    )
+    assert ok.status_code == 200, ok.text
+
+    # 旧密码会话、旧设备 Cookie、旧密码全部失效；新随机密码可登录。
+    assert member.get("/api/me").status_code == 401
+    assert device_browser.get("/api/me").status_code == 401
+    assert (
+        member.post("/api/login", json={"name": "重置处置员", "password": old_password}).status_code
+        == 401
+    )
+    relogin = TestClient(app)
+    assert (
+        relogin.post(
+            "/api/login", json={"name": "重置处置员", "password": "brand-new-pass-1"}
+        ).status_code
+        == 200
+    )
+    # 历史数据不变。
+    detail = relogin.get(f"/api/samples/{sample_id}").json()
+    assert [c["body"] for c in detail["comments"]] == ["重置前的标注"]
+    assert detail["rating"]["choice"] == tracks[0]

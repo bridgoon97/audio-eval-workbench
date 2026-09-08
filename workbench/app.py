@@ -1599,22 +1599,32 @@ def create_app(
 
     @app.post("/api/users/{user_id}/password")
     def reset_password(user_id: str, body: ResetPasswordInput, request: Request):
-        admin(request)
+        u = admin(request)
+        require_csrf(request, u)
         with mutation_lock, connect(database) as db:
             target = db.execute(
-                "SELECT name,role FROM users WHERE id=?", (user_id,)
+                "SELECT name,role,active FROM users WHERE id=?", (user_id,)
             ).fetchone()
             if not target:
                 raise HTTPException(404, "账号不存在")
             if target["role"] == "admin":
                 raise HTTPException(409, "此入口仅用于重置同事账号，不修改管理员密码")
+            # 停用账号的处置路径是先启用：避免停用态下发放新凭证造成状态混乱。
+            if not target["active"]:
+                raise HTTPException(409, "账号已停用，请先启用再重置密码")
             if body.confirm_name != target["name"]:
                 raise HTTPException(422, "请输入完整账号名称确认重置")
             db.execute(
                 "UPDATE users SET password=? WHERE id=?",
                 (password_hash(body.password), user_id),
             )
+            # 失窃处置口径：旧密码、全部会话与全部设备令牌一并作废，
+            # 仅凭旧设备 Cookie 不能继续登录。
             db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            db.execute(
+                "UPDATE devices SET revoked=1 WHERE user_id=? AND revoked=0",
+                (user_id,),
+            )
         return {"ok": True}
 
     @app.patch("/api/users/{user_id}/role")

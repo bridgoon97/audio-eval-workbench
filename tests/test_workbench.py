@@ -648,12 +648,15 @@ def test_password_reset_revokes_sessions_and_preserves_work(env):
     c.post(f"/api/samples/{s}/rating", json={"choice": tracks[0]})
     payload = {"password": "new-random-test-only-2026", "confirm_name": "需要重置"}
     route = f"/api/users/{member}/password"
+    # 重置属于敏感管理操作：需要管理员会话的 CSRF 令牌。
+    reset_headers = {"x-csrf-token": a.get("/api/me").json()["csrf_token"]}
     assert c.post(route, json=payload).status_code == 403
     assert (
-        a.post(route, json={**payload, "confirm_name": "其他同事"}).status_code == 422
+        a.post(route, json={**payload, "confirm_name": "其他同事"}, headers=reset_headers).status_code
+        == 422
     )
     assert c.get("/api/me").status_code == 200
-    result = a.post(route, json=payload)
+    result = a.post(route, json=payload, headers=reset_headers)
     assert result.status_code == 200
     assert payload["password"] not in result.text
     assert c.get("/api/me").status_code == 401
@@ -683,6 +686,7 @@ def test_password_reset_revokes_sessions_and_preserves_work(env):
         a.post(
             f"/api/users/{admin_id}/password",
             json={**payload, "confirm_name": "组织者"},
+            headers=reset_headers,
         ).status_code
         == 409
     )
