@@ -1,5 +1,5 @@
 .venv/
-node_modules/
+node_modules
 dist/
 build/
 *.spec
@@ -20,4 +20,3 @@ coverage/
 *.egg-info/
 playwright-report/
 test-results/
-node_modules/
