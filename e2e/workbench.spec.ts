@@ -196,6 +196,11 @@ test('同事获授组织者权限后可上传、删除及恢复自己的任务',
   await expect(page.locator('.task-card')).toHaveCount(0);
   await page.getByRole('button', { name: '回收站', exact: true }).click();
   await expect(page.locator('.trash-row')).toHaveCount(1);
+  // 组织者只能软删除/恢复：无永久清除入口，服务端同样拒绝。
+  await expect(page.getByRole('button', { name: '永久清除' })).toHaveCount(0);
+  const trashedTasks = await (await page.request.get('/api/tasks?deleted=true')).json();
+  const denied = await page.request.post(`/api/tasks/${trashedTasks[0].id}/purge/prepare`);
+  expect(denied.status()).toBe(403);
   await page.getByRole('button', { name: '恢复任务', exact: true }).click();
   await expect(page.getByText('回收站为空', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '关闭', exact: true }).click();
@@ -774,6 +779,35 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
 
   await page.goto('/');
   await page.locator('.task-card').filter({ hasText: '对齐响度验收' }).click();
+
+  // 草稿修订：纠正任务标题与片段名称。
+  await page.getByRole('button', { name: '编辑任务', exact: true }).click();
+  await page.getByLabel('任务名称', { exact: true }).fill('对齐响度验收（修订）');
+  await page.getByRole('button', { name: '保存任务信息' }).click();
+  await expect(page.getByRole('heading', { name: /对齐响度验收（修订）/ })).toBeVisible();
+  await page.getByRole('button', { name: '编辑片段', exact: true }).click();
+  await page.getByLabel('片段名称', { exact: true }).fill('对齐片段（修订）');
+  await page.getByRole('button', { name: '保存片段信息' }).click();
+  await expect(page.getByRole('heading', { name: '对齐片段（修订）' })).toBeVisible();
+
+  // 整段删除：无贡献片段经确认后整段移除。
+  const sample2 = await (
+    await page.request.post(`/api/tasks/${created.id}/samples`, {
+      data: { name: '待删除片段', provenance: 'PUBLIC reproducible' },
+    })
+  ).json();
+  await page.request.post(`/api/samples/${sample2.id}/tracks`, {
+    multipart: {
+      name: '候选甲',
+      version: 'v1',
+      file: { name: 'c.wav', mimeType: 'audio/wav', buffer: wav(ref) },
+    },
+  });
+  await page.locator('.sample-item').filter({ hasText: '待删除片段' }).click();
+  page.once('dialog', (d) => d.accept());
+  await page.getByRole('button', { name: '删除片段', exact: true }).click();
+  await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0);
+
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
   await page.getByRole('button', { name: '开始分析' }).click();
@@ -855,5 +889,23 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   expect(processedTrack['处理口径']['lag']).toBe(320);
   expect(processedTrack['处理口径']['派生资产SHA256']).toMatch(/^[0-9a-f]{64}$/);
   expect(exported).toContain('ERR_LOW_CORRELATION');
+
+  // 软删除 → 管理员永久清除（一次性令牌 + 不可恢复确认）。
+  await page.request.delete(`/api/tasks/${created.id}`, {
+    data: { title: '对齐响度验收（修订）' },
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: '回收站', exact: true }).click();
+  const trashRow = page.locator('.trash-row').filter({ hasText: '对齐响度验收（修订）' });
+  await expect(trashRow).toBeVisible();
+  await trashRow.getByRole('button', { name: '永久清除' }).click();
+  await expect(page.locator('.purge-confirm')).toContainText('不可恢复');
+  await page.locator('.purge-confirm').getByRole('button', { name: '确认永久清除' }).click();
+  // 其他任务的软删除记录不受影响；本任务行消失且接口 404。
+  await expect(page.locator('.trash-row').filter({ hasText: '对齐响度验收（修订）' })).toHaveCount(
+    0,
+  );
+  await expect(page.locator('.trash-row').filter({ hasText: '合成音试听' })).toBeVisible();
+  expect((await page.request.get(`/api/tasks/${created.id}`)).status()).toBe(404);
   expect(errors).toEqual([]);
 });

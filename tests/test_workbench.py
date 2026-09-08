@@ -6,6 +6,7 @@ import json
 import sqlite3
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -66,6 +67,10 @@ def task(admin, mode="blind"):
         assert response.status_code == 200, response.text
         tracks.append(response.json()["id"])
     return t, s, tracks
+
+
+def csrf(client):
+    return client.get("/api/me").json()["csrf_token"]
 
 
 def publish(admin, t, users=None):
@@ -1667,3 +1672,607 @@ def test_replacement_reclaims_old_derived_file(env):
     assert not (folder / "assets" / first_name).exists()
     assert a.get(f"/api/audio/{ids[1]}").content != served_first
     assert a.get(f"/api/audio/{ids[1]}").content == (folder / "assets" / second_name).read_bytes()
+
+
+def test_edit_task_mode_requires_clean_draft(env):
+    """比较模式仅在草稿且无任何标注/评分时可改；标题不受贡献限制。"""
+    _, a, _ = env
+    t, s, _ = task(a, "development")
+    a.post(
+        f"/api/samples/{s}/comments", json={"start": 0, "end": 100, "body": "已有标注"}
+    )
+    assert (
+        a.patch(
+            f"/api/tasks/{t}",
+            json={"title": "改个名字", "kind": "算法版本", "mode": "development"},
+        ).status_code
+        == 200
+    )
+    detail = a.get(f"/api/tasks/{t}").json()
+    assert detail["title"] == "改个名字" and detail["mode"] == "development"
+    blocked = a.patch(
+        f"/api/tasks/{t}",
+        json={"title": "改个名字", "kind": "算法版本", "mode": "blind"},
+    )
+    assert blocked.status_code == 409 and "比较模式保持冻结" in blocked.text
+    t2, _, _ = task(a, "development")
+    assert (
+        a.patch(
+            f"/api/tasks/{t2}",
+            json={"title": "任务二", "kind": "算法版本", "mode": "blind"},
+        ).status_code
+        == 200
+    )
+    assert a.get(f"/api/tasks/{t2}").json()["mode"] == "blind"
+
+
+def test_delete_draft_sample_reclaims_exclusive_keeps_shared(env):
+    """整段删除：行级清理＋独占资产回收＋共享原始资产保留可播放。"""
+    _, a, folder = env
+    t1 = a.post("/api/tasks", json={"title": "删除片段任务", "mode": "development"}).json()["id"]
+    s1, ids1, ref_x = processing_sample(a, t1, name="待删片段")
+    apply_body = {"参考": ids1[0], "处理": [{"候选": ids1[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s1}/processing", json=apply_body).status_code == 200
+    t2 = a.post("/api/tasks", json={"title": "共享任务", "mode": "development"}).json()["id"]
+    s2 = a.post(f"/api/tasks/{t2}/samples", json={"name": "共享片段"}).json()["id"]
+    r = a.post(
+        f"/api/samples/{s2}/tracks",
+        data={"name": "同字节参考", "version": "v"},
+        files={"file": ("x.wav", encode_float_wav(ref_x), "audio/wav")},
+    )
+    assert r.status_code == 200
+    shared_track = r.json()["id"]
+
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_path = db.execute(
+            "SELECT path FROM tracks WHERE id=?", (ids1[1],)
+        ).fetchone()[0]
+        derived_name = json.loads(
+            db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (ids1[1],)
+            ).fetchone()[0]
+        )["派生文件"]
+    assets = folder / "assets"
+    assert (assets / derived_name).exists()
+
+    assert a.delete(f"/api/samples/{s1}").status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM samples WHERE id=?", (s1,)).fetchone()[0] == 0
+        assert (
+            db.execute("SELECT count(*) FROM tracks WHERE sample_id=?", (s1,)).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT count(*) FROM track_processing WHERE track_id=?", (ids1[1],)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute("SELECT count(*) FROM aliases WHERE sample_id=?", (s1,)).fetchone()[0]
+            == 0
+        )
+    assert not (assets / derived_name).exists()
+    assert not (assets / cand_path).exists()
+    assert a.get(f"/api/audio/{shared_track}").status_code == 200
+    assert a.get(f"/api/samples/{s1}").status_code == 404
+
+
+def test_delete_draft_sample_blocks_contributions(env):
+    """根评论、回复任一存在即拒绝；DB 与 assets 快照完全不变。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "贡献保护", "mode": "development"}).json()["id"]
+    s, _, _ = processing_sample(a, t)
+    root = a.post(
+        f"/api/samples/{s}/comments", json={"start": 0, "end": 100, "body": "根评论"}
+    ).json()["id"]
+    a.post(
+        f"/api/samples/{s}/comments",
+        json={"start": 0, "end": 100, "body": "回复", "parent": root},
+    )
+
+    def snapshot():
+        files = {p.name for p in (folder / "assets").iterdir()}
+        with sqlite3.connect(folder / "workbench.sqlite3") as db:
+            rows = {
+                table: db.execute(
+                    f"SELECT count(*) FROM {table} WHERE sample_id=?", (s,)
+                ).fetchone()[0]
+                for table in ("comments", "tracks", "aliases")
+            }
+        return files, rows
+
+    before = snapshot()
+    blocked = a.delete(f"/api/samples/{s}")
+    assert blocked.status_code == 409
+    assert snapshot() == before
+
+
+def test_sample_revision_permission_and_state_matrix(env):
+    """匿名/成员/其他组织者/owner/管理员 × draft/active/closed/trashed。"""
+    app, a, _ = env
+    member, member_id = reviewer(app, a, "矩阵成员")
+    other_org, other_org_id = reviewer(app, a, "矩阵组织者")
+    a.patch(f"/api/users/{other_org_id}/role", json={"role": "organizer"})
+
+    def make_task(status):
+        t = a.post("/api/tasks", json={"title": f"矩阵-{status}", "mode": "development"}).json()["id"]
+        s, ids, _ = processing_sample(a, t)
+        if status in ("active", "closed"):
+            publish(a, t, [member_id])
+        if status == "closed":
+            a.post(f"/api/tasks/{t}/close")
+        if status == "trashed":
+            a.request("DELETE", f"/api/tasks/{t}", json={"title": f"矩阵-{status}"})
+        return t, s, ids
+
+    for status in ("draft", "active", "closed", "trashed"):
+        t, s, _ = make_task(status)
+        expected_edit = 200 if status == "draft" else (404 if status == "trashed" else 409)
+        not_found = status == "trashed"
+        edit_body = {"title": f"矩阵-{status}-改", "kind": "算法版本", "mode": "development"}
+        assert a.patch(f"/api/tasks/{t}", json=edit_body).status_code == expected_edit, status
+        assert other_org.patch(f"/api/tasks/{t}", json=edit_body).status_code == (
+            404 if not_found else 403
+        ), status
+        assert member.patch(f"/api/tasks/{t}", json=edit_body).status_code == (
+            404 if not_found else 403
+        ), status
+        if status == "draft":
+            # 草稿态为每个角色准备独立无贡献片段，避免同片段重复删除。
+            for client, expected, tag in (
+                (other_org, 403, "甲"),
+                (member, 403, "乙"),
+                (a, 200, "丙"),
+            ):
+                fresh = processing_sample(a, t, name=f"矩阵片段{tag}")[0]
+                assert client.delete(f"/api/samples/{fresh}").status_code == expected, status
+        else:
+            expected_del = 404 if not_found else 409
+            others_del = 404 if not_found else 403
+            assert a.delete(f"/api/samples/{s}").status_code == expected_del, status
+            assert other_org.delete(f"/api/samples/{s}").status_code == others_del, status
+            assert member.delete(f"/api/samples/{s}").status_code == others_del, status
+        prep = a.post(
+            f"/api/tasks/{t}/purge/prepare", headers={"x-csrf-token": csrf(a)}
+        )
+        assert prep.status_code == (200 if status == "trashed" else 409), status
+        if status != "trashed":
+            # purge 执行入口同样受回收站状态保护（先于令牌校验）。
+            assert (
+                a.post(
+                    f"/api/tasks/{t}/purge",
+                    json={"确认令牌": "任意"},
+                    headers={"x-csrf-token": csrf(a)},
+                ).status_code
+                == 409
+            ), status
+        # purge 仅管理员可用：非管理员一律 403（不泄露任务存在性）。
+        assert other_org.post(f"/api/tasks/{t}/purge/prepare").status_code == 403, status
+        assert member.post(f"/api/tasks/{t}/purge/prepare").status_code == 403, status
+        assert TestClient(app).post(f"/api/tasks/{t}/purge/prepare").status_code == 401, status
+        if status == "trashed":
+            token = prep.json()["确认令牌"]
+            assert (
+                member.post(f"/api/tasks/{t}/purge", json={"确认令牌": token}).status_code
+                == 403
+            )
+        if status == "draft":
+            a.request("DELETE", f"/api/tasks/{t}", json={"title": f"矩阵-{status}"})
+
+
+def test_purge_token_flow_and_single_use(env):
+    """令牌绑定任务、一次性、错误令牌拒绝；清除后任务与接口 404。"""
+    _, a, _ = env
+    t = a.post("/api/tasks", json={"title": "令牌任务", "mode": "development"}).json()["id"]
+    s, _, _ = processing_sample(a, t)
+    a.request("DELETE", f"/api/tasks/{t}", json={"title": "令牌任务"})
+    token_header = {"x-csrf-token": csrf(a)}
+    prep = a.post(f"/api/tasks/{t}/purge/prepare", headers=token_header).json()
+    wrong = a.post(f"/api/tasks/{t}/purge", json={"确认令牌": "不是令牌"})
+    assert wrong.status_code == 403  # 无 CSRF 头
+    wrong = a.post(
+        f"/api/tasks/{t}/purge",
+        json={"确认令牌": "不是令牌"},
+        headers={"x-csrf-token": "0" * 64},
+    )
+    assert wrong.status_code == 403  # CSRF 错误
+    # 重新 prepare 使旧令牌失效（一次性机制的一部分）。
+    latest = a.post(f"/api/tasks/{t}/purge/prepare", headers=token_header).json()
+    stale = a.post(
+        f"/api/tasks/{t}/purge",
+        json={"确认令牌": prep["确认令牌"]},
+        headers=token_header,
+    )
+    assert stale.status_code == 403
+    done = a.post(
+        f"/api/tasks/{t}/purge",
+        json={"确认令牌": latest["确认令牌"]},
+        headers=token_header,
+    )
+    assert done.status_code == 200 and done.json()["已清除"] is True
+    assert a.get(f"/api/tasks/{t}").status_code == 404
+    assert a.get(f"/api/samples/{s}").status_code == 404
+    again = a.post(
+        f"/api/tasks/{t}/purge",
+        json={"确认令牌": latest["确认令牌"]},
+        headers=token_header,
+    )
+    assert again.status_code == 404
+
+
+def test_purge_prepare_excludes_shared_assets(env):
+    """共享 SHA 文件不得计入独占资产与预计释放字节；独占文件按精确字节计。"""
+    _, a, folder = env
+    ref = (np.random.default_rng(31).standard_normal(96000) * 0.2).astype(np.float32)
+    shared_bytes = encode_float_wav(ref)
+    unique_bytes = encode_float_wav(ref * 0.3)
+
+    def upload(task_id, sample_name, track_name, data):
+        s = a.post(f"/api/tasks/{task_id}/samples", json={"name": sample_name}).json()["id"]
+        return s, a.post(
+            f"/api/samples/{s}/tracks",
+            data={"name": track_name, "version": "v"},
+            files={"file": ("x.wav", data, "audio/wav")},
+        ).json()["id"]
+
+    t1 = a.post("/api/tasks", json={"title": "任务A", "mode": "development"}).json()["id"]
+    upload(t1, "片段A", "共享轨", shared_bytes)
+    t2 = a.post("/api/tasks", json={"title": "任务B", "mode": "development"}).json()["id"]
+    _, track_b = upload(t2, "片段B", "共享轨", shared_bytes)
+    # A 仅引用共享文件：独占资产 0、预计释放 0。
+    a.request("DELETE", f"/api/tasks/{t1}", json={"title": "任务A"})
+    prep = a.post(
+        f"/api/tasks/{t1}/purge/prepare", headers={"x-csrf-token": csrf(a)}
+    ).json()
+    assert prep["独占资产数"] == 0 and prep["预计释放字节"] == 0
+    assert a.post(
+        f"/api/tasks/{t1}/purge",
+        json={"确认令牌": prep["确认令牌"]},
+        headers={"x-csrf-token": csrf(a)},
+    ).status_code == 200
+    # 共享文件保留，B 仍可播放。
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        shared_path = db.execute("SELECT path FROM tracks WHERE id=?", (track_b,)).fetchone()[0]
+    assert (folder / "assets" / shared_path).exists()
+    assert a.get(f"/api/audio/{track_b}").status_code == 200
+    # A 加入独占文件后：只统计该文件的精确字节。
+    t3 = a.post("/api/tasks", json={"title": "任务A独占", "mode": "development"}).json()["id"]
+    _, track_u = upload(t3, "片段A独占", "独占轨", unique_bytes)
+    a.request("DELETE", f"/api/tasks/{t3}", json={"title": "任务A独占"})
+    prep3 = a.post(
+        f"/api/tasks/{t3}/purge/prepare", headers={"x-csrf-token": csrf(a)}
+    ).json()
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        unique_path = db.execute("SELECT path FROM tracks WHERE id=?", (track_u,)).fetchone()[0]
+    assert prep3["独占资产数"] == 1
+    assert prep3["预计释放字节"] == (folder / "assets" / unique_path).stat().st_size
+
+
+def test_purge_reclaims_exclusive_keeps_shared_and_backup(env):
+    """永久清除：独占资产回收、共享保留、备份不再包含已清除任务。"""
+    _, a, folder = env
+    t1 = a.post("/api/tasks", json={"title": "清除任务", "mode": "development"}).json()["id"]
+    s1, ids1, ref_x = processing_sample(a, t1)
+    apply_body = {"参考": ids1[0], "处理": [{"候选": ids1[1], "对齐": True, "响度": True}]}
+    assert a.post(f"/api/samples/{s1}/processing", json=apply_body).status_code == 200
+    t2 = a.post("/api/tasks", json={"title": "保留任务", "mode": "development"}).json()["id"]
+    s2 = a.post(f"/api/tasks/{t2}/samples", json={"name": "共享片段"}).json()["id"]
+    r = a.post(
+        f"/api/samples/{s2}/tracks",
+        data={"name": "同字节参考", "version": "v"},
+        files={"file": ("x.wav", encode_float_wav(ref_x), "audio/wav")},
+    )
+    shared_track = r.json()["id"]
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        shared_path = db.execute(
+            "SELECT path FROM tracks WHERE id=?", (shared_track,)
+        ).fetchone()[0]
+        derived_name = json.loads(
+            db.execute(
+                "SELECT data FROM track_processing WHERE track_id=?", (ids1[1],)
+            ).fetchone()[0]
+        )["派生文件"]
+    a.request("DELETE", f"/api/tasks/{t1}", json={"title": "清除任务"})
+    purge_headers = {"x-csrf-token": csrf(a)}
+    prep = a.post(f"/api/tasks/{t1}/purge/prepare", headers=purge_headers).json()
+    assert prep["片段数"] == 1 and prep["候选数"] == 3
+    assert prep["预计释放字节"] > 0
+    assert (
+        a.post(
+            f"/api/tasks/{t1}/purge",
+            json={"确认令牌": prep["确认令牌"]},
+            headers=purge_headers,
+        ).status_code
+        == 200
+    )
+    assets = folder / "assets"
+    assert not (assets / derived_name).exists()
+    assert (assets / shared_path).exists()
+    assert a.get(f"/api/audio/{shared_track}").status_code == 200
+    assert a.get(f"/api/tasks/{t1}").status_code == 404
+    assert len(a.get("/api/tasks?deleted=true").json()) == 0
+    result = a.get("/api/backup")
+    with zipfile.ZipFile(io.BytesIO(result.content)) as z:
+        names = z.namelist()
+        assert f"assets/{derived_name}" not in names
+        assert f"assets/{shared_path}" in names
+        z.extractall(folder / "purge-restore")
+    restored = create_app(folder / "purge-restore")
+    c = TestClient(restored)
+    c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
+    assert c.get(f"/api/audio/{shared_track}").status_code == 200
+
+
+def test_purge_commit_failure_keeps_task_and_files(env, monkeypatch):
+    """注入真实 commit 失败：任务、回收站与所有文件保持原状态。"""
+    application, a, folder = env
+    t = a.post("/api/tasks", json={"title": "提交失败", "mode": "development"}).json()["id"]
+    _, ids, _ = processing_sample(a, t)
+    a.request("DELETE", f"/api/tasks/{t}", json={"title": "提交失败"})
+    token = a.post(
+        f"/api/tasks/{t}/purge/prepare", headers={"x-csrf-token": csrf(a)}
+    ).json()["确认令牌"]
+    files_before = {p.name for p in (folder / "assets").iterdir()}
+    monkeypatch.setattr(app_module, "sqlite3", _FakeSqlite)
+    strict = TestClient(application, raise_server_exceptions=False)
+    strict.cookies.update(a.cookies)
+    assert (
+        strict.post(
+            f"/api/tasks/{t}/purge",
+            json={"确认令牌": token},
+            headers={"x-csrf-token": csrf(a)},
+        ).status_code
+        == 500
+    )
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT 1 FROM tasks WHERE id=?", (t,)).fetchone()
+        assert db.execute("SELECT 1 FROM deleted_tasks WHERE task_id=?", (t,)).fetchone()
+        assert (
+            db.execute("SELECT count(*) FROM samples WHERE task_id=?", (t,)).fetchone()[0]
+            == 1
+        )
+    assert {p.name for p in (folder / "assets").iterdir()} == files_before
+    assert a.get("/api/tasks?deleted=true").json()[0]["id"] == t
+    # 回收站任务按既有语义禁止音频访问；恢复后可播放。
+    assert a.get(f"/api/audio/{ids[0]}").status_code == 404
+    assert a.post(f"/api/tasks/{t}/restore").status_code == 200
+    assert a.get(f"/api/audio/{ids[0]}").status_code == 200
+
+
+def test_sample_delete_unlink_failure_goes_to_ledger(env, monkeypatch):
+    """整段删除回收失败：200 + 待清理账本，不伪回滚；重试成功后清空。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "删除失败", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_name = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    real_unlink = Path.unlink
+    target = folder / "assets" / cand_name
+
+    def failing_unlink(self, missing_ok=False):
+        if self == target:
+            raise OSError("文件被占用")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    r = a.delete(f"/api/samples/{s}")
+    assert r.status_code == 200  # 不伪回滚为 500
+    assert r.json()["待清理"] == [cand_name]
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert not db.execute("SELECT 1 FROM samples WHERE id=?", (s,)).fetchone()
+        ledger = db.execute("SELECT name, last_error FROM cleanup_pending").fetchall()
+    assert [x[0] for x in ledger] == [cand_name]
+    assert target.exists()  # 文件与账本保留
+
+    # 解除占用后重试：文件消失、账本清空。
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    retry = a.post(
+        "/api/maintenance/cleanup-retry", headers={"x-csrf-token": csrf(a)}
+    )
+    assert retry.status_code == 200
+    assert cand_name in retry.json()["已清理"]
+    assert not target.exists()
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0] == 0
+
+
+def test_cleanup_retry_keeps_re_referenced_asset(env, monkeypatch):
+    """失败后资产重新被某轨引用：重试不得删除，且该轨仍可播放。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "重新引用", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_name = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+        cand_meta = db.execute("SELECT meta FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    real_unlink = Path.unlink
+    target = folder / "assets" / cand_name
+
+    def failing_unlink(self, missing_ok=False):
+        if self == target:
+            raise OSError("文件被占用")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    assert a.delete(f"/api/samples/{s}").status_code == 200
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    # 失败后另一任务的新轨重新引用同一资产。
+    t2 = a.post("/api/tasks", json={"title": "引用任务", "mode": "development"}).json()["id"]
+    s2 = a.post(f"/api/tasks/{t2}/samples", json={"name": "引用片段"}).json()["id"]
+    new_track = "f" * 32
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute(
+            "INSERT INTO tracks VALUES(?,?,?,?,?,?)",
+            (new_track, s2, "引用轨", "v", cand_name, cand_meta),
+        )
+    retry = a.post(
+        "/api/maintenance/cleanup-retry", headers={"x-csrf-token": csrf(a)}
+    )
+    assert retry.status_code == 200
+    assert retry.json()["重新被引用"] == [cand_name]
+    assert target.exists()  # 不得删除
+    assert a.get(f"/api/audio/{new_track}").status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0] == 0
+
+
+def test_purge_unlink_failure_goes_to_ledger_and_retry(env, monkeypatch):
+    """永久清除回收失败同样入账本并可通过重试闭环。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "清除失败", "mode": "development"}).json()["id"]
+    _, ids, _ = processing_sample(a, t)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_name = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    real_unlink = Path.unlink
+    target = folder / "assets" / cand_name
+
+    def failing_unlink(self, missing_ok=False):
+        if self == target:
+            raise OSError("文件被占用")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    a.request("DELETE", f"/api/tasks/{t}", json={"title": "清除失败"})
+    purge_headers = {"x-csrf-token": csrf(a)}
+    prep = a.post(f"/api/tasks/{t}/purge/prepare", headers=purge_headers).json()
+    done = a.post(
+        f"/api/tasks/{t}/purge",
+        json={"确认令牌": prep["确认令牌"]},
+        headers=purge_headers,
+    )
+    assert done.status_code == 200
+    assert done.json()["待清理"] == [cand_name]
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert not db.execute("SELECT 1 FROM tasks WHERE id=?", (t,)).fetchone()
+        assert db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0] == 1
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    retry = a.post(
+        "/api/maintenance/cleanup-retry", headers={"x-csrf-token": csrf(a)}
+    )
+    assert cand_name in retry.json()["已清理"]
+    assert not target.exists()
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0] == 0
+
+
+def test_cleanup_ledger_survives_backup_restore(env, monkeypatch):
+    """备份恢复后账本仍可安全重试（缺失文件按成功清理退出）。"""
+    _, a, folder = env
+    t = a.post("/api/tasks", json={"title": "账本备份", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_name = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    real_unlink = Path.unlink
+    target = folder / "assets" / cand_name
+
+    def failing_unlink(self, missing_ok=False):
+        if self == target:
+            raise OSError("文件被占用")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    a.delete(f"/api/samples/{s}")
+    assert a.post(
+        "/api/maintenance/cleanup-retry", headers={"x-csrf-token": csrf(a)}
+    ).status_code == 200
+    result = a.get("/api/backup")
+    destination = folder / "账本恢复"
+    with zipfile.ZipFile(io.BytesIO(result.content)) as z:
+        z.extractall(destination)
+    with sqlite3.connect(destination / "workbench.sqlite3") as db:
+        assert db.execute(
+            "SELECT name FROM cleanup_pending WHERE name=?", (cand_name,)
+        ).fetchone()
+    restored = create_app(destination)
+    c = TestClient(restored)
+    c.post("/api/login", json={"name": "组织者", "password": "test-only-strong-pass"})
+    retry = c.post("/api/maintenance/cleanup-retry", headers={"x-csrf-token": csrf(c)})
+    assert retry.status_code == 200
+    assert cand_name in retry.json()["已清理"]  # 缺失文件按成功清理退出
+    with sqlite3.connect(destination / "workbench.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0] == 0
+
+
+def test_cleanup_retry_serializes_with_concurrent_upload(env, monkeypatch):
+    """重试全程持锁：并发经真实 API 上传同 SHA 资产后，新轨完整可播放、账本一致。"""
+    application, a, folder = env
+    t = a.post("/api/tasks", json={"title": "重试竞态", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_name = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    cand_bytes = (folder / "assets" / cand_name).read_bytes()
+
+    # 删除片段：X 文件被正常回收（消失）；随后直接种入待清理账本（测试安排，
+    # 竞态本身由重试端点与真实 API 上传并发构成）。
+    assert a.delete(f"/api/samples/{s}").status_code == 200
+    assert not (folder / "assets" / cand_name).exists()
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute(
+            "INSERT INTO cleanup_pending VALUES(?,?,?)",
+            (cand_name, "2026-01-01T00:00:00+00:00", "seeded"),
+        )
+
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_unlink = Path.unlink
+    unlink_target = folder / "assets" / cand_name
+
+    def blocking_unlink(self, missing_ok=False):
+        # 暂停点：重试已完成“确认无引用”的检查，路径解析到目标文件、
+        # 即将执行删除时暂停。
+        if self == unlink_target:
+            entered.set()
+            release.wait(timeout=10)
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", blocking_unlink)
+
+    strict = TestClient(application, raise_server_exceptions=False)
+    strict.cookies.update(a.cookies)
+    retry_status = {}
+
+    def run_retry():
+        retry_status["resp"] = strict.post(
+            "/api/maintenance/cleanup-retry",
+            headers={"x-csrf-token": csrf(a)},
+        )
+
+    worker = threading.Thread(target=run_retry)
+    worker.start()
+    assert entered.wait(timeout=10)
+
+    # 并发通过真实 API 上传同字节资产并建轨（生产路径持有 mutation_lock）。
+    # 用定时器释放暂停点，避免与持锁等待互相阻塞。
+    uploader = threading.Timer(
+        0.5,
+        lambda: a.post(
+            f"/api/tasks/{t}/samples",
+            json={"name": "并发片段", "provenance": "PUBLIC reproducible"},
+        ),
+    )
+    release_t = threading.Timer(0.5, release.set)
+    uploader.start()
+    release_t.start()
+
+    # 真实 API 上传同字节资产（主线程；无锁版本此刻并发写入文件并建轨）。
+    t2 = a.post("/api/tasks", json={"title": "并发任务", "mode": "development"}).json()["id"]
+    s2 = a.post(f"/api/tasks/{t2}/samples", json={"name": "并发片段"}).json()["id"]
+    upload = a.post(
+        f"/api/samples/{s2}/tracks",
+        data={"name": "并发轨", "version": "v"},
+        files={"file": ("x.wav", cand_bytes, "audio/wav")},
+    )
+    release.set()
+    uploader.join()
+    release_t.join()
+    worker.join(timeout=15)
+
+    assert upload.status_code == 200
+    new_track = upload.json()["id"]
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        pending = db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0]
+    assert pending == 0  # 账本状态一致
+    # 新轨完整可播放（文件未被竞态删除）。
+    assert a.get(f"/api/audio/{new_track}").content == cand_bytes

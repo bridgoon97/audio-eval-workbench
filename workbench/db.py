@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS ratings(sample_id TEXT REFERENCES samples(id), user_i
 CREATE TABLE IF NOT EXISTS review_assignments(task_id TEXT NOT NULL REFERENCES tasks(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(task_id,user_id));
 CREATE TABLE IF NOT EXISTS track_processing(track_id TEXT PRIMARY KEY REFERENCES tracks(id), data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS track_analysis(track_id TEXT PRIMARY KEY REFERENCES tracks(id), data TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS purge_tokens(token TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cleanup_pending(name TEXT PRIMARY KEY, created TEXT NOT NULL, last_error TEXT NOT NULL);
 -- 自助申请：设备令牌、邀请凭证与申请记录。所有凭证只保存哈希；
 -- 邀请哈希内嵌独立盐（password_hash 格式 salt:digest），列表与备份均无法恢复明文。
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT UNIQUE NOT NULL, created TEXT NOT NULL, claimed_at REAL NOT NULL, last_used REAL, expires REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, first_ip TEXT NOT NULL DEFAULT '', last_ip TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '');
