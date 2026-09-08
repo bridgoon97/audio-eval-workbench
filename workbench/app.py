@@ -917,20 +917,29 @@ def create_app(
                     (device_id, row["id"]),
                 )
             else:
-                # 重试领取：同一申请同一设备行，轮换令牌并立即作废旧令牌；
-                # 窗口关闭后领取秘密不再可用，设备 Cookie 是唯一凭证。
+                # 重试领取：同一申请同一设备行，仅轮换令牌与审计字段；
+                # 领取窗口起点（首次 claimed_at）与绝对到期（expires）固定不变，
+                # 连续重试不能延长窗口或寿命；已撤销或已过期稳定 409。
                 device = db.execute(
-                    "SELECT claimed_at FROM devices WHERE id=?", (row["device_id"],)
+                    "SELECT claimed_at, expires, revoked FROM devices WHERE id=?",
+                    (row["device_id"],),
                 ).fetchone()
-                if not device or time.time() - device["claimed_at"] > CLAIM_GRACE:
+                if (
+                    not device
+                    or device["revoked"]
+                    or device["expires"] <= time.time()
+                    or time.time() - device["claimed_at"] > CLAIM_GRACE
+                ):
                     raise HTTPException(
                         409,
                         "登录状态已在原浏览器生效；如需在新浏览器登录，请联系管理员重置密码或撤销设备",
                     )
-                db.execute(
-                    "UPDATE devices SET token_hash=?, claimed_at=?, last_used=NULL, last_ip=?, device=?, expires=? WHERE id=? AND revoked=0",
-                    (digest, time.time(), address, device_info, time.time() + DEVICE_TTL, row["device_id"]),
-                )
+                rotated = db.execute(
+                    "UPDATE devices SET token_hash=?, last_used=NULL, last_ip=?, device=? WHERE id=? AND revoked=0",
+                    (digest, address, device_info, row["device_id"]),
+                ).rowcount
+                if rotated != 1:
+                    raise HTTPException(409, "设备状态已变化，请刷新后重试")
         response.set_cookie(
             DEVICE_COOKIE,
             token,
@@ -1092,16 +1101,19 @@ def create_app(
                 )
                 if row["invite_kind"] == "task" and tasks != [row["invite_task_id"]]:
                     raise HTTPException(422, "任务邀请只能批准到受邀任务")
-                if row["invite_kind"] != "task":
-                    for task_id in tasks:
-                        t = db.execute(
-                            "SELECT status FROM tasks WHERE id=? AND id NOT IN (SELECT task_id FROM deleted_tasks)",
-                            (task_id,),
-                        ).fetchone()
-                        if not t:
-                            raise HTTPException(404, "受邀任务不存在")
-                        if t["status"] != "active":
-                            raise HTTPException(422, "只能分配正在评测中的任务")
+                # 审批事务内重查任务最新状态（邀请创建后任务可能已被关闭/移入回收站），
+                # 统一复用既有成员语义：draft/active 可新增，closed 冻结名单，回收站不可见。
+                for task_id in tasks:
+                    t = db.execute(
+                        "SELECT status FROM tasks WHERE id=?", (task_id,)
+                    ).fetchone()
+                    deleted = db.execute(
+                        "SELECT 1 FROM deleted_tasks WHERE task_id=?", (task_id,)
+                    ).fetchone()
+                    if not t or deleted:
+                        raise HTTPException(404, "受邀任务不存在或已移入回收站")
+                    if t["status"] == "closed":
+                        raise HTTPException(409, "任务已关闭，成员名单冻结，不能新增受邀评测者")
                 if db.execute(
                     "SELECT 1 FROM users WHERE name=?", (resolved_name,)
                 ).fetchone():

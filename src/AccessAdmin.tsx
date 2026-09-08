@@ -111,7 +111,7 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
   const [error, setError] = useState('');
   const [expanding, setExpanding] = useState<string | null>(null);
   const codeRef = useRef<HTMLTextAreaElement>(null);
-  const activeTasks = tasks.filter((t) => t.status === 'active');
+  const activeTasks = tasks.filter((t) => t.status === 'active' || t.status === 'draft');
 
   const refresh = async () => {
     const [apps, invs, tks] = await Promise.all([
@@ -242,8 +242,8 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
                     <p className="muted">任务邀请只能批准到「{a.invite.task_title}」。</p>
                   ) : (
                     <>
-                      <span className="eyebrow">分配正在评测中的任务</span>
-                      {!activeTasks.length && <p className="muted">当前没有进行中的任务；可以稍后在任务里增补。</p>}
+                      <span className="eyebrow">分配可参与的任务（准备中/进行中；已关闭任务冻结名单）</span>
+                      {!activeTasks.length && <p className="muted">当前没有可分配的任务；可以稍后在任务里增补。</p>}
                       {activeTasks.map((t) => (
                         <label className="checkbox" key={t.id}>
                           <input type="checkbox" name="task_ids" value={t.id} />

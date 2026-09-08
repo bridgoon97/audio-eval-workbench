@@ -10,6 +10,7 @@
 import io
 import json
 import sqlite3
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -299,7 +300,86 @@ def test_claim_retry_issues_single_device_and_rotates_token(env):
     assert len(admin.get(f"/api/users/{user_id}/devices").json()) == 1
 
 
+def test_claim_retry_fixed_window_and_expiry(env):
+    """重试只轮换令牌：claimed_at 与绝对 expires 不动；窗口/过期判定用首次值。"""
+    app, admin, folder = env
+    browser, application_id, first_token = full_onboard(admin, app, "固窗员", secret="6" * 43)
+    retry_claim = lambda: browser.post(
+        "/api/apply/claim",
+        json={"application_id": application_id, "claim_secret": "6" * 43},
+    )
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        first_claimed, first_expires = db.execute(
+            "SELECT claimed_at, expires FROM devices"
+        ).fetchone()
+
+    # 第 899 秒重试：成功，但窗口起点与绝对到期保持人为设置的值（不再后移）。
+    mutated = first_claimed - 899
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute("UPDATE devices SET claimed_at=?", (mutated,))
+    near_edge = retry_claim()
+    assert near_edge.status_code == 200, near_edge.text
+    second_token = browser.cookies.get("device")
+    assert second_token and second_token != first_token
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        claimed, expires = db.execute(
+            "SELECT claimed_at, expires FROM devices"
+        ).fetchone()
+    assert abs(claimed - mutated) < 0.01 and expires == first_expires
+    old = TestClient(app, client=("10.0.0.1", 1))
+    old.cookies.set("device", first_token)
+    assert old.get("/api/me").status_code == 401
+    assert browser.get("/api/me").status_code == 200
+
+    # 再次重试（仍在窗口内）：同样不得移动窗口/到期。
+    assert retry_claim().status_code == 200
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        claimed, expires = db.execute(
+            "SELECT claimed_at, expires FROM devices"
+        ).fetchone()
+    assert abs(claimed - mutated) < 0.01 and expires == first_expires
+
+    # 超过原始窗口（距首次领取 >901 秒）：稳定 409。
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute("UPDATE devices SET claimed_at=?", (time.time() - 901,))
+    late = retry_claim()
+    assert late.status_code == 409
+    assert "set-cookie" not in {k.lower() for k in late.headers}
+
+    # 绝对到期后：即使窗口未过也 409，且不延长。
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute(
+            "UPDATE devices SET claimed_at=?, expires=?",
+            (time.time() - 10, time.time() - 1),
+        )
+    expired = retry_claim()
+    assert expired.status_code == 409
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert db.execute("SELECT expires FROM devices").fetchone()[0] < time.time()
+
+
+def test_claim_revoked_retry_no_cookie(env):
+    """撤销后窗口内重试：409 且不写 device Cookie。"""
+    app, admin, _ = env
+    browser, application_id, _ = full_onboard(admin, app, "撤重员", secret="7" * 43)
+    user_id = next(
+        row["user_id"]
+        for row in admin.get("/api/applications").json()
+        if row["display_name"] == "撤重员"
+    )
+    devices = admin.get(f"/api/users/{user_id}/devices").json()
+    admin.delete(f"/api/devices/{devices[0]['id']}", headers=secure_headers(admin))
+    response = browser.post(
+        "/api/apply/claim",
+        json={"application_id": application_id, "claim_secret": "7" * 43},
+    )
+    assert response.status_code == 409
+    assert "device=" not in response.headers.get("set-cookie", "")
+    assert browser.get("/api/me").status_code == 401
+
+
 def test_claim_window_closes_after_grace(env):
+    """窗口关闭后（距首次领取超过 15 分钟）重试稳定 409。"""
     app, admin, folder = env
     browser, application_id, _ = full_onboard(admin, app, "过窗员", secret="g" * 43)
     with sqlite3.connect(folder / "workbench.sqlite3") as db:
@@ -309,6 +389,80 @@ def test_claim_window_closes_after_grace(env):
         json={"application_id": application_id, "claim_secret": "g" * 43},
     )
     assert late.status_code == 409
+    assert "device=" not in late.headers.get("set-cookie", "")
+
+
+def test_approval_respects_task_member_freeze(env):
+    """审批时重查任务状态：closed 冻结（两类邀请），回收站拒绝，draft 可分配。"""
+    app, admin, folder = env
+
+    def new_application(name, secret):
+        invite = make_invite(admin)
+        return invite, apply_user(app, invite["code"], secret, name)
+
+    # 场景 A：task invite + 审批前任务被关闭 → 稳定 409，无任何副作用。
+    task_id, _ = active_task_with_tracks(admin, "将被关闭的受邀任务")
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        members_before = set(db.execute("SELECT task_id,user_id FROM members").fetchall())
+        assigned_before = set(
+            db.execute("SELECT task_id,user_id FROM review_assignments").fetchall()
+        )
+    task_invite = make_invite(admin, kind="task", task_id=task_id)
+    app_a = apply_user(app, task_invite["code"], "8" * 43, "关闭前申请人甲")
+    assert admin.post(f"/api/tasks/{task_id}/close").status_code == 200
+    closed = approve(admin, app_a, task_ids=[task_id])
+    assert closed.status_code == 409 and "冻结" in closed.text
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        used = db.execute("SELECT used_count FROM invites WHERE id=?", (task_invite["id"],)).fetchone()[0]
+        users = db.execute("SELECT count(*) FROM users").fetchone()[0]
+        members_after = set(db.execute("SELECT task_id,user_id FROM members").fetchall())
+        assigned_after = set(
+            db.execute("SELECT task_id,user_id FROM review_assignments").fetchall()
+        )
+        status_a = db.execute("SELECT status FROM applications WHERE id=?", (app_a,)).fetchone()[0]
+    assert used == 0 and users == 1 and status_a == "pending"
+    assert members_after == members_before and assigned_after == assigned_before
+
+    # 场景 B：team invite + 审批前任务被关闭 → 409，无副作用。
+    task_b, _ = active_task_with_tracks(admin, "审批前关闭的团队任务")
+    team_invite, app_b = new_application("关闭前申请人乙", "9" * 43)
+    assert admin.post(f"/api/tasks/{task_b}/close").status_code == 200
+    closed_b = approve(admin, app_b, task_ids=[task_b])
+    assert closed_b.status_code == 409 and "冻结" in closed_b.text
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        used_b = db.execute("SELECT used_count FROM invites WHERE id=?", (team_invite["id"],)).fetchone()[0]
+        status_b = db.execute("SELECT status FROM applications WHERE id=?", (app_b,)).fetchone()[0]
+    assert used_b == 0 and status_b == "pending"
+
+    # 场景 C：draft 任务可分配（与 members 接口语义一致），发布前成员不可见。
+    draft = admin.post("/api/tasks", json={"title": "草稿也可受邀"}).json()["id"]
+    _, app_c = new_application("草稿受令人", "a" * 43)
+    ok = approve(admin, app_c, task_ids=[draft])
+    assert ok.status_code == 200, ok.text
+    draft_user = next(
+        row["user_id"]
+        for row in admin.get("/api/applications").json()
+        if row["id"] == app_c
+    )
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        assert (draft, draft_user) in {
+            tuple(r) for r in db.execute("SELECT task_id,user_id FROM members").fetchall()
+        }
+        assert (draft, draft_user) in {
+            tuple(r)
+            for r in db.execute("SELECT task_id,user_id FROM review_assignments").fetchall()
+        }
+
+    # 场景 D：任务移入回收站后批准 → 404。
+    task_d, _ = active_task_with_tracks(admin, "将被回收的受邀任务")
+    task_invite_d = make_invite(admin, kind="task", task_id=task_d)
+    app_d = apply_user(app, task_invite_d["code"], "b" * 43, "回收前申请人")
+    admin.request("DELETE", f"/api/tasks/{task_d}", json={"title": "将被回收的受邀任务"})
+    trashed = approve(admin, app_d, task_ids=[task_d])
+    assert trashed.status_code == 404
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        used_d = db.execute("SELECT used_count FROM invites WHERE id=?", (task_invite_d["id"],)).fetchone()[0]
+    assert used_d == 0
 
 
 def test_device_login_ip_change_revoke_and_logout(env):
@@ -534,12 +688,21 @@ def test_team_invite_admin_selects_tasks_and_retry_idempotent(env):
     assert retry.status_code == 200 and retry.json()["already"] is True
     conflict = approve(admin, application_id, task_ids=[])
     assert conflict.status_code == 409
-    # 另一人批准到 draft/closed 任务被拒绝。
+    # 另一人批准到 draft/回收站任务：draft 可分配（与成员接口语义一致），回收站拒绝。
     other_invite = make_invite(admin)
     other_id = apply_user(app, other_invite["code"], "q" * 43, "团队新人乙")
     draft = admin.post("/api/tasks", json={"title": "还没发布"}).json()["id"]
     response = approve(admin, other_id, task_ids=[draft])
-    assert response.status_code == 422
+    assert response.status_code == 200, response.text
+    draft_user = next(
+        row["user_id"]
+        for row in admin.get("/api/applications").json()
+        if row["id"] == other_id
+    )
+    with sqlite3.connect(app.state.database) as db:
+        assert (draft, draft_user) in {
+            tuple(r) for r in db.execute("SELECT task_id,user_id FROM members").fetchall()
+        }
 
 
 def test_reject_does_not_consume_and_expired_states(env):
