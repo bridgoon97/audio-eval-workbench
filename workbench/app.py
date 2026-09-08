@@ -1767,7 +1767,9 @@ def create_app(
         u = user(request)
         admin(request)
         require_csrf(request, u)
-        with connect(database) as db:
+        # 状态校验、统计与令牌签发在同一 mutation_lock 临界区内完成，避免
+        # restore/purge 在统计与发令牌之间改变任务状态。
+        with mutation_lock, connect(database) as db:
             task_access(db, task_id, u, True, include_deleted=True)
             if not db.execute(
                 "SELECT 1 FROM deleted_tasks WHERE task_id=?", (task_id,)
@@ -1806,8 +1808,7 @@ def create_app(
                 for name in exclusive
                 if (assets / name).exists()
             )
-        token = secrets.token_urlsafe(24)
-        with mutation_lock, connect(database) as db:
+            token = secrets.token_urlsafe(24)
             db.execute("DELETE FROM purge_tokens WHERE task_id=?", (task_id,))
             db.execute(
                 "INSERT INTO purge_tokens VALUES(?,?,?)", (token, task_id, now())
@@ -1915,7 +1916,10 @@ def create_app(
         u = user(request)
         admin(request)
         require_csrf(request, u)
-        with connect(database) as db:
+        # 全程持有 mutation_lock：引用检查到 unlink 的决定序列与上传、处理、
+        # 整段删除、purge 串行，防止并发请求在确认无引用后重新引用同一 SHA
+        # 造成新引用的文件损坏。
+        with mutation_lock, connect(database) as db:
             rows = db.execute(
                 "SELECT name FROM cleanup_pending ORDER BY created"
             ).fetchall()

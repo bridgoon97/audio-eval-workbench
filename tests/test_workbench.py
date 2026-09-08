@@ -2191,3 +2191,88 @@ def test_cleanup_ledger_survives_backup_restore(env, monkeypatch):
     assert cand_name in retry.json()["已清理"]  # 缺失文件按成功清理退出
     with sqlite3.connect(destination / "workbench.sqlite3") as db:
         assert db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0] == 0
+
+
+def test_cleanup_retry_serializes_with_concurrent_upload(env, monkeypatch):
+    """重试全程持锁：并发经真实 API 上传同 SHA 资产后，新轨完整可播放、账本一致。"""
+    application, a, folder = env
+    t = a.post("/api/tasks", json={"title": "重试竞态", "mode": "development"}).json()["id"]
+    s, ids, _ = processing_sample(a, t)
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        cand_name = db.execute("SELECT path FROM tracks WHERE id=?", (ids[1],)).fetchone()[0]
+    cand_bytes = (folder / "assets" / cand_name).read_bytes()
+
+    # 删除片段：X 文件被正常回收（消失）；随后直接种入待清理账本（测试安排，
+    # 竞态本身由重试端点与真实 API 上传并发构成）。
+    assert a.delete(f"/api/samples/{s}").status_code == 200
+    assert not (folder / "assets" / cand_name).exists()
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        db.execute(
+            "INSERT INTO cleanup_pending VALUES(?,?,?)",
+            (cand_name, "2026-01-01T00:00:00+00:00", "seeded"),
+        )
+
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+    real_unlink = Path.unlink
+    unlink_target = folder / "assets" / cand_name
+
+    def blocking_unlink(self, missing_ok=False):
+        # 暂停点：重试已完成“确认无引用”的检查，路径解析到目标文件、
+        # 即将执行删除时暂停。
+        if self == unlink_target:
+            entered.set()
+            release.wait(timeout=10)
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", blocking_unlink)
+
+    strict = TestClient(application, raise_server_exceptions=False)
+    strict.cookies.update(a.cookies)
+    retry_status = {}
+
+    def run_retry():
+        retry_status["resp"] = strict.post(
+            "/api/maintenance/cleanup-retry",
+            headers={"x-csrf-token": csrf(a)},
+        )
+
+    worker = threading.Thread(target=run_retry)
+    worker.start()
+    assert entered.wait(timeout=10)
+
+    # 并发通过真实 API 上传同字节资产并建轨（生产路径持有 mutation_lock）。
+    # 用定时器释放暂停点，避免与持锁等待互相阻塞。
+    uploader = threading.Timer(
+        0.5,
+        lambda: a.post(
+            f"/api/tasks/{t}/samples",
+            json={"name": "并发片段", "provenance": "PUBLIC reproducible"},
+        ),
+    )
+    release_t = threading.Timer(0.5, release.set)
+    uploader.start()
+    release_t.start()
+
+    # 真实 API 上传同字节资产（主线程；无锁版本此刻并发写入文件并建轨）。
+    t2 = a.post("/api/tasks", json={"title": "并发任务", "mode": "development"}).json()["id"]
+    s2 = a.post(f"/api/tasks/{t2}/samples", json={"name": "并发片段"}).json()["id"]
+    upload = a.post(
+        f"/api/samples/{s2}/tracks",
+        data={"name": "并发轨", "version": "v"},
+        files={"file": ("x.wav", cand_bytes, "audio/wav")},
+    )
+    release.set()
+    uploader.join()
+    release_t.join()
+    worker.join(timeout=15)
+
+    assert upload.status_code == 200
+    new_track = upload.json()["id"]
+    with sqlite3.connect(folder / "workbench.sqlite3") as db:
+        pending = db.execute("SELECT count(*) FROM cleanup_pending").fetchone()[0]
+    assert pending == 0  # 账本状态一致
+    # 新轨完整可播放（文件未被竞态删除）。
+    assert a.get(f"/api/audio/{new_track}").content == cand_bytes
