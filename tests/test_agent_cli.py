@@ -1,6 +1,9 @@
 """Agent CLI：manifest 校验、素材准备、幂等编排与凭据卫生。"""
 
+import hashlib
+import io
 import json
+import shutil
 import subprocess
 import sys
 import threading
@@ -233,6 +236,26 @@ def test_validate_rejects_length_mismatch_and_non16k_without_license(tmp_path):
     manifest48["conversion"]["resample_to_16000"] = True
     assert validate_manifest(manifest48, tmp_path) == []
 
+    # 失败项 1 反例：48 kHz 1.0 秒与 16 kHz 1.0 秒时长相同，许可重采样后通过。
+    write_wav(tmp_path / "sources" / "a" / "mix48.wav", 48000, 1.0, 1)
+    write_wav(tmp_path / "sources" / "b" / "mix16.wav", 16000, 1.0, 1)
+    mixed = base_manifest({"cand-a": "sources/a/mix48.wav", "cand-b": "sources/b/mix16.wav"})
+    mixed["conversion"]["resample_to_16000"] = True
+    assert validate_manifest(mixed, tmp_path) == []
+    # 0.9 秒与 1.0 秒：目标样本数不同 → 拒绝。
+    write_wav(tmp_path / "sources" / "a" / "short48.wav", 48000, 0.9, 1)
+    short = base_manifest({"cand-a": "sources/a/short48.wav", "cand-b": "sources/b/mix16.wav"})
+    short["conversion"]["resample_to_16000"] = True
+    problems = validate_manifest(short, tmp_path)
+    assert any("目标样本数不一致" in p for p in problems)
+    # 不同总长但统一合法 segment 0.2–0.8 秒 → 目标一致通过。
+    write_wav(tmp_path / "sources" / "a" / "long48.wav", 48000, 1.5, 1)
+    write_wav(tmp_path / "sources" / "b" / "long16.wav", 16000, 2.0, 1)
+    seg = base_manifest({"cand-a": "sources/a/long48.wav", "cand-b": "sources/b/long16.wav"})
+    seg["samples"][0]["segment"] = {"start_seconds": 0.2, "end_seconds": 0.8}
+    seg["conversion"]["resample_to_16000"] = True
+    assert validate_manifest(seg, tmp_path) == []
+
 
 def test_validate_rejects_processing_without_single_reference(tmp_path):
     write_wav(tmp_path / "sources" / "a" / "clip.wav", 16000, 1.0, 1)
@@ -288,7 +311,6 @@ def test_prepare_creates_16k_mono_copies_with_sha_and_keeps_sources(tmp_path):
     for candidate in entry["candidates"]:
         copy = out / candidate["output"]["path"]
         assert copy.is_file()
-        import hashlib
 
         assert hashlib.sha256(copy.read_bytes()).hexdigest() == candidate["output"]["sha256"]
         info = sf.info(str(copy))
@@ -376,6 +398,40 @@ def prepare_media_and_mapping(tmp_path, rate=16000):
     out = tmp_path / "prepared"
     prepare_assets(manifest, work, out)
     return manifest_path, manifest, out
+
+
+def test_validate_and_prepare_reject_segment_out_of_range(tmp_path):
+    """失败项 2：segment 越界必须拒绝，不得静默 clamp；start>=end 拒绝。"""
+    work = tmp_path / "work"
+    write_wav(work / "sources" / "a" / "clip.wav", 16000, 8.0, 1)
+    write_wav(work / "sources" / "b" / "clip.wav", 16000, 8.0, 1)
+    manifest = base_manifest({"cand-a": "sources/a/clip.wav", "cand-b": "sources/b/clip.wav"})
+    manifest["samples"][0]["segment"] = {"start_seconds": 0.0, "end_seconds": 10.0}
+    problems = validate_manifest(manifest, work)
+    assert any("超出源长度" in p for p in problems)
+    # prepare 同样拒绝，且不产生输出文件。
+    with pytest.raises(AgentError, match="超出源长度") as excinfo:
+        prepare_assets(manifest, work, tmp_path / "prepared")
+    assert "8.000 秒" in str(excinfo.value)
+    assert not (tmp_path / "prepared" / "samples").exists()
+    # start >= end：语义拒绝。
+    bad = base_manifest({"cand-a": "sources/a/clip.wav", "cand-b": "sources/b/clip.wav"})
+    bad["samples"][0]["segment"] = {"start_seconds": 5.0, "end_seconds": 5.0}
+    problems = validate_manifest(bad, work)
+    assert any("起点必须小于终点" in p for p in problems)
+
+
+def test_prepare_rejects_output_dir_in_every_direction(tmp_path):
+    """失败项 3：输出目录与候选源目录重合/祖先/后代三个方向都拒绝。"""
+    work = tmp_path / "work"
+    write_wav(work / "sources" / "a" / "clip.wav", 16000, 1.0, 1)
+    manifest = base_manifest({"cand-a": "sources/a/clip.wav", "cand-b": "sources/a/clip.wav"})
+    with pytest.raises(AgentError, match="覆盖候选源目录"):
+        prepare_assets(manifest, work, work / "sources")  # 重合
+    with pytest.raises(AgentError, match="覆盖候选源目录"):
+        prepare_assets(manifest, work, work)  # 输出是源目录的祖先
+    with pytest.raises(AgentError, match="覆盖候选源目录"):
+        prepare_assets(manifest, work, work / "sources" / "a" / "prepared")  # 后代
 
 
 def test_apply_end_to_end_idempotent_and_publish(tmp_path, server):
@@ -916,22 +972,41 @@ def test_apply_processing_success_then_publish(tmp_path, server):
     track_id = state_payload["samples"]["sample-001"]["tracks"]["cand-b"]["track_id"]
 
     # 发布（双确认齐备）：派生 SHA 复核通过后发布成功。
-    receipt = agent_tasks.run_apply(
-        manifest_path,
-        base,
-        "编排组织者",
-        "organizer-agent-pass",
-        state,
-        out / "mapping.json",
-        publish_flag=True,
+    import hashlib as _hl
+
+    print(
+        "DIAG source-sha:",
+        _hl.sha256((work / "sources" / "a" / "clip.wav").read_bytes()).hexdigest()[:12],
+        "mapping-file-sha:",
+        _hl.sha256((out / "mapping.json").read_bytes()).hexdigest()[:12],
+        flush=True,
     )
+    try:
+        receipt = agent_tasks.run_apply(
+            manifest_path,
+            base,
+            "编排组织者",
+            "organizer-agent-pass",
+            state,
+            out / "mapping.json",
+            publish_flag=True,
+        )
+    except Exception as exc:
+        print(
+            "DIAG second-apply-failed:",
+            type(exc).__name__,
+            str(exc)[:200],
+            "source-now:",
+            _hl.sha256((work / "sources" / "a" / "clip.wav").read_bytes()).hexdigest()[:12],
+            flush=True,
+        )
+        raise
     assert receipt["published"] is True
     client = TestClient(app)
     client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
     assert client.get(f"/api/tasks/{receipt['task_id']}").json()["status"] == "active"
     # 下载派生轨核对 SHA 与回执一致。
     downloaded = client.get(f"/api/audio/{track_id}")
-    import hashlib
 
     assert hashlib.sha256(downloaded.content).hexdigest() == derived_sha
 
@@ -1051,3 +1126,106 @@ def test_publish_without_implicit_owner_and_rejects_disabled(tmp_path, server):
     detail = client.get(f"/api/tasks/{receipt['task_id']}").json()
     assert detail["review_assignments"] == []
     assert detail["can_manage"] is True  # owner 保留管理权
+
+
+def test_apply_rejects_tampered_mapping(tmp_path, server):
+    """失败项 4：mapping 路径逃逸、自洽改写 SHA、额外条目、缺 mapping 全部拒绝，
+    服务端无任务副作用。"""
+    base, app = server
+    manifest_path, _manifest, out = prepare_media_and_mapping(tmp_path)
+    _manifest = _manifest | {"participants": [{"name": "受邀同事"}]} if False else _manifest
+    client = TestClient(app)
+    client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
+    mapping_path = out / "mapping.json"
+    state = tmp_path / "state.json"
+
+    # 首次不传 mapping：登录前拒绝，服务端无任务。
+    with pytest.raises(AgentError, match="--mapping"):
+        agent_tasks.run_apply(
+            manifest_path, base, "编排组织者", "organizer-agent-pass", state, None
+        )
+    assert client.get("/api/tasks").json() == []
+
+    # 路径逃逸：output.path 指向 mapping 目录之外（自洽 SHA）。
+
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    outside = out / "outside-escape.wav"
+    shutil.copy(out / "samples" / "sample-001" / "cand-a.wav", outside)
+    outside_sha = hashlib.sha256(outside.read_bytes()).hexdigest()
+    pcm = hashlib.sha256(
+        sf.read(str(outside), dtype="float32")[0].astype(np.float32).tobytes()
+    ).hexdigest()
+    mapping["samples"][0]["candidates"][0]["output"].update(
+        {"path": "../outside.wav", "sha256": outside_sha, "pcm_sha256": pcm, "frames": 16000}
+    )
+    mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(AgentError, match="逃逸出 mapping 目录"):
+        agent_tasks.run_apply(
+            manifest_path,
+            base,
+            "编排组织者",
+            "organizer-agent-pass",
+            state,
+            mapping_path,
+        )  # 篡改发生在任何服务端调用之前
+    assert client.get("/api/tasks").json() == []
+
+    # 自洽改写：把 output 指向内容被篡改（增益 0.5）的 WAV，并同步改写全部
+    # SHA 字段——只有“按源与声明的转换重建”校验能识破。
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    swapped = out / "swapped.wav"
+    data, rate = sf.read(str(out / "samples" / "sample-001" / "cand-a.wav"), dtype="float32")
+    swapped_bytes = io.BytesIO()
+    sf.write(swapped_bytes, (data * 0.5).astype(np.float32), rate, subtype="FLOAT", format="WAV")
+    swapped.write_bytes(swapped_bytes.getvalue())
+    mapping["samples"][0]["candidates"][0]["output"].update(
+        {
+            "path": "swapped.wav",
+            "sha256": hashlib.sha256(swapped_bytes.getvalue()).hexdigest(),
+            "pcm_sha256": hashlib.sha256(
+                (data * 0.5).astype(np.float32).tobytes()
+            ).hexdigest(),
+            "frames": len(data),
+        }
+    )
+    mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(AgentError, match="无法由源与声明的转换重建"):
+        agent_tasks.run_apply(
+            manifest_path,
+            base,
+            "编排组织者",
+            "organizer-agent-pass",
+            state,
+            mapping_path,
+        )
+    assert client.get("/api/tasks").json() == []
+
+    # mapping 中途修改：先把 mapping 恢复为 prepare 的合法内容，完成草稿建立
+    # state 绑定；再改动任何字段 → SHA 不一致被拒。
+    good_mapping = json.loads((out / "mapping.json").read_text(encoding="utf-8"))
+    good_mapping.pop("samples", None)
+    # 从 prepare 输出恢复：重新 prepare 一份干净的（原 mapping 已被前序场景污染）。
+    clean_dir = tmp_path / "prepared-clean"
+    clean_mapping = prepare_assets(_manifest, tmp_path / "work", clean_dir)
+    mapping_path.write_text(
+        json.dumps(clean_mapping, ensure_ascii=False), encoding="utf-8"
+    )
+    state3 = tmp_path / "state3.json"
+    agent_tasks.run_apply(
+        manifest_path, base, "编排组织者", "organizer-agent-pass", state3, mapping_path
+    )
+    mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+    mapping["conversion_note"] = "被中途改动"
+    mapping_path.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(AgentError, match="不一致"):
+        agent_tasks.run_apply(
+            manifest_path,
+            base,
+            "编排组织者",
+            "organizer-agent-pass",
+            state3,
+            mapping_path,
+        )
+    payload3 = json.loads(state3.read_text(encoding="utf-8"))
+    detail3 = client.get(f"/api/tasks/{payload3['task_id']}").json()
+    assert detail3["samples"][0]["track_count"] == 2  # 服务端草稿未被改动

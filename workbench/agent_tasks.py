@@ -643,6 +643,35 @@ def load_and_check_mapping(
         ).hexdigest()
         if pcm_sha != mapping_candidate["output"]["pcm_sha256"]:
             raise AgentError(f"{sample_key}/{cand_key}: 副本逐样本 SHA 与 mapping 不符")
+
+        # 重建校验：按 manifest 源与声明的转换重新生成副本，必须与 mapping
+        # 的输出逐字节一致——自洽改写 SHA 指向其他 WAV 无法通过。
+        import io as _io
+
+        import soxr as _soxr
+
+        raw, rate = sf.read(str(source), dtype="float32", always_2d=True)
+        mono = raw[:, candidate["channel"]].copy()
+        segment = info["sample"].get("segment")
+        if segment:
+            start = round(segment["start_seconds"] * rate)
+            end = round(segment["end_seconds"] * rate)
+            mono = mono[start:end]
+        if rate != TARGET_RATE:
+            mono = _soxr.resample(mono, rate, TARGET_RATE, quality="VHQ")
+        mono = np.asarray(mono, dtype=np.float32)
+        rebuilt = _io.BytesIO()
+        sf.write(rebuilt, mono, TARGET_RATE, subtype="FLOAT", format="WAV")
+        # 容器字节在 libsndfile 内存写入下跨调用不可复现（实测同输入不同容器
+        # 字节），因此重建校验只比对确定性的逐样本 PCM SHA。
+        rebuilt_pcm = hashlib.sha256(
+            np.asarray(mono, dtype=np.float32).tobytes()
+        ).hexdigest()
+        if rebuilt_pcm != mapping_candidate["output"]["pcm_sha256"]:
+            raise AgentError(
+                f"{sample_key}/{cand_key}: mapping 输出无法由源与声明的转换重建"
+                "（逐样本 SHA 不符）；mapping 可能被篡改"
+            )
     return mapping
 
 
@@ -1102,6 +1131,10 @@ def run_apply(
                     raise AgentError(
                         f"合规副本 SHA256 与 mapping 不符：{copy_path}"
                     )
+                # 附加防线：路径必须在 mapping 目录内（与 load_and_check_mapping 一致）。
+                resolved_copy = copy_path.resolve()
+                if not resolved_copy.is_relative_to(mapping_file.parent.resolve()):
+                    raise AgentError(f"副本路径逃逸出 mapping 目录：{copy_path}")
                 if centry.get("track_id"):
                     tracks_view.append(
                         {

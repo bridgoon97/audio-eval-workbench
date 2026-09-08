@@ -21,3 +21,4 @@ Agent 附加禁止事项：
 - 密码只允许经 stdin 或环境变量进入 CLI；manifest、mapping、state、日志与 shell history 不得出现凭据。
 - 盲评任务的候选匿名映射在任务关闭前不得提前揭晓。
 - CLI 只走公开 HTTP API；不得直接写服务端数据库或 assets，也不得绕过用户权限。
+- 发布需要双重确认（manifest.publish=true 且 CLI --publish）；处理被服务端拒绝时不得发布，拒绝证据持久化。owner 不因创建任务而自动成为受邀评测者。
