@@ -9,3 +9,15 @@
 - 运行与变更相关的测试以及前端构建；不得将 CPU/CI 通过宣称为实体设备听音或真实算法效果通过。
 - 不添加未经需求支持的云服务、遥测、外部字体或 CDN。
 - Python 项目统一使用 uv：依赖写入 pyproject.toml 并提交 uv.lock；运行使用 uv run --locked，不另维护 requirements.txt。
+
+# Agent 创建评测任务
+
+通用 Agent 可以在用户授权下，通过 `audio-eval agent ...` CLI 把已整理的音频编排为评测任务（生成/校验 manifest、准备 16 kHz 合规副本、幂等创建草稿、显式双确认发布）。入口与完整流程见 [docs/Agent创建评测任务.md](docs/Agent创建评测任务.md)，清单结构见 `docs/task-manifest.schema.json`。
+
+Agent 附加禁止事项：
+
+- 不得自动选择通道、截取区间、归一化、对齐或增益；非 16 kHz 源必须由用户在 manifest 中显式许可重采样。
+- 不得覆盖源文件或在素材目录内写入输出。
+- 密码只允许经 stdin 或环境变量进入 CLI；manifest、mapping、state、日志与 shell history 不得出现凭据。
+- 盲评任务的候选匿名映射在任务关闭前不得提前揭晓。
+- CLI 只走公开 HTTP API；不得直接写服务端数据库或 assets，也不得绕过用户权限。
