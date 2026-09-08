@@ -20,3 +20,4 @@ coverage/
 *.egg-info/
 playwright-report/
 test-results/
+node_modules/
