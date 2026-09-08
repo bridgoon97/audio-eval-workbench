@@ -1568,6 +1568,24 @@ function App() {
                 此处显示你有权管理的已删除任务。恢复保留原有发布状态和成员；管理员可永久清除以释放磁盘空间，清除后不可恢复。
               </p>
               {!trashed.length && <p>回收站为空</p>}
+              {user?.role === 'admin' && (
+                <div className="cleanup-retry">
+                  <button
+                    className="text-button"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        const result = await api('/maintenance/cleanup-retry', 'POST');
+                        setNotice(
+                          `待清理重试完成：已清理 ${result['已清理'].length} 个文件，保留 ${result['保留'].length} 个，重新被引用 ${result['重新被引用'].length} 个`,
+                        );
+                      })
+                    }
+                  >
+                    重试清理待删文件
+                  </button>
+                </div>
+              )}
               {trashed.map((t) => (
                 <div className="trash-row" key={t.id}>
                   <div>

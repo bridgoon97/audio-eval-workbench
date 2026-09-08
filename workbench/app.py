@@ -1466,8 +1466,24 @@ def create_app(
                 db.close()
             with connect(database) as db:
                 refs_after = _all_asset_files(db)
+            pending = []
             for name in sorted(refs_before - refs_after):
-                _unlink_asset(name)
+                try:
+                    _unlink_asset(name)
+                except OSError as exc:
+                    pending.append(name)
+                    with mutation_lock, connect(database) as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO cleanup_pending VALUES(?,?,?)",
+                            (name, now(), f"{type(exc).__name__}: {exc}"),
+                        )
+            if pending:
+                return {
+                    "ok": True,
+                    "已删候选": len(track_ids),
+                    "待清理": pending,
+                    "说明": "数据库已删除；以上文件暂时无法删除，管理员可重试清理",
+                }
             return {"ok": True, "已删候选": len(track_ids)}
 
     class PurgeInput(BaseModel):
@@ -1477,6 +1493,7 @@ def create_app(
     def prepare_purge_task(task_id: str, request: Request):
         u = user(request)
         admin(request)
+        require_csrf(request, u)
         with connect(database) as db:
             task_access(db, task_id, u, True, include_deleted=True)
             if not db.execute(
@@ -1492,7 +1509,25 @@ def create_app(
                 (task_id,),
             ).fetchone()[0]
             task_files = _task_asset_files(db, task_id)
-            exclusive = sorted(task_files - (_all_asset_files(db) - task_files))
+            outside_files = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT t.path FROM tracks t LEFT JOIN samples s ON s.id=t.sample_id "
+                    "WHERE s.task_id IS NULL OR s.task_id!=?",
+                    (task_id,),
+                )
+            }
+            outside_files |= {
+                json.loads(r[0])["派生文件"]
+                for r in db.execute(
+                    "SELECT tp.data FROM track_processing tp "
+                    "JOIN tracks t ON t.id=tp.track_id "
+                    "LEFT JOIN samples s ON s.id=t.sample_id "
+                    "WHERE s.task_id IS NULL OR s.task_id!=?",
+                    (task_id,),
+                )
+            }
+            exclusive = sorted(task_files - outside_files)
             total_bytes = sum(
                 (assets / name).stat().st_size
                 for name in exclusive
@@ -1516,6 +1551,7 @@ def create_app(
     def purge_task(task_id: str, body: PurgeInput, request: Request):
         u = user(request)
         admin(request)
+        require_csrf(request, u)
         with mutation_lock:
             # 手工事务：先提交数据库删除，成功后才按引用差集回收文件；
             # 提交失败回滚，任务与所有文件保持原状态、可恢复、可播放。
@@ -1582,19 +1618,54 @@ def create_app(
                 db.close()
             with connect(database) as db:
                 refs_after = _all_asset_files(db)
-            reclaim_failed = []
+            pending = []
             for name in sorted(refs_before - refs_after):
                 try:
                     _unlink_asset(name)
-                except OSError:
-                    reclaim_failed.append(name)
-            if reclaim_failed:
+                except OSError as exc:
+                    pending.append(name)
+                    with mutation_lock, connect(database) as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO cleanup_pending VALUES(?,?,?)",
+                            (name, now(), f"{type(exc).__name__}: {exc}"),
+                        )
+            if pending:
                 return {
                     "已清除": True,
-                    "回收失败": reclaim_failed,
-                    "说明": "数据库已清除；以下文件因删除失败仍留在 assets，可稍后重试清理",
+                    "待清理": pending,
+                    "说明": "数据库已清除；以上文件暂时无法删除，管理员可重试清理",
                 }
-            return {"已清除": True, "回收失败": []}
+            return {"已清除": True, "待清理": []}
+
+    @app.post("/api/maintenance/cleanup-retry")
+    def retry_cleanup(request: Request):
+        u = user(request)
+        admin(request)
+        require_csrf(request, u)
+        with connect(database) as db:
+            rows = db.execute(
+                "SELECT name FROM cleanup_pending ORDER BY created"
+            ).fetchall()
+            referenced = _all_asset_files(db)
+            cleaned, kept, reappeared = [], [], []
+            for row in rows:
+                name = row["name"]
+                if name in referenced:
+                    # 资产重新被某轨/处理引用：保留文件并从待清理安全退出。
+                    db.execute("DELETE FROM cleanup_pending WHERE name=?", (name,))
+                    reappeared.append(name)
+                    continue
+                try:
+                    _unlink_asset(name)
+                    db.execute("DELETE FROM cleanup_pending WHERE name=?", (name,))
+                    cleaned.append(name)
+                except OSError as exc:
+                    db.execute(
+                        "UPDATE cleanup_pending SET last_error=? WHERE name=?",
+                        (f"{type(exc).__name__}: {exc}", name),
+                    )
+                    kept.append(name)
+        return {"已清理": cleaned, "保留": kept, "重新被引用": reappeared}
 
     @app.get("/api/tasks")
     def task_list(request: Request, deleted: bool = False):

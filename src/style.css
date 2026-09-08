@@ -2228,6 +2228,9 @@ kbd {
   align-items: center;
   gap: 10px;
 }
+.cleanup-retry {
+  margin-bottom: 8px;
+}
 .purge-confirm {
   border: 1px solid #ad5b2b;
   border-radius: 8px;
