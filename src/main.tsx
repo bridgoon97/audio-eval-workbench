@@ -148,6 +148,11 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState('');
   const [trashed, setTrashed] = useState<Task[]>([]);
+  const [purgePrep, setPurgePrep] = useState<{
+    task_id: string;
+    token: string;
+    summary: Record<string, any>;
+  } | null>(null);
   const [batchBusy, setBatchBusy] = useState(false);
   const [editTrack, setEditTrack] = useState<{ id: string; name: string; version: string } | null>(
     null,
@@ -1112,6 +1117,22 @@ function App() {
                           <>
                             <button onClick={() => setModal('edit-sample')}>编辑片段</button>
                             <button
+                              onClick={() => {
+                                if (
+                                  window.confirm(
+                                    `删除整个草稿片段「${sample?.name}」？其全部候选、派生资产与未引用音频将一并移除，已有标注或评分的片段不能删除。`,
+                                  )
+                                )
+                                  void run(async () => {
+                                    await api('/samples/' + sample!.id, 'DELETE');
+                                    await openTask(task.id);
+                                    setNotice('片段已删除；未被引用的音频空间已释放。');
+                                  });
+                              }}
+                            >
+                              删除片段
+                            </button>
+                            <button
                               className={modal === 'processing' ? 'selected' : ''}
                               onClick={() => setModal('processing')}
                             >
@@ -1642,9 +1663,27 @@ function App() {
           {modal === 'trash' && (
             <div>
               <p className="muted">
-                此处显示你有权管理的已删除任务。恢复保留原有发布状态和成员；回收站不释放磁盘空间。
+                此处显示你有权管理的已删除任务。恢复保留原有发布状态和成员；管理员可永久清除以释放磁盘空间，清除后不可恢复。
               </p>
               {!trashed.length && <p>回收站为空</p>}
+              {user?.role === 'admin' && (
+                <div className="cleanup-retry">
+                  <button
+                    className="text-button"
+                    disabled={busy}
+                    onClick={() =>
+                      void run(async () => {
+                        const result = await api('/maintenance/cleanup-retry', 'POST');
+                        setNotice(
+                          `待清理重试完成：已清理 ${result['已清理'].length} 个文件，保留 ${result['保留'].length} 个，重新被引用 ${result['重新被引用'].length} 个`,
+                        );
+                      })
+                    }
+                  >
+                    重试清理待删文件
+                  </button>
+                </div>
+              )}
               {trashed.map((t) => (
                 <div className="trash-row" key={t.id}>
                   <div>
@@ -1653,18 +1692,72 @@ function App() {
                       {stateName[t.status]} · {t.sample_count} 个片段
                     </p>
                   </div>
-                  <button
-                    disabled={busy}
-                    onClick={() =>
-                      void run(async () => {
-                        await api('/tasks/' + t.id + '/restore', 'POST');
-                        setTrashed(await api('/tasks?deleted=true'));
-                        await refreshTasks();
-                      })
-                    }
-                  >
-                    恢复任务
-                  </button>
+                  <div className="trash-actions">
+                    <button
+                      disabled={busy}
+                      onClick={() =>
+                        void run(async () => {
+                          await api('/tasks/' + t.id + '/restore', 'POST');
+                          setTrashed(await api('/tasks?deleted=true'));
+                          await refreshTasks();
+                        })
+                      }
+                    >
+                      恢复任务
+                    </button>
+                    {user?.role === 'admin' &&
+                      (purgePrep?.task_id === t.id ? (
+                        <div className="purge-confirm">
+                          <p>
+                            将永久删除 {purgePrep.summary['片段数']} 个片段、
+                            {purgePrep.summary['候选数']} 个候选，预计释放约{' '}
+                            {(purgePrep.summary['预计释放字节'] / 1048576).toFixed(1)} MB。
+                            <strong>此操作不可恢复。</strong>
+                          </p>
+                          <button
+                            className="danger"
+                            disabled={busy}
+                            onClick={() =>
+                              void run(async () => {
+                                const result = await api('/tasks/' + t.id + '/purge', 'POST', {
+                                  确认令牌: purgePrep.token,
+                                });
+                                setPurgePrep(null);
+                                setTrashed(await api('/tasks?deleted=true'));
+                                await refreshTasks();
+                                setNotice(
+                                  result['回收失败']?.length
+                                    ? `已清除任务；${result['回收失败'].length} 个文件未能回收，可稍后重试清理`
+                                    : '任务已永久清除，独占音频空间已释放',
+                                );
+                              })
+                            }
+                          >
+                            确认永久清除
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          className="danger-text"
+                          disabled={busy}
+                          onClick={() =>
+                            void run(async () => {
+                              const summary = await api(
+                                '/tasks/' + t.id + '/purge/prepare',
+                                'POST',
+                              );
+                              setPurgePrep({
+                                task_id: t.id,
+                                token: summary['确认令牌'],
+                                summary,
+                              });
+                            })
+                          }
+                        >
+                          永久清除
+                        </button>
+                      ))}
+                  </div>
                 </div>
               ))}
             </div>

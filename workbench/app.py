@@ -1664,6 +1664,286 @@ def create_app(
             db.execute("DELETE FROM deleted_tasks WHERE task_id=?", (task_id,))
         return {"ok": True}
 
+    def _all_asset_files(db):
+        files = {r[0] for r in db.execute("SELECT DISTINCT path FROM tracks")}
+        files |= {
+            json.loads(r[0])["派生文件"]
+            for r in db.execute("SELECT data FROM track_processing")
+        }
+        return files
+
+    def _task_asset_files(db, task_id):
+        files = {
+            r[0]
+            for r in db.execute(
+                "SELECT DISTINCT t.path FROM tracks t JOIN samples s ON s.id=t.sample_id "
+                "WHERE s.task_id=?",
+                (task_id,),
+            )
+        }
+        files |= {
+            json.loads(r[0])["派生文件"]
+            for r in db.execute(
+                "SELECT tp.data FROM track_processing tp "
+                "JOIN tracks t ON t.id=tp.track_id "
+                "JOIN samples s ON s.id=t.sample_id WHERE s.task_id=?",
+                (task_id,),
+            )
+        }
+        return files
+
+    def _unlink_asset(name):
+        # 仅清理 assets 下由服务端 SHA 派生的文件名，不接受外部任意路径。
+        if not re.fullmatch(r"[0-9a-f]{64}\.wav", name):
+            return
+        (assets / name).unlink(missing_ok=True)
+
+    @app.delete("/api/samples/{sample_id}")
+    def delete_sample(sample_id: str, request: Request):
+        u = user(request)
+        with mutation_lock:
+            # 手工事务＋显式提交点：提交成功后按引用差集回收无引用资产。
+            db = sqlite3.connect(database, timeout=15)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            try:
+                _, _ = _sample_managers_only(db, sample_id, u)
+                annotated = db.execute(
+                    "SELECT 1 FROM comments WHERE sample_id=? LIMIT 1", (sample_id,)
+                ).fetchone() or db.execute(
+                    "SELECT 1 FROM ratings WHERE sample_id=? LIMIT 1", (sample_id,)
+                ).fetchone()
+                if annotated:
+                    raise HTTPException(
+                        409,
+                        "此片段已有评论或评分，不能删除；标注是可追溯证据的一部分",
+                    )
+                refs_before = _all_asset_files(db)
+                track_ids = [
+                    r["id"]
+                    for r in db.execute(
+                        "SELECT id FROM tracks WHERE sample_id=?", (sample_id,)
+                    ).fetchall()
+                ]
+                for tid in track_ids:
+                    db.execute("DELETE FROM track_processing WHERE track_id=?", (tid,))
+                    db.execute("DELETE FROM track_analysis WHERE track_id=?", (tid,))
+                db.execute("DELETE FROM aliases WHERE sample_id=?", (sample_id,))
+                db.execute("DELETE FROM tracks WHERE sample_id=?", (sample_id,))
+                db.execute("DELETE FROM samples WHERE id=?", (sample_id,))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+            with connect(database) as db:
+                refs_after = _all_asset_files(db)
+            pending = []
+            for name in sorted(refs_before - refs_after):
+                try:
+                    _unlink_asset(name)
+                except OSError as exc:
+                    pending.append(name)
+                    with mutation_lock, connect(database) as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO cleanup_pending VALUES(?,?,?)",
+                            (name, now(), f"{type(exc).__name__}: {exc}"),
+                        )
+            if pending:
+                return {
+                    "ok": True,
+                    "已删候选": len(track_ids),
+                    "待清理": pending,
+                    "说明": "数据库已删除；以上文件暂时无法删除，管理员可重试清理",
+                }
+            return {"ok": True, "已删候选": len(track_ids)}
+
+    class PurgeInput(BaseModel):
+        确认令牌: str
+
+    @app.post("/api/tasks/{task_id}/purge/prepare")
+    def prepare_purge_task(task_id: str, request: Request):
+        u = user(request)
+        admin(request)
+        require_csrf(request, u)
+        # 状态校验、统计与令牌签发在同一 mutation_lock 临界区内完成，避免
+        # restore/purge 在统计与发令牌之间改变任务状态。
+        with mutation_lock, connect(database) as db:
+            task_access(db, task_id, u, True, include_deleted=True)
+            if not db.execute(
+                "SELECT 1 FROM deleted_tasks WHERE task_id=?", (task_id,)
+            ).fetchone():
+                raise HTTPException(409, "仅回收站中的任务可以永久清除")
+            sample_count = db.execute(
+                "SELECT count(*) FROM samples WHERE task_id=?", (task_id,)
+            ).fetchone()[0]
+            track_count = db.execute(
+                "SELECT count(*) FROM tracks t JOIN samples s ON s.id=t.sample_id "
+                "WHERE s.task_id=?",
+                (task_id,),
+            ).fetchone()[0]
+            task_files = _task_asset_files(db, task_id)
+            outside_files = {
+                r[0]
+                for r in db.execute(
+                    "SELECT DISTINCT t.path FROM tracks t LEFT JOIN samples s ON s.id=t.sample_id "
+                    "WHERE s.task_id IS NULL OR s.task_id!=?",
+                    (task_id,),
+                )
+            }
+            outside_files |= {
+                json.loads(r[0])["派生文件"]
+                for r in db.execute(
+                    "SELECT tp.data FROM track_processing tp "
+                    "JOIN tracks t ON t.id=tp.track_id "
+                    "LEFT JOIN samples s ON s.id=t.sample_id "
+                    "WHERE s.task_id IS NULL OR s.task_id!=?",
+                    (task_id,),
+                )
+            }
+            exclusive = sorted(task_files - outside_files)
+            total_bytes = sum(
+                (assets / name).stat().st_size
+                for name in exclusive
+                if (assets / name).exists()
+            )
+            token = secrets.token_urlsafe(24)
+            db.execute("DELETE FROM purge_tokens WHERE task_id=?", (task_id,))
+            db.execute(
+                "INSERT INTO purge_tokens VALUES(?,?,?)", (token, task_id, now())
+            )
+        return {
+            "确认令牌": token,
+            "片段数": sample_count,
+            "候选数": track_count,
+            "独占资产数": len(exclusive),
+            "预计释放字节": total_bytes,
+        }
+
+    @app.post("/api/tasks/{task_id}/purge")
+    def purge_task(task_id: str, body: PurgeInput, request: Request):
+        u = user(request)
+        admin(request)
+        require_csrf(request, u)
+        with mutation_lock:
+            # 手工事务：先提交数据库删除，成功后才按引用差集回收文件；
+            # 提交失败回滚，任务与所有文件保持原状态、可恢复、可播放。
+            db = sqlite3.connect(database, timeout=15)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            try:
+                task_access(db, task_id, u, True, include_deleted=True)
+                if not db.execute(
+                    "SELECT 1 FROM deleted_tasks WHERE task_id=?", (task_id,)
+                ).fetchone():
+                    raise HTTPException(409, "仅回收站中的任务可以永久清除")
+                row = db.execute(
+                    "SELECT created FROM purge_tokens WHERE token=? AND task_id=?",
+                    (body.确认令牌, task_id),
+                ).fetchone()
+                expired = not row or (
+                    datetime.now(UTC)
+                    - datetime.fromisoformat(row["created"])
+                ) > timedelta(minutes=15)
+                if expired:
+                    raise HTTPException(403, "确认令牌无效或已过期，请重新发起永久清除")
+                refs_before = _all_asset_files(db)
+                sample_ids = [
+                    r["id"]
+                    for r in db.execute(
+                        "SELECT id FROM samples WHERE task_id=?", (task_id,)
+                    ).fetchall()
+                ]
+                for sid in sample_ids:
+                    db.execute("DELETE FROM comments WHERE sample_id=?", (sid,))
+                    db.execute("DELETE FROM ratings WHERE sample_id=?", (sid,))
+                    db.execute("DELETE FROM aliases WHERE sample_id=?", (sid,))
+                db.execute(
+                    "DELETE FROM track_processing WHERE track_id IN "
+                    "(SELECT t.id FROM tracks t JOIN samples s ON s.id=t.sample_id "
+                    "WHERE s.task_id=?)",
+                    (task_id,),
+                )
+                db.execute(
+                    "DELETE FROM track_analysis WHERE track_id IN "
+                    "(SELECT t.id FROM tracks t JOIN samples s ON s.id=t.sample_id "
+                    "WHERE s.task_id=?)",
+                    (task_id,),
+                )
+                db.execute(
+                    "DELETE FROM tracks WHERE sample_id IN "
+                    "(SELECT id FROM samples WHERE task_id=?)",
+                    (task_id,),
+                )
+                db.execute("DELETE FROM samples WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM purge_tokens WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM review_assignments WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM members WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM deleted_tasks WHERE task_id=?", (task_id,))
+                # 自助申请的邀请/申请记录保留审计线索，仅解除与本任务的关联。
+                db.execute("UPDATE invites SET task_id=NULL WHERE task_id=?", (task_id,))
+                db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+            with connect(database) as db:
+                refs_after = _all_asset_files(db)
+            pending = []
+            for name in sorted(refs_before - refs_after):
+                try:
+                    _unlink_asset(name)
+                except OSError as exc:
+                    pending.append(name)
+                    with mutation_lock, connect(database) as db:
+                        db.execute(
+                            "INSERT OR REPLACE INTO cleanup_pending VALUES(?,?,?)",
+                            (name, now(), f"{type(exc).__name__}: {exc}"),
+                        )
+            if pending:
+                return {
+                    "已清除": True,
+                    "待清理": pending,
+                    "说明": "数据库已清除；以上文件暂时无法删除，管理员可重试清理",
+                }
+            return {"已清除": True, "待清理": []}
+
+    @app.post("/api/maintenance/cleanup-retry")
+    def retry_cleanup(request: Request):
+        u = user(request)
+        admin(request)
+        require_csrf(request, u)
+        # 全程持有 mutation_lock：引用检查到 unlink 的决定序列与上传、处理、
+        # 整段删除、purge 串行，防止并发请求在确认无引用后重新引用同一 SHA
+        # 造成新引用的文件损坏。
+        with mutation_lock, connect(database) as db:
+            rows = db.execute(
+                "SELECT name FROM cleanup_pending ORDER BY created"
+            ).fetchall()
+            referenced = _all_asset_files(db)
+            cleaned, kept, reappeared = [], [], []
+            for row in rows:
+                name = row["name"]
+                if name in referenced:
+                    # 资产重新被某轨/处理引用：保留文件并从待清理安全退出。
+                    db.execute("DELETE FROM cleanup_pending WHERE name=?", (name,))
+                    reappeared.append(name)
+                    continue
+                try:
+                    _unlink_asset(name)
+                    db.execute("DELETE FROM cleanup_pending WHERE name=?", (name,))
+                    cleaned.append(name)
+                except OSError as exc:
+                    db.execute(
+                        "UPDATE cleanup_pending SET last_error=? WHERE name=?",
+                        (f"{type(exc).__name__}: {exc}", name),
+                    )
+                    kept.append(name)
+        return {"已清理": cleaned, "保留": kept, "重新被引用": reappeared}
+
     @app.get("/api/tasks")
     def task_list(request: Request, deleted: bool = False):
         u = user(request)
@@ -1728,6 +2008,22 @@ def create_app(
                 raise HTTPException(409, "发布后任务名称、类型和模式保持冻结")
             if not body.title.strip():
                 raise HTTPException(422, "任务名称不能为空")
+            if body.mode != t["mode"] and (
+                db.execute(
+                    "SELECT 1 FROM comments c JOIN samples s ON s.id=c.sample_id "
+                    "WHERE s.task_id=? LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM ratings r JOIN samples s ON s.id=r.sample_id "
+                    "WHERE s.task_id=? LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+            ):
+                raise HTTPException(
+                    409,
+                    "此任务已有标注或评分，比较模式保持冻结；需要更改时请创建新任务",
+                )
             db.execute(
                 "UPDATE tasks SET title=?,kind=?,mode=? WHERE id=?",
                 (body.title.strip(), body.kind, body.mode, task_id),
