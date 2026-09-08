@@ -219,7 +219,8 @@ function App() {
       setServerVersion(status.version);
       if (nextUser.role === 'admin' && typeof (nextUser as any).pending_applications === 'number')
         setPendingCount((nextUser as any).pending_applications);
-      if (typeof (nextUser as any).csrf_token === 'string') setCsrfToken((nextUser as any).csrf_token);
+      if (typeof (nextUser as any).csrf_token === 'string')
+        setCsrfToken((nextUser as any).csrf_token);
       setUser((previous) =>
         previous?.role === nextUser.role && previous.name === nextUser.name ? previous : nextUser,
       );

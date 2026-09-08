@@ -38,7 +38,10 @@ async function csrfToken(request: import('@playwright/test').APIRequestContext) 
   return (await (await request.get('/api/me')).json()).csrf_token as string;
 }
 
-async function createActiveTask(request: import('@playwright/test').APIRequestContext, title: string) {
+async function createActiveTask(
+  request: import('@playwright/test').APIRequestContext,
+  title: string,
+) {
   const token = await csrfToken(request);
   const created = await (
     await request.post('/api/tasks', { data: { title, kind: '算法版本', mode: 'development' } })
@@ -50,7 +53,11 @@ async function createActiveTask(request: import('@playwright/test').APIRequestCo
   ).json();
   for (const name of ['候选甲', '候选乙']) {
     await request.post(`/api/samples/${sample.id}/tracks`, {
-      multipart: { name, version: 'v1', file: { name: 'clip.wav', mimeType: 'audio/wav', buffer: wav } },
+      multipart: {
+        name,
+        version: 'v1',
+        file: { name: 'clip.wav', mimeType: 'audio/wav', buffer: wav },
+      },
     });
   }
   const published = await request.post(`/api/tasks/${created.id}/publish`, {
@@ -61,7 +68,10 @@ async function createActiveTask(request: import('@playwright/test').APIRequestCo
   return created.id as string;
 }
 
-test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 → 免密登录 → 撤销', async ({ page, browser }) => {
+test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 → 免密登录 → 撤销', async ({
+  page,
+  browser,
+}) => {
   test.setTimeout(120000);
   await ensureAdmin(page.request);
   const taskId = await createActiveTask(page.request, '免密登录验收任务');
@@ -105,7 +115,9 @@ test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 
     await expect(row.getByLabel('账号名称')).toHaveValue('免密申请员');
     await row.getByLabel('免密登录验收任务').check();
     await row.getByRole('button', { name: '确认批准并创建账号' }).click();
-    await expect(page.locator('.application-row').filter({ hasText: '免密申请员' })).not.toBeVisible();
+    await expect(
+      page.locator('.application-row').filter({ hasText: '免密申请员' }),
+    ).not.toBeVisible();
     await page.keyboard.press('Escape');
     await expect(page.locator('.overlay')).toHaveCount(0);
 
@@ -113,7 +125,9 @@ test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 
     await expect(applicantPage.locator('.dashboard')).toBeVisible({ timeout: 20000 });
     await applicantPage.reload();
     await expect(applicantPage.locator('.dashboard')).toBeVisible();
-    await expect(applicantPage.locator('.task-card', { hasText: '免密登录验收任务' })).toBeVisible();
+    await expect(
+      applicantPage.locator('.task-card', { hasText: '免密登录验收任务' }),
+    ).toBeVisible();
 
     // 管理员查看设备并撤销。
     await page.getByRole('button', { name: '团队成员', exact: true }).click();
@@ -162,7 +176,9 @@ test('拒绝申请、无效与停用邀请凭证、普通成员无审批入口',
     // 停用邀请后同样无效。
     await applicantPage.getByLabel('邀请凭证').fill(invite.code);
     await applicantPage.getByRole('button', { name: '提交申请' }).click();
-    await expect(applicantPage.getByRole('heading', { name: '等待管理员批准' })).toBeVisible({ timeout: 20000 });
+    await expect(applicantPage.getByRole('heading', { name: '等待管理员批准' })).toBeVisible({
+      timeout: 20000,
+    });
     const applicationId = (await applicantPage.getByText(/^[0-9a-f]{32}$/).textContent()) as string;
     const list = await (await page.request.get('/api/applications')).json();
     const entry = list.find((x: { id: string }) => x.id === applicationId);
@@ -172,7 +188,9 @@ test('拒绝申请、无效与停用邀请凭证、普通成员无审批入口',
     });
     expect(disable.ok()).toBeTruthy();
     // 轮询后申请随邀请失效自动过期；批准被拒绝。
-    await expect(applicantPage.getByText('邀请凭证已失效，申请已过期')).toBeVisible({ timeout: 20000 });
+    await expect(applicantPage.getByText('邀请凭证已失效，申请已过期')).toBeVisible({
+      timeout: 20000,
+    });
     const approve = await page.request.post(`/api/applications/${entry.id}/approve`, {
       data: { role: 'reviewer' },
       headers: { 'x-csrf-token': token },
@@ -189,13 +207,21 @@ test('拒绝申请、无效与停用邀请凭证、普通成员无审批入口',
     await applicantPage.getByLabel('显示名称').fill('将被拒绝的人');
     await applicantPage.getByLabel('邀请凭证').fill(secondInvite.code);
     await applicantPage.getByRole('button', { name: '提交申请' }).click();
-    await expect(applicantPage.getByRole('heading', { name: '等待管理员批准' })).toBeVisible({ timeout: 20000 });
+    await expect(applicantPage.getByRole('heading', { name: '等待管理员批准' })).toBeVisible({
+      timeout: 20000,
+    });
     const list2 = await (await page.request.get('/api/applications')).json();
     const entry2 = list2.find(
       (x: { display_name: string; status: string }) =>
         x.display_name === '将被拒绝的人' && x.status === 'pending',
     );
-    expect(entry2, '第二次申请应为 pending：' + JSON.stringify(list2.map((x: { display_name: string; status: string }) => [x.display_name, x.status]))).toBeTruthy();
+    expect(
+      entry2,
+      '第二次申请应为 pending：' +
+        JSON.stringify(
+          list2.map((x: { display_name: string; status: string }) => [x.display_name, x.status]),
+        ),
+    ).toBeTruthy();
     const reject = await page.request.post(`/api/applications/${entry2.id}/reject`, {
       data: {},
       headers: { 'x-csrf-token': token },

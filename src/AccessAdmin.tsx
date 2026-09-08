@@ -9,7 +9,11 @@ const stateName: Record<string, string> = {
   expired: '已过期',
 };
 
-function copyText(text: string, done: (message: string) => void, fallback?: HTMLTextAreaElement | null) {
+function copyText(
+  text: string,
+  done: (message: string) => void,
+  fallback?: HTMLTextAreaElement | null,
+) {
   void (async () => {
     try {
       if (navigator.clipboard?.writeText) {
@@ -91,7 +95,11 @@ export function DeviceAdmin({ target }: { target: User }) {
         </div>
       ))}
       {!!devices?.some((d) => !d.revoked) && (
-        <button className="full" disabled={busy} onClick={() => void revoke(`/users/${target.id}/devices`)}>
+        <button
+          className="full"
+          disabled={busy}
+          onClick={() => void revoke(`/users/${target.id}/devices`)}
+        >
           撤销全部设备
         </button>
       )}
@@ -145,7 +153,10 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
   return (
     <div className="access-admin">
       <div className="access-tabs" role="group" aria-label="管理区切换">
-        <button className={tab === 'applications' ? 'selected' : ''} onClick={() => setTab('applications')}>
+        <button
+          className={tab === 'applications' ? 'selected' : ''}
+          onClick={() => setTab('applications')}
+        >
           <Users size={16} /> 加入申请
         </button>
         <button className={tab === 'invites' ? 'selected' : ''} onClick={() => setTab('invites')}>
@@ -178,7 +189,8 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
                 <small>
                   {a.employee_id && <>工号 {a.employee_id} · </>}
                   {a.email && <>{a.email} · </>}
-                  {a.created.slice(0, 16).replace('T', ' ')} · {a.device || '未知客户端'} · IP {a.ip}
+                  {a.created.slice(0, 16).replace('T', ' ')} · {a.device || '未知客户端'} · IP{' '}
+                  {a.ip}
                 </small>
                 <small>
                   邀请用途：{a.invite.purpose || '—'}
@@ -188,13 +200,17 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
                   <small className="muted">
                     {stateName[a.status]}
                     {a.decided_by && ` · 由 ${a.decided_by} 处理`}
-                    {a.status === 'approved' && (a.claimed ? ' · 已在浏览器登录' : ' · 尚未领取登录状态')}
+                    {a.status === 'approved' &&
+                      (a.claimed ? ' · 已在浏览器登录' : ' · 尚未领取登录状态')}
                   </small>
                 )}
               </div>
               {a.status === 'pending' && (
                 <div className="application-actions">
-                  <button disabled={busy} onClick={() => setExpanding(expanding === a.id ? null : a.id)}>
+                  <button
+                    disabled={busy}
+                    onClick={() => setExpanding(expanding === a.id ? null : a.id)}
+                  >
                     {expanding === a.id ? '收起' : '批准…'}
                   </button>
                   <button
@@ -242,8 +258,12 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
                     <p className="muted">任务邀请只能批准到「{a.invite.task_title}」。</p>
                   ) : (
                     <>
-                      <span className="eyebrow">分配可参与的任务（准备中/进行中；已关闭任务冻结名单）</span>
-                      {!activeTasks.length && <p className="muted">当前没有可分配的任务；可以稍后在任务里增补。</p>}
+                      <span className="eyebrow">
+                        分配可参与的任务（准备中/进行中；已关闭任务冻结名单）
+                      </span>
+                      {!activeTasks.length && (
+                        <p className="muted">当前没有可分配的任务；可以稍后在任务里增补。</p>
+                      )}
                       {activeTasks.map((t) => (
                         <label className="checkbox" key={t.id}>
                           <input type="checkbox" name="task_ids" value={t.id} />
@@ -266,7 +286,8 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
             <section className="credential-card" aria-label="本次邀请凭证">
               <h3>邀请凭证已生成</h3>
               <p>
-                用途：{credential.purpose || '—'}。明文只显示这一次，关闭后无法再次查看；请通过可信渠道单独发给申请人。
+                用途：{credential.purpose || '—'}
+                。明文只显示这一次，关闭后无法再次查看；请通过可信渠道单独发给申请人。
               </p>
               <textarea
                 ref={codeRef}
@@ -327,7 +348,9 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
                 <option value="">—</option>
                 {tasks.map((t) => (
                   <option key={t.id} value={t.id}>
-                    {t.title}（{t.status === 'active' ? '进行中' : t.status === 'draft' ? '准备中' : '已揭晓'}）
+                    {t.title}（
+                    {t.status === 'active' ? '进行中' : t.status === 'draft' ? '准备中' : '已揭晓'}
+                    ）
                   </option>
                 ))}
               </select>
@@ -335,7 +358,14 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
             <div className="invite-numbers">
               <label>
                 有效期（天）
-                <input name="expires_days" type="number" min={1} max={365} defaultValue={7} required />
+                <input
+                  name="expires_days"
+                  type="number"
+                  min={1}
+                  max={365}
+                  defaultValue={7}
+                  required
+                />
               </label>
               <label>
                 最大使用次数
@@ -358,9 +388,9 @@ export function AccessAdmin({ onBusy }: { onBusy: (busy: boolean) => void }) {
                   <div>
                     <strong>{i.purpose || '（无备注）'}</strong>
                     <small>
-                      {i.kind === 'task' ? `任务邀请 · ${i.task_title}` : '团队邀请'} · 已使用 {i.used_count}/
-                      {i.max_uses} · 创建 {i.created.slice(0, 16).replace('T', ' ')} · 有效期至{' '}
-                      {i.expires.slice(0, 16).replace('T', ' ')}
+                      {i.kind === 'task' ? `任务邀请 · ${i.task_title}` : '团队邀请'} · 已使用{' '}
+                      {i.used_count}/{i.max_uses} · 创建 {i.created.slice(0, 16).replace('T', ' ')}{' '}
+                      · 有效期至 {i.expires.slice(0, 16).replace('T', ' ')}
                       {expired && ' · 已过期'}
                     </small>
                   </div>

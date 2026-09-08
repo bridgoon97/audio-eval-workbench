@@ -6,7 +6,9 @@ import { api } from './types';
 // 服务端只存哈希，申请编号本身不是登录凭证。
 function generateSecret() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
-  return btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_');
+  return btoa(String.fromCharCode(...bytes))
+    .replaceAll('+', '-')
+    .replaceAll('/', '_');
 }
 
 const STORE_KEY = 'apply-application';
@@ -25,13 +27,7 @@ function loadStored(): Stored | null {
   return null;
 }
 
-export function ApplyFlow({
-  onDone,
-  onCancel,
-}: {
-  onDone: () => void;
-  onCancel: () => void;
-}) {
+export function ApplyFlow({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
   const stored = useRef(loadStored());
   const [application, setApplication] = useState<Stored | null>(stored.current);
   const [status, setStatus] = useState('');
