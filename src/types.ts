@@ -1,4 +1,4 @@
-export type User = { id: string; name: string; role: string };
+export type User = { id: string; name: string; role: string; active?: number };
 export type Task = {
   id: string;
   title: string;

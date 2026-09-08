@@ -2379,3 +2379,28 @@ kbd {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
+
+/* 账号生命周期：停用徽标、恢复凭证表单、安全入口 */
+.disabled-member {
+  opacity: 0.6;
+}
+.pill-badge {
+  font-style: normal;
+  font-size: 10px;
+  background: #b3562e;
+  color: #fff;
+  border-radius: 8px;
+  padding: 1px 6px;
+  margin-left: 6px;
+}
+.recovery-form {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 12px;
+  display: grid;
+  gap: 10px;
+}
+.security-entry {
+  margin-right: 8px;
+}
