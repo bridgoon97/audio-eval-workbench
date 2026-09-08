@@ -550,6 +550,25 @@ class ApproveInput(BaseModel):
     task_ids: list[str] = Field(default_factory=list)
 
 
+class ChangePasswordInput(BaseModel):
+    current_password: str = Field(default="", max_length=200)
+    new_password: str = Field(min_length=10, max_length=200)
+
+
+class RecoveryCreateInput(BaseModel):
+    purpose: str = Field(default="", max_length=120)
+    expires_hours: int = Field(default=24, ge=1, le=72)
+
+
+class RecoverInput(BaseModel):
+    recovery_code: str = Field(min_length=6, max_length=200)
+    new_password: str = Field(min_length=10, max_length=200)
+
+
+class StatusInput(BaseModel):
+    active: bool
+
+
 def create_app(
     data_dir: Path,
     static_dir: Path | None = None,
@@ -621,13 +640,16 @@ def create_app(
 
     def user(request):
         """身份解析：优先会话 Cookie，其次设备令牌 Cookie。
-        IP 从不参与身份判断：相同 IP、不同浏览器没有 Cookie 就不能登录。"""
+        IP 从不参与身份判断：相同 IP、不同浏览器没有 Cookie 就不能登录。
+        停用账号（active=0）在两条路径上都被拒绝；停用时已撤销全部凭证，
+        此处 active 条件是并发停用下的第二道防线。"""
         token = request.cookies.get("session", "")
         if token:
             token_hash = hashlib.sha256(token.encode()).hexdigest()
             with connect(database) as db:
                 row = db.execute(
-                    "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires>?",
+                    "SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id "
+                    "WHERE s.token=? AND s.expires>? AND u.active=1",
                     (token_hash, time.time()),
                 ).fetchone()
             if row:
@@ -641,7 +663,7 @@ def create_app(
                 row = db.execute(
                     "SELECT u.*, d.id AS device_row, d.last_used AS device_last_used, d.last_ip AS device_last_ip "
                     "FROM devices d JOIN users u ON u.id=d.user_id "
-                    "WHERE d.token_hash=? AND d.revoked=0 AND d.expires>?",
+                    "WHERE d.token_hash=? AND d.revoked=0 AND d.expires>? AND u.active=1",
                     (digest, time.time()),
                 ).fetchone()
             if row:
@@ -770,7 +792,7 @@ def create_app(
             if len(body.password) < 10:
                 raise HTTPException(422, "密码至少 10 个字符")
             db.execute(
-                "INSERT INTO users VALUES(?,?,?,?)",
+                "INSERT INTO users(id,name,password,role,active) VALUES(?,?,?,?,1)",
                 (uid(), body.name, password_hash(body.password), "admin"),
             )
         setup_file.unlink(missing_ok=True)
@@ -786,7 +808,10 @@ def create_app(
             attempts[("login", address)] = recent + [time.time()]
         with mutation_lock, connect(database) as db:
             u = db.execute("SELECT * FROM users WHERE name=?", (body.name,)).fetchone()
-            if not u or not verify(body.password, u["password"]):
+            if not u or not u["active"]:
+                # 停用与口令错误同一提示，不泄露账号是否存在或状态。
+                raise HTTPException(401, "账号或密码错误")
+            if not verify(body.password, u["password"]):
                 raise HTTPException(401, "账号或密码错误")
             # 成功登录重置该地址的失败尝试计数：限流只针对暴力猜测，
             # 不惩罚输错几次后正常进入的同事。
@@ -845,6 +870,8 @@ def create_app(
     def me(request: Request):
         u = user(request)
         result = {k: u[k] for k in ("id", "name", "role")}
+        # 认证方式决定改密口径：密码会话需核验当前密码，设备会话可免。
+        result["auth_kind"] = u["_auth_seed"].partition(":")[0]
         # CSRF 令牌：由当前凭证哈希派生，交给同源页面在敏感操作请求头中回传。
         result["csrf_token"] = hashlib.sha256(("csrf:" + u["_auth_seed"]).encode()).hexdigest()
         if u["role"] == "admin":
@@ -1222,7 +1249,7 @@ def create_app(
                 # 被批准账号初始不设置可用口令：随机值哈希后即刻丢弃，
                 # 只能通过设备 Cookie 免密登录；必要时管理员可用既有重置口令流程。
                 db.execute(
-                    "INSERT INTO users VALUES(?,?,?,?)",
+                    "INSERT INTO users(id,name,password,role,active) VALUES(?,?,?,?,1)",
                     (user_id, resolved_name, password_hash(secrets.token_urlsafe(32)), body.role),
                 )
                 for task_id in tasks:
@@ -1307,13 +1334,249 @@ def create_app(
             db.execute("UPDATE devices SET revoked=1 WHERE user_id=? AND revoked=0", (user_id,))
         return {"ok": True}
 
+    # ---------- 账号生命周期：改密、恢复凭证、停用/启用 ----------
+    # 沿用既有规则：只存哈希、CSRF + 同源 + JSON、socket 对端限流；
+    # IP 不参与身份判断。
+
+    @app.post("/api/me/password")
+    def change_password(body: ChangePasswordInput, request: Request, response: Response):
+        u = user(request)
+        require_csrf(request, u)
+        if len(body.new_password) < 10:
+            raise HTTPException(422, "新密码至少 10 个字符")
+        seed_kind = u["_auth_seed"].partition(":")[0]
+        with mutation_lock, connect(database) as db:
+            row = db.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+            if not row or not row["active"]:
+                raise HTTPException(401, "请登录后继续")
+            # 密码会话改密必须核验当前密码；设备会话持有可信持有者证明，可免。
+            if seed_kind == "session" and (
+                not body.current_password
+                or not verify(body.current_password, row["password"])
+            ):
+                raise HTTPException(403, "当前密码不正确")
+            db.execute(
+                "UPDATE users SET password=? WHERE id=?",
+                (password_hash(body.new_password), u["id"]),
+            )
+            # 撤销本人其他凭证；当前浏览器通过轮换保持在线。
+            presented_session = request.cookies.get("session", "")
+            current_session_hash = (
+                hashlib.sha256(presented_session.encode()).hexdigest()
+                if presented_session
+                else ""
+            )
+            db.execute(
+                "DELETE FROM sessions WHERE user_id=? AND token<>?",
+                (u["id"], current_session_hash),
+            )
+            presented_device = request.cookies.get(DEVICE_COOKIE, "")
+            current_device_hash = (
+                hashlib.sha256(presented_device.encode()).hexdigest()
+                if presented_device
+                else ""
+            )
+            db.execute(
+                "UPDATE devices SET revoked=1 WHERE user_id=? AND token_hash<>?",
+                (u["id"], current_device_hash),
+            )
+            if seed_kind == "session":
+                # 轮换当前会话：旧令牌立即失效，新令牌经 Cookie 下发。
+                db.execute(
+                    "DELETE FROM sessions WHERE token=?",
+                    (u["_auth_seed"].partition(":")[2],)
+                )
+                token = secrets.token_urlsafe(32)
+                db.execute(
+                    "INSERT INTO sessions VALUES(?,?,?)",
+                    (
+                        hashlib.sha256(token.encode()).hexdigest(),
+                        u["id"],
+                        time.time() + 43200,
+                    ),
+                )
+                response.set_cookie(
+                    "session",
+                    token,
+                    httponly=True,
+                    secure=secure_cookie,
+                    samesite="strict",
+                    max_age=43200,
+                )
+            else:
+                # 轮换当前设备令牌：窗口起点与绝对到期不变，仅换哈希。
+                new_device = secrets.token_urlsafe(32)
+                rotated = db.execute(
+                    "UPDATE devices SET token_hash=?, last_used=NULL WHERE id=? AND revoked=0",
+                    (
+                        hashlib.sha256(new_device.encode()).hexdigest(),
+                        u["device_row"],
+                    ),
+                ).rowcount
+                if rotated != 1:
+                    raise HTTPException(409, "登录状态已变化，请重新登录后重试")
+                response.set_cookie(
+                    DEVICE_COOKIE,
+                    new_device,
+                    httponly=True,
+                    secure=secure_cookie,
+                    samesite="lax",
+                    max_age=DEVICE_TTL,
+                    path="/",
+                )
+        return {"ok": True}
+
+    @app.post("/api/users/{user_id}/recovery")
+    def create_recovery(user_id: str, body: RecoveryCreateInput, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        with mutation_lock, connect(database) as db:
+            target = db.execute(
+                "SELECT id, name, active FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            if not target:
+                raise HTTPException(404, "账号不存在")
+            if not target["active"]:
+                raise HTTPException(409, "账号已停用，请先启用再生成恢复凭证")
+            code = secrets.token_urlsafe(6) + "." + secrets.token_urlsafe(18)
+            key, _, secret = code.partition(".")
+            recovery_id = uid()
+            expires = (
+                datetime.now(UTC).replace(microsecond=0)
+                + timedelta(hours=body.expires_hours)
+            ).isoformat()
+            db.execute(
+                "INSERT INTO recovery_keys VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    recovery_id,
+                    target["id"],
+                    key,
+                    password_hash(secret),
+                    body.purpose.strip(),
+                    expires,
+                    None,
+                    "",
+                    now(),
+                    u["id"],
+                ),
+            )
+        return {"id": recovery_id, "code": code, "expires": expires}
+
+    @app.get("/api/users/{user_id}/recovery")
+    def recovery_list(user_id: str, request: Request):
+        admin(request)
+        with connect(database) as db:
+            if not db.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
+                raise HTTPException(404, "账号不存在")
+            rows = db.execute(
+                "SELECT id, purpose, expires, used_at, created, created_by FROM recovery_keys "
+                "WHERE user_id=? ORDER BY created DESC, id",
+                (user_id,),
+            ).fetchall()
+        # 列表不含 token_key 与哈希，无法恢复明文。
+        return [dict(row) for row in rows]
+
+    @app.post("/api/recover")
+    def recover(body: RecoverInput, request: Request, response: Response):
+        address = client_ip(request)
+        rate_limit("recover", address, 10, 300, "尝试过于频繁，请稍后再试")
+        with mutation_lock, connect(database) as db:
+            key, _, secret = body.recovery_code.strip().partition(".")
+            row = (
+                db.execute(
+                    "SELECT r.*, u.active AS user_active, u.name AS user_name FROM recovery_keys r "
+                    "JOIN users u ON u.id=r.user_id WHERE r.token_key=?",
+                    (key,),
+                ).fetchone()
+                if key and secret
+                else None
+            )
+            valid = bool(row)
+            if valid:
+                try:
+                    valid = verify(secret, row["token_hash"])
+                except ValueError:
+                    valid = False
+            # 已使用明确报 409 帮助用户理解；错误/过期/停用统一 403 不泄露细节。
+            if valid and row["used_at"] is not None:
+                raise HTTPException(409, "该恢复凭证已被使用，请向管理员重新获取")
+            # 错误/过期/停用一律同一提示，不泄露凭证状态细节。
+            if valid:
+                valid = row["expires"] > now() and row["user_active"] == 1
+            if not valid:
+                raise HTTPException(403, "恢复凭证无效、已使用或已过期，请向管理员重新获取")
+            # 单次消费：原子置位，并发领取最多一次成功。
+            consumed = db.execute(
+                "UPDATE recovery_keys SET used_at=?, used_ip=? WHERE id=? AND used_at IS NULL",
+                (now(), address, row["id"]),
+            ).rowcount
+            if consumed != 1:
+                raise HTTPException(409, "该恢复凭证已被使用，请向管理员重新获取")
+            db.execute(
+                "UPDATE users SET password=? WHERE id=?",
+                (password_hash(body.new_password), row["user_id"]),
+            )
+            # 旧凭证全部失效，领取浏览器获得全新会话。
+            db.execute("DELETE FROM sessions WHERE user_id=?", (row["user_id"],))
+            db.execute(
+                "UPDATE devices SET revoked=1 WHERE user_id=?", (row["user_id"],)
+            )
+            token = secrets.token_urlsafe(32)
+            db.execute(
+                "INSERT INTO sessions VALUES(?,?,?)",
+                (
+                    hashlib.sha256(token.encode()).hexdigest(),
+                    row["user_id"],
+                    time.time() + 43200,
+                ),
+            )
+        response.set_cookie(
+            "session",
+            token,
+            httponly=True,
+            secure=secure_cookie,
+            samesite="strict",
+            max_age=43200,
+        )
+        return {"ok": True, "name": row["user_name"]}
+
+    @app.post("/api/users/{user_id}/status")
+    def set_user_status(user_id: str, body: StatusInput, request: Request):
+        u = admin(request)
+        require_csrf(request, u)
+        with mutation_lock, connect(database) as db:
+            target = db.execute(
+                "SELECT id, name, role, active FROM users WHERE id=?", (user_id,)
+            ).fetchone()
+            if not target:
+                raise HTTPException(404, "账号不存在")
+            if target["role"] == "admin":
+                # 管理员账号不参与停用：这同时保证站点永远至少有一名可用管理员。
+                raise HTTPException(409, "管理员账号不能停用，请通过角色调整或密码重置处理")
+            if target["id"] == u["id"]:
+                raise HTTPException(409, "不能停用自己当前登录的账号")
+            if body.active:
+                # 启用不恢复任何旧会话或设备：停用时已全部撤销。
+                db.execute("UPDATE users SET active=1 WHERE id=?", (user_id,))
+            else:
+                db.execute("UPDATE users SET active=0 WHERE id=?", (user_id,))
+                db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+                db.execute(
+                    "UPDATE devices SET revoked=1 WHERE user_id=? AND revoked=0",
+                    (user_id,),
+                )
+        name = target["name"]
+        return {"ok": True, "active": body.active, "name": name}
+
     @app.get("/api/users")
     def users(request: Request):
         organizer(request)
         with connect(database) as db:
             return [
                 dict(x)
-                for x in db.execute("SELECT id,name,role FROM users ORDER BY name")
+                for x in db.execute(
+                    "SELECT id,name,role,active FROM users ORDER BY name"
+                )
             ]
 
     @app.post("/api/users")
@@ -1327,7 +1590,7 @@ def create_app(
         try:
             with connect(database) as db:
                 db.execute(
-                    "INSERT INTO users VALUES(?,?,?,?)",
+                    "INSERT INTO users(id,name,password,role,active) VALUES(?,?,?,?,1)",
                     (uid(), body.name, password_hash(body.password), body.role),
                 )
         except sqlite3.IntegrityError:
@@ -1336,22 +1599,32 @@ def create_app(
 
     @app.post("/api/users/{user_id}/password")
     def reset_password(user_id: str, body: ResetPasswordInput, request: Request):
-        admin(request)
+        u = admin(request)
+        require_csrf(request, u)
         with mutation_lock, connect(database) as db:
             target = db.execute(
-                "SELECT name,role FROM users WHERE id=?", (user_id,)
+                "SELECT name,role,active FROM users WHERE id=?", (user_id,)
             ).fetchone()
             if not target:
                 raise HTTPException(404, "账号不存在")
             if target["role"] == "admin":
                 raise HTTPException(409, "此入口仅用于重置同事账号，不修改管理员密码")
+            # 停用账号的处置路径是先启用：避免停用态下发放新凭证造成状态混乱。
+            if not target["active"]:
+                raise HTTPException(409, "账号已停用，请先启用再重置密码")
             if body.confirm_name != target["name"]:
                 raise HTTPException(422, "请输入完整账号名称确认重置")
             db.execute(
                 "UPDATE users SET password=? WHERE id=?",
                 (password_hash(body.password), user_id),
             )
+            # 失窃处置口径：旧密码、全部会话与全部设备令牌一并作废，
+            # 仅凭旧设备 Cookie 不能继续登录。
             db.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+            db.execute(
+                "UPDATE devices SET revoked=1 WHERE user_id=? AND revoked=0",
+                (user_id,),
+            )
         return {"ok": True}
 
     @app.patch("/api/users/{user_id}/role")

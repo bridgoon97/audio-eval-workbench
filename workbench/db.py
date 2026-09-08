@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import contextmanager
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
 CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, title TEXT NOT NULL, kind TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', owner TEXT NOT NULL REFERENCES users(id), created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS deleted_tasks(task_id TEXT PRIMARY KEY REFERENCES tasks(id), deleted_by TEXT NOT NULL REFERENCES users(id), deleted_at TEXT NOT NULL);
@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS cleanup_pending(name TEXT PRIMARY KEY, created TEXT N
 CREATE TABLE IF NOT EXISTS devices(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT UNIQUE NOT NULL, created TEXT NOT NULL, claimed_at REAL NOT NULL, last_used REAL, expires REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, first_ip TEXT NOT NULL DEFAULT '', last_ip TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS invites(id TEXT PRIMARY KEY, purpose TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, task_id TEXT REFERENCES tasks(id), token_key TEXT UNIQUE NOT NULL, token_hash TEXT NOT NULL, expires TEXT NOT NULL, max_uses INTEGER NOT NULL, used_count INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created TEXT NOT NULL, created_by TEXT REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, claim_hash TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL, employee_id TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', invite_id TEXT NOT NULL REFERENCES invites(id), status TEXT NOT NULL DEFAULT 'pending', ip TEXT NOT NULL DEFAULT '', device TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, decided TEXT, decided_by TEXT REFERENCES users(id), decision TEXT NOT NULL DEFAULT '', user_id TEXT REFERENCES users(id), device_id TEXT REFERENCES devices(id));
+-- 账号生命周期：管理员一次性恢复凭证。明文只显示一次，库中只存独立盐哈希；
+-- 单次消费由 used_at 原子置位保证，短期到期由审批时设置。
+CREATE TABLE IF NOT EXISTS recovery_keys(id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_key TEXT UNIQUE NOT NULL, token_hash TEXT NOT NULL, purpose TEXT NOT NULL DEFAULT '', expires TEXT NOT NULL, used_at TEXT, used_ip TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, created_by TEXT REFERENCES users(id));
 """
 
 
@@ -49,6 +52,11 @@ def init(path):
     with connect(path) as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
+        # 无损迁移：v0.7.0 旧库 users 表没有 active 列，补齐后默认全部可用；
+        # 重复执行与重复启动均无副作用。
+        columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+        if "active" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
         # 无损迁移：旧数据中的非 owner 成员是当时被分配的评测者，迁入受邀名单；
         # owner 的自动成员行只是访问便利，不构成评测义务。凡已产生评分的用户
         # （含 owner/admin）同样迁入受邀名单，历史有效证据不丢失。
