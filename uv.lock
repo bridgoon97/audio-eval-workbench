@@ -57,6 +57,7 @@ version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "jsonschema" },
     { name = "numpy" },
     { name = "python-multipart" },
@@ -67,7 +68,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pyinstaller" },
     { name = "pytest" },
     { name = "ruff" },
@@ -76,6 +76,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "numpy", specifier = ">=2.2,<3" },
     { name = "python-multipart", specifier = ">=0.0.20,<1" },
@@ -86,7 +87,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "pyinstaller", specifier = ">=6,<7" },
     { name = "pytest", specifier = ">=8,<10" },
     { name = "ruff", specifier = ">=0.16.6" },

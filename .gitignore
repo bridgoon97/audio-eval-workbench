@@ -20,3 +20,5 @@ coverage/
 *.egg-info/
 playwright-report/
 test-results/
+release-agent/
+release-agent-build/

@@ -15,12 +15,12 @@ dependencies = [
     "soundfile>=0.13,<1",
     "soxr>=1.1.0",
     "jsonschema>=4.26.0",
+    "httpx>=0.28,<1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8,<10",
-    "httpx>=0.28,<1",
     "pyinstaller>=6,<7",
     "ruff>=0.16.6",
 ]

@@ -48,3 +48,71 @@ with tempfile.TemporaryDirectory(prefix="audio-eval-package-") as data:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+
+
+# ---------- 独立 Agent CLI 包 smoke：全新临时目录，不依赖源码树 ----------
+
+import numpy as np
+import soundfile as sfile
+
+agent_dir = Path("release-agent/audio-eval-agent")
+if agent_dir.is_dir():
+    agent_exe_name = "audio-eval-agent.exe" if sys.platform == "win32" else "audio-eval-agent"
+    agent_exe = agent_dir / agent_exe_name
+    with tempfile.TemporaryDirectory(prefix="audio-eval-agent-smoke-") as work:
+        work_path = Path(work)
+        # 合成 48 kHz 立体声源（重采样路径一并验证；不依赖源码树/系统 Python）。
+        rate, seconds = 48000, 1.0
+        t = np.arange(int(rate * seconds)) / rate
+        tone = (0.4 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        for sub in ("cand-a", "cand-b"):
+            source_dir = work_path / "work" / "sources" / sub
+            source_dir.mkdir(parents=True, exist_ok=True)
+            sfile.write(
+                str(source_dir / "clip.wav"),
+                np.stack([tone] * 2, axis=1),
+                rate,
+                subtype="FLOAT",
+            )
+
+        def agent(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [str(agent_exe), *args], capture_output=True, text=True,
+                encoding="utf-8", timeout=300, check=False,
+            )
+
+        # --help：可执行且帮助可用。
+        help_result = agent("--help")
+        if help_result.returncode != 0 or "manifest-init" not in help_result.stdout:
+            raise RuntimeError(f"agent --help 异常：{help_result.stderr[:200]}")
+
+        # manifest-init → 填充真实路径 → validate → prepare。
+        manifest_path = work_path / "manifest.json"
+        result = agent("manifest-init", "--output", str(manifest_path))
+        if result.returncode != 0:
+            raise RuntimeError(f"agent manifest-init 异常：{result.stderr[:200]}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["task"] = {"title": "打包冒烟", "kind": "算法版本", "mode": "development"}
+        # 模板自带 0–10 秒 segment；冒烟源只有 1 秒，移除以匹配实际素材。
+        manifest["samples"][0].pop("segment", None)
+        manifest["samples"][0]["candidates"][0]["source"] = "work/sources/cand-a/clip.wav"
+        manifest["samples"][0]["candidates"][1]["source"] = "work/sources/cand-b/clip.wav"
+        manifest["conversion"]["resample_to_16000"] = True
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+        validate = agent("validate", str(manifest_path))
+        if validate.returncode != 0:
+            raise RuntimeError(f"agent validate 异常：{validate.stdout[:200]}{validate.stderr[:200]}")
+
+        prepared = work_path / "prepared"
+        prepare = agent("prepare", str(manifest_path), "--output-dir", str(prepared))
+        if prepare.returncode != 0:
+            raise RuntimeError(f"agent prepare 异常：{prepare.stderr[:200]}")
+        mapping = json.loads((prepared / "mapping.json").read_text(encoding="utf-8"))
+        copy_path = prepared / mapping["samples"][0]["candidates"][0]["output"]["path"]
+        info = sfile.info(str(copy_path))
+        if info.samplerate != 16000 or info.channels != 1:
+            raise RuntimeError("prepare 产物不是 16 kHz 单声道")
+        print("独立 Agent CLI 包 smoke 通过（--help / manifest-init / validate / prepare）")
+else:
+    print("未找到独立 Agent CLI 包，跳过其 smoke（打包脚本未运行？）")
