@@ -88,7 +88,8 @@ test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 
   const code = (await credential.inputValue()).trim();
   expect(code).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
   await page.keyboard.press('Escape');
-  await expect(page.locator('.overlay')).toHaveCount(0);
+  // 模态关闭与重渲染在慢 runner 上可能超过 5 秒。
+  await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 15000 });
 
   // 无账号浏览器：申请加入并等待。
   const applicant = await browser.newContext();

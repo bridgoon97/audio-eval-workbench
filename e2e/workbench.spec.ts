@@ -806,7 +806,10 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await page.locator('.sample-item').filter({ hasText: '待删除片段' }).click();
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: '删除片段', exact: true }).click();
-  await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0);
+  // 删除与列表刷新在慢 runner 上可能超过 5 秒。
+  await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0, {
+    timeout: 15000,
+  });
 
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
