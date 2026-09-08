@@ -2222,6 +2222,41 @@ kbd {
   font-size: 11px;
   color: var(--muted);
 }
+
+.trash-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.purge-confirm {
+  border: 1px solid #ad5b2b;
+  border-radius: 8px;
+  padding: 10px 12px;
+  max-width: 320px;
+  font-size: 12px;
+}
+:root[data-theme='dark'] .purge-confirm {
+  border-color: #e8a06c;
+}
+.purge-confirm p {
+  margin: 0 0 8px;
+  line-height: 1.6;
+}
+.purge-confirm .danger {
+  background: #ad5b2b;
+  color: #fff;
+}
+:root[data-theme='dark'] .purge-confirm .danger {
+  background: #e8a06c;
+  color: #243446;
+}
+.danger-text {
+  color: #ad5b2b;
+}
+:root[data-theme='dark'] .danger-text {
+  color: #e8a06c;
+}
+
 .server-info dd {
   margin: 4px 0 16px;
   overflow-wrap: anywhere;
