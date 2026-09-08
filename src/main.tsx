@@ -21,11 +21,12 @@ import {
   Settings2,
   Sun,
   Upload,
+  UserRoundPlus,
   Users,
   X,
 } from 'lucide-react';
 import { AudioEngine } from './audio';
-import { api, type Analysis, type Sample, type Task, type User } from './types';
+import { api, setCsrfToken, type Analysis, type Sample, type Task, type User } from './types';
 import { distinctChoices, formatShare, lagText, shareWidth, type ReportPayload } from './review';
 import packageInfo from '../package.json';
 import { TeamMembers } from './TeamMembers';
@@ -34,6 +35,8 @@ import { BatchImport } from './BatchImport';
 import { CommentThread } from './CommentThread';
 import { ProcessingModal } from './ProcessingModal';
 import { Waveform } from './Waveform';
+import { ApplyFlow } from './ApplyFlow';
+import { AccessAdmin, DeviceAdmin } from './AccessAdmin';
 import './style.css';
 
 const stateName: Record<string, string> = {
@@ -108,6 +111,8 @@ function Modal({
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
+  const [authView, setAuthView] = useState<'login' | 'apply'>('login');
+  const [pendingCount, setPendingCount] = useState(0);
   const [serverVersion, setServerVersion] = useState('');
   const [serverInfo, setServerInfo] = useState<{
     version: string;
@@ -146,6 +151,7 @@ function App() {
     null,
   );
   const [members, setMembers] = useState<User[]>([]);
+  const [deviceTarget, setDeviceTarget] = useState<User | null>(null);
   const [publishSummary, setPublishSummary] = useState<any>(null);
   const [progress, setProgress] = useState<ReportPayload['参与进度'] | null>(null);
   const [report, setReport] = useState<ReportPayload | null>(null);
@@ -167,9 +173,21 @@ function App() {
     setServerVersion(status.version);
     if (!status.needs_setup) {
       try {
-        setUser(await api('/me'));
+        const me = await api<{
+          id: string;
+          name: string;
+          role: string;
+          csrf_token?: string;
+          pending_applications?: number;
+        }>('/me');
+        // CSRF 令牌随 /api/me 下发，供敏感管理操作回传。
+        setCsrfToken(me.csrf_token || '');
+        setPendingCount(me.pending_applications || 0);
+        setUser(me);
         await refreshTasks();
       } catch {
+        setCsrfToken('');
+        setPendingCount(0);
         setUser(null);
       }
     }
@@ -199,6 +217,10 @@ function App() {
       ]);
       if (live.current.user?.id !== current.user.id) return;
       setServerVersion(status.version);
+      if (nextUser.role === 'admin' && typeof (nextUser as any).pending_applications === 'number')
+        setPendingCount((nextUser as any).pending_applications);
+      if (typeof (nextUser as any).csrf_token === 'string')
+        setCsrfToken((nextUser as any).csrf_token);
       setUser((previous) =>
         previous?.role === nextUser.role && previous.name === nextUser.name ? previous : nextUser,
       );
@@ -246,6 +268,8 @@ function App() {
         setSample(null);
         setModal('');
         setTasks([]);
+        setCsrfToken('');
+        setPendingCount(0);
         setError('登录已失效或密码已重置，请重新登录。');
       } else setSyncMessage('连接暂时失败，稍后重试或点击同步');
     } finally {
@@ -442,7 +466,33 @@ function App() {
       </div>
     );
   if (!user)
-    return (
+    return authView === 'apply' ? (
+      <div className="auth-shell">
+        <div className="auth-brand">
+          <AudioLines size={46} />
+          <h1>听鉴</h1>
+          <p>让每一次听感判断，有据可循。</p>
+          <div className="auth-lines">
+            {Array.from({ length: 45 }, (_, i) => (
+              <i
+                key={i}
+                style={{
+                  height: `${15 + Math.abs(Math.sin(i * 0.7) * Math.cos(i * 0.14)) * 100}px`,
+                }}
+              />
+            ))}
+          </div>
+          <span>音频版本比较 · 片段标注 · 团队评测</span>
+        </div>
+        <ApplyFlow
+          onDone={() => {
+            setAuthView('login');
+            void initialize();
+          }}
+          onCancel={() => setAuthView('login')}
+        />
+      </div>
+    ) : (
       <div className="auth-shell">
         <div className="auth-brand">
           <AudioLines size={46} />
@@ -478,7 +528,7 @@ function App() {
           <p className="muted">
             {setup
               ? '初始化密钥显示在主机启动窗口，仅首次使用需要。'
-              : '使用组织者为你创建的账号登录。'}
+              : '使用组织者为你创建的账号登录，或凭邀请凭证申请加入。'}
           </p>
           {setup && (
             <label>
@@ -509,6 +559,20 @@ function App() {
             {busy ? '正在连接…' : setup ? '创建并进入' : '进入工作台'}
             <ArrowRight size={18} />
           </button>
+          {!setup && (
+            <button
+              type="button"
+              className="full apply-entry"
+              onClick={() => {
+                setError('');
+                setNotice('');
+                setAuthView('apply');
+              }}
+            >
+              申请加入评测
+              <ArrowRight size={16} />
+            </button>
+          )}
           <small>音频和评测结果保存在托管这项服务的电脑上。</small>
         </form>
       </div>
@@ -552,6 +616,17 @@ function App() {
         {user.role === 'admin' && (
           <button
             className="nav"
+            onClick={() => setModal('access')}
+            aria-label={`加入与邀请，${pendingCount} 条待审批`}
+          >
+            <UserRoundPlus size={19} />
+            加入与邀请
+            {pendingCount > 0 && <span className="pending-badge">{pendingCount}</span>}
+          </button>
+        )}
+        {user.role === 'admin' && (
+          <button
+            className="nav"
             onClick={() =>
               void run(async () => {
                 setMembers(await api('/users'));
@@ -585,6 +660,9 @@ function App() {
                 void run(async () => {
                   engine?.dispose();
                   await api('/logout', 'POST');
+                  setCsrfToken('');
+                  setPendingCount(0);
+                  setAuthView('login');
                   setUser(null);
                   setTask(null);
                   setSample(null);
@@ -1356,6 +1434,8 @@ function App() {
               publish: '发布独立评测',
               close: '关闭并揭晓',
               users: '团队成员',
+              access: '加入申请与邀请凭证',
+              devices: '登录设备',
               help: '使用指南',
               system: '当前服务信息',
               report: '评测结果',
@@ -1854,8 +1934,18 @@ function App() {
             </>
           )}
           {modal === 'users' && (
-            <TeamMembers members={members} onChange={setMembers} onBusy={setBusy} />
+            <TeamMembers
+              members={members}
+              onChange={setMembers}
+              onBusy={setBusy}
+              onDevices={(m) => {
+                setDeviceTarget(m);
+                setModal('devices');
+              }}
+            />
           )}
+          {modal === 'access' && <AccessAdmin onBusy={setBusy} />}
+          {modal === 'devices' && deviceTarget && <DeviceAdmin target={deviceTarget} />}
           {modal === 'system' && serverInfo && (
             <div className="server-info">
               <p>

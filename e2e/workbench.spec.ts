@@ -2,6 +2,11 @@ import { test, expect } from '@playwright/test';
 import fs from 'node:fs';
 import ts from 'typescript';
 
+// 与 playwright.config 同源：E2E_PORT 覆盖端口（默认 8877）。
+// 手工 browser.newContext()/request 不继承 use.baseURL，必须用同一常量构造绝对地址。
+const port = Number(process.env.E2E_PORT || 8877);
+const lan = `http://127.0.0.1:${port}`;
+
 test('首次使用、合成音播放、片段标注、发布判断和重开', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
@@ -283,7 +288,7 @@ test('自动密码、HTTP 复制回退与现有账号重置', async ({ page, bro
   try {
     expect(
       (
-        await colleague.request.post('http://127.0.0.1:8877/api/login', {
+        await colleague.request.post(`${lan}/api/login`, {
           data: { name: '随机密码同事', password: generated },
         })
       ).status(),
@@ -295,17 +300,17 @@ test('自动密码、HTTP 复制回退与现有账号重置', async ({ page, bro
     await expect(page.getByLabel('本次登录凭证内容')).toHaveValue(
       `听鉴登录地址：http://192.0.2.10:8765\n账号：随机密码同事\n密码：${replacement}`,
     );
-    expect((await colleague.request.get('http://127.0.0.1:8877/api/me')).status()).toBe(401);
+    expect((await colleague.request.get(`${lan}/api/me`)).status()).toBe(401);
     expect(
       (
-        await colleague.request.post('http://127.0.0.1:8877/api/login', {
+        await colleague.request.post(`${lan}/api/login`, {
           data: { name: '随机密码同事', password: generated },
         })
       ).status(),
     ).toBe(401);
     expect(
       (
-        await colleague.request.post('http://127.0.0.1:8877/api/login', {
+        await colleague.request.post(`${lan}/api/login`, {
           data: { name: '随机密码同事', password: replacement },
         })
       ).status(),
@@ -333,7 +338,7 @@ test('同事不刷新网页即可收到角色和任务变化，保留未提交�
   const context = await browser.newContext();
   const colleague = await context.newPage();
   try {
-    await colleague.goto('http://127.0.0.1:8877');
+    await colleague.goto(lan);
     await colleague.getByLabel('账号', { exact: true }).fill('实时同步同事');
     await colleague.getByLabel('密码', { exact: true }).fill('sync-test-password');
     await colleague.getByRole('button', { name: '进入工作台', exact: true }).click();
@@ -444,7 +449,7 @@ test('草稿信息可修正、发布后增补成员、评论按楼层回复', as
       [firstPage, '评论甲'],
       [secondPage, '评论乙'],
     ] as const) {
-      await participant.goto('http://127.0.0.1:8877');
+      await participant.goto(lan);
       await participant.getByLabel('账号', { exact: true }).fill(name);
       await participant.getByLabel('密码', { exact: true }).fill('comment-test-password');
       await participant.getByRole('button', { name: '进入工作台' }).click();
@@ -564,7 +569,7 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
   const second = await browser.newContext();
   try {
     const api = second.request;
-    const base = 'http://127.0.0.1:8877';
+    const base = lan;
     expect(
       (
         await api.post(`${base}/api/login`, {
@@ -772,8 +777,11 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
   await page.getByRole('button', { name: '开始分析' }).click();
+  // 分析在低端/Windows runner 上可能超过默认 5 秒：三处（首次、恢复后、再次应用）
+  // 统一 20 秒显式等待，不降低数值断言。
   await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText(
     '320 samples',
+    { timeout: 20000 },
   );
   await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText('建议');
   // 负 lag 渲染：-157 samples、早到、应用后移，符号不出现 "+-" 或 "--"。
@@ -806,8 +814,11 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
   await page.getByRole('button', { name: '开始分析' }).click();
+  // 分析在低端/Windows runner 上可能超过默认 5 秒：三处（首次、恢复后、再次应用）
+  // 统一 20 秒显式等待，不降低数值断言。
   await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText(
     '320 samples',
+    { timeout: 20000 },
   );
   await page.getByRole('button', { name: '确认应用所选处理' }).click();
   await expect(processedTrackCard.locator('.proc-live')).toContainText('派生试听');
@@ -817,8 +828,11 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
   await page.getByRole('button', { name: '开始分析' }).click();
+  // 分析在低端/Windows runner 上可能超过默认 5 秒：三处（首次、恢复后、再次应用）
+  // 统一 20 秒显式等待，不降低数值断言。
   await expect(page.locator('.proc-row').filter({ hasText: '延迟衰减' })).toContainText(
     '320 samples',
+    { timeout: 20000 },
   );
   await page.getByRole('button', { name: '确认应用所选处理' }).click();
   await expect(processedTrackCard.locator('.proc-live')).toContainText('派生试听');

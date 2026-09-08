@@ -2238,3 +2238,144 @@ kbd {
     gap: 8px;
   }
 }
+
+/* 自助申请与免密设备登录 */
+.apply-entry {
+  margin-top: 2px;
+}
+.apply-flow {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 430px;
+  margin: auto;
+  padding: 28px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  width: min(430px, 100%);
+}
+.apply-flow h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.apply-flow code {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  color: var(--accent);
+}
+.apply-notes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  display: grid;
+  gap: 6px;
+}
+.pending-badge {
+  background: var(--accent);
+  color: #fff;
+  border-radius: 9px;
+  font-size: 11px;
+  padding: 1px 7px;
+  margin-left: auto;
+}
+.nav .pending-badge {
+  color: #fff;
+}
+.access-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.access-tabs button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.access-tabs button.selected {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--tint);
+}
+.access-filters {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.access-filters button {
+  padding: 6px 12px;
+  border-radius: 999px;
+}
+.access-filters button.selected {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--tint);
+}
+.application-row,
+.invite-row,
+.device-row {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+.application-row {
+  flex-wrap: wrap;
+}
+.application-main {
+  display: grid;
+  gap: 4px;
+  min-width: 220px;
+  flex: 1;
+}
+.application-main small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.application-actions {
+  display: flex;
+  gap: 8px;
+}
+.approve-form {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+  border-top: 1px dashed var(--line);
+  padding-top: 12px;
+}
+.invite-row.disabled {
+  opacity: 0.55;
+}
+.invite-row div {
+  display: grid;
+  gap: 4px;
+}
+.invite-row small {
+  color: var(--muted);
+}
+.invite-numbers {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.invite-list {
+  margin-top: 18px;
+}
+.device-row.revoked {
+  opacity: 0.6;
+}
+.device-row div {
+  display: grid;
+  gap: 4px;
+}
+.device-row small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
