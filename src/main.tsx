@@ -27,12 +27,13 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, setCsrfToken, type Analysis, type Sample, type Task, type User } from './types';
-import { distinctChoices, formatShare, shareWidth, type ReportPayload } from './review';
+import { distinctChoices, formatShare, lagText, shareWidth, type ReportPayload } from './review';
 import packageInfo from '../package.json';
 import { TeamMembers } from './TeamMembers';
 import { UserGuide } from './UserGuide';
 import { BatchImport } from './BatchImport';
 import { CommentThread } from './CommentThread';
+import { ProcessingModal } from './ProcessingModal';
 import { Waveform } from './Waveform';
 import { ApplyFlow } from './ApplyFlow';
 import { AccessAdmin, DeviceAdmin } from './AccessAdmin';
@@ -151,6 +152,7 @@ function App() {
   );
   const [members, setMembers] = useState<User[]>([]);
   const [deviceTarget, setDeviceTarget] = useState<User | null>(null);
+  const [publishSummary, setPublishSummary] = useState<any>(null);
   const [progress, setProgress] = useState<ReportPayload['参与进度'] | null>(null);
   const [report, setReport] = useState<ReportPayload | null>(null);
   const [dark, setDark] = useState(localStorage.getItem('theme') === 'dark');
@@ -899,6 +901,7 @@ function App() {
                       onClick={() =>
                         void run(async () => {
                           setMembers(await api('/users'));
+                          setPublishSummary(await api('/tasks/' + task.id + '/processing-summary'));
                           setModal('publish');
                         })
                       }
@@ -1008,7 +1011,15 @@ function App() {
                       </div>
                       <div className="view-tabs">
                         {task.can_manage && task.status === 'draft' && (
-                          <button onClick={() => setModal('edit-sample')}>编辑片段</button>
+                          <>
+                            <button onClick={() => setModal('edit-sample')}>编辑片段</button>
+                            <button
+                              className={modal === 'processing' ? 'selected' : ''}
+                              onClick={() => setModal('processing')}
+                            >
+                              对齐与响度
+                            </button>
+                          </>
                         )}
                         <button
                           className={!spectrum ? 'selected' : ''}
@@ -1085,6 +1096,19 @@ function App() {
                               style={{ left: `${duration ? (position / duration) * 100 : 0}%` }}
                             />
                           </div>
+                          {tr.处理 && (
+                            <div className="track-meta proc-live">
+                              <span className="proc-badge">
+                                派生试听 ·{' '}
+                                {tr.处理.模式 === '对齐+响度' || tr.处理.模式 === '对齐'
+                                  ? `对齐 ${lagText(tr.处理.lag).samples}（${lagText(tr.处理.lag).direction}）`
+                                  : '时间位置未变'}
+                                {tr.处理.模式 === '对齐+响度' || tr.处理.模式 === '响度'
+                                  ? ` · 活动段 RMS ${tr.处理.gain_db > 0 ? '+' : ''}${tr.处理.gain_db.toFixed(2)} dB`
+                                  : ''}
+                              </span>
+                            </div>
+                          )}
                           {tr.meta && (
                             <div className="track-meta">
                               <span>RMS {tr.meta.rms_dbfs.toFixed(1)} dBFS</span>
@@ -1402,6 +1426,7 @@ function App() {
               members: '受邀评测者',
               progress: '评测进度',
               batch: '按版本目录批量导入',
+              processing: '对齐与响度（草稿）',
               'edit-track': '管理草稿候选',
               sample: '添加音频片段',
               track: '导入候选版本',
@@ -1429,6 +1454,17 @@ function App() {
               onDone={async () => {
                 await openTask(task.id);
                 setTasks(await api('/tasks'));
+              }}
+            />
+          )}
+          {modal === 'processing' && sample && (
+            <ProcessingModal
+              sample={sample}
+              onBusy={setBusy}
+              onDone={async () => {
+                await openTask(task!.id);
+                setModal('');
+                setNotice('处理已更新；试听已切换到对应资产。');
               }}
             />
           )}
@@ -1818,7 +1854,38 @@ function App() {
                 });
               }}
             >
-              <p>发布后锁定输入文件、候选版本和比较模式。关闭任务后统一揭晓。</p>
+              <p>发布后锁定输入文件、候选版本、比较模式与播放处理。关闭任务后统一揭晓。</p>
+              {publishSummary && (
+                <div className="publish-processing">
+                  <h3>播放处理确认</h3>
+                  {publishSummary['片段'].map((ps: any) => (
+                    <div key={ps.片段ID}>
+                      <strong>
+                        {ps.片段}
+                        {ps.混合处理 && <span className="proc-badge warn">存在混合处理口径</span>}
+                      </strong>
+                      <div className="publish-processing-lines">
+                        {ps.候选.map((e: any) => (
+                          <span key={e.track_id}>
+                            {e.名称}：{e.模式}
+                          </span>
+                        ))}
+                      </div>
+                      {ps.候选.some((e: any) => e.拒绝.length > 0) && (
+                        <div className="publish-processing-rejected">
+                          {ps.候选.flatMap((e: any) =>
+                            e.拒绝.map((r: any) => (
+                              <span key={e.track_id + r.判据}>
+                                {r.候选} {r.判据}建议被拒绝（{r.拒绝码}）
+                              </span>
+                            )),
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
               <h3>分配给同事</h3>
               {members
                 .filter((m) => m.id !== user.id)

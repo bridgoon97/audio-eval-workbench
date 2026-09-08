@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { distinctChoices, formatShare, shareWidth } from './review';
+import { distinctChoices, formatShare, lagText, shareWidth } from './review';
 
 describe('复盘展示口径', () => {
   it('百分比明确写出分母（该片段有效提交人数）', () => {
@@ -27,5 +27,29 @@ describe('复盘展示口径', () => {
       ]),
     ).toBe(2);
     expect(distinctChoices([])).toBe(0);
+  });
+});
+
+describe('对齐 lag 展示符号与方向', () => {
+  it('+320 表示候选晚到、应用前移，samples 与 ms 同号', () => {
+    const text = lagText(320);
+    expect(text.samples).toBe('+320 samples');
+    expect(text.ms).toBe('+20.0 ms');
+    expect(text.direction).toBe('候选晚到，应用时前移');
+    expect(text.samples.includes('+-')).toBe(false);
+  });
+  it('-157 表示候选早到、应用后移', () => {
+    const text = lagText(-157);
+    expect(text.samples).toBe('-157 samples');
+    expect(text.ms).toBe('-9.8 ms');
+    expect(text.direction).toBe('候选早到，应用时后移');
+    expect(text.samples.includes('--')).toBe(false);
+  });
+  it('0 表示无需移动', () => {
+    expect(lagText(0)).toEqual({
+      samples: '0 samples',
+      ms: '0 ms',
+      direction: '无需移动',
+    });
   });
 });

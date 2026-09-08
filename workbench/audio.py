@@ -8,6 +8,22 @@ import numpy as np
 import soundfile as sf
 
 
+def encode_float_wav(x, sr: int = 16000) -> bytes:
+    """显式编码单通道 IEEE float WAV；只含固定格式信息，输出字节可重复。"""
+    x = np.asarray(x, dtype=np.float32)
+    payload = x.astype("<f4").tobytes()
+    chunks = (
+        b"fmt "
+        + struct.pack("<IHHIIHH", 16, 3, 1, sr, sr * 4, 4, 32)
+        + b"fact"
+        + struct.pack("<II", 4, len(x))
+        + b"data"
+        + struct.pack("<I", len(payload))
+        + payload
+    )
+    return b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks
+
+
 def decode_audio(raw: bytes, channel: int = 0):
     try:
         info = sf.info(io.BytesIO(raw))
@@ -25,19 +41,7 @@ def decode_audio(raw: bytes, channel: int = 0):
     x = x[:, channel]
     if not np.isfinite(x).all():
         raise ValueError("音频含 NaN 或 Inf，无法导入")
-    # 显式编码单通道 IEEE float WAV，避免编码器 PEAK 块写入当前时间。
-    # fact 块保存帧数；只含固定格式信息与原始浮点采样，输出可重复。
-    payload = x.astype("<f4").tobytes()
-    chunks = (
-        b"fmt "
-        + struct.pack("<IHHIIHH", 16, 3, 1, sr, sr * 4, 4, 32)
-        + b"fact"
-        + struct.pack("<II", 4, len(x))
-        + b"data"
-        + struct.pack("<I", len(payload))
-        + payload
-    )
-    asset = b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks
+    asset = encode_float_wav(x, sr)
     return asset, {
         "sha256": hashlib.sha256(raw).hexdigest(),
         "asset_sha256": hashlib.sha256(asset).hexdigest(),
