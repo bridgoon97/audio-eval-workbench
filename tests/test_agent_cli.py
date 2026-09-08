@@ -219,7 +219,7 @@ def test_validate_rejects_length_mismatch_and_non16k_without_license(tmp_path):
     write_wav(tmp_path / "sources" / "b" / "clip.wav", 16000, 2.0, 1)
     manifest = base_manifest({"cand-a": "sources/a/clip.wav", "cand-b": "sources/b/clip.wav"})
     problems = validate_manifest(manifest, tmp_path)
-    assert any("长度不一致" in p for p in problems)
+    assert any("目标样本数不一致" in p for p in problems)
 
     # 非 16 kHz 源：未显式许可时拒绝；显式许可且长度一致时通过。
     write_wav(tmp_path / "sources" / "a" / "48k.wav", 48000, 1.0, 1)
@@ -328,11 +328,13 @@ def test_prepare_rejects_non_empty_output_and_output_inside_sources(tmp_path):
     (out / "已有文件.txt").write_text("x", encoding="utf-8")
     with pytest.raises(AgentError, match="非空"):
         prepare_assets(manifest, work, out)
-    # 输出目录与候选源目录重合或包含它：拒绝。
+    # 输出目录与候选源目录：重合、祖先、后代三个方向都拒绝。
     with pytest.raises(AgentError, match="覆盖候选源目录"):
-        prepare_assets(manifest, work, work / "sources")
+        prepare_assets(manifest, work, work / "sources")  # 重合
     with pytest.raises(AgentError, match="覆盖候选源目录"):
-        prepare_assets(manifest, work, work)
+        prepare_assets(manifest, work, work)  # 输出是源目录的祖先
+    with pytest.raises(AgentError, match="覆盖候选源目录"):
+        prepare_assets(manifest, work, work / "sources" / "a" / "prepared")  # 后代
 
 
 def test_prepare_requires_explicit_resample_license(tmp_path):
@@ -517,7 +519,7 @@ def test_apply_stops_on_tampered_source_or_manifest(tmp_path, server):
     source = work / "sources" / "a" / "clip.wav"
     data, rate = sf.read(str(source))
     sf.write(str(source), (data * 0.5).astype(np.float32), rate, subtype="FLOAT")
-    with pytest.raises(AgentError, match="差异"):
+    with pytest.raises(AgentError, match="源文件 SHA256 与 mapping 不符"):
         agent_tasks.run_apply(
             manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
         )
@@ -862,3 +864,182 @@ def test_end_to_end_command_flow(tmp_path, server):
     state = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
     detail = client.get(f"/api/tasks/{state['task_id']}").json()
     assert len(detail["samples"]) == 1 and detail["samples"][0]["track_count"] == 2
+
+
+def test_apply_processing_success_then_publish(tmp_path, server):
+    """失败项 5：可判据的正向处理成功后，派生轨按回执 SHA 复核并成功发布。"""
+    base, app = server
+    # 参考 4 秒宽带（白噪声 + 扫频，确定性种子）；候选 = 延迟 320 采样 + 增益 0.7。
+    rate = 16000
+    t = np.arange(int(rate * 4)) / rate
+    rng = np.random.default_rng(12345)
+    ref = (0.6 * rng.standard_normal(len(t)) + 0.3 * np.sin(
+        2 * np.pi * (40 * t + (900 * t**2) / 2)
+    )).astype(np.float32)
+    ref = (ref / np.max(np.abs(ref)) * 0.5).astype(np.float32)  # 与对齐 E2E 相同的 0.5 峰值
+    delayed = np.zeros_like(ref)
+    delayed[320:] = ref[:-320] * 0.7
+    work = tmp_path / "work"
+    (work / "sources" / "a").mkdir(parents=True, exist_ok=True)
+    (work / "sources" / "b").mkdir(parents=True, exist_ok=True)
+    sf.write(str(work / "sources" / "a" / "clip.wav"), ref, rate, subtype="FLOAT")
+    sf.write(str(work / "sources" / "b" / "clip.wav"), delayed, rate, subtype="FLOAT")
+    manifest = base_manifest({"cand-a": "sources/a/clip.wav", "cand-b": "sources/b/clip.wav"})
+    manifest["samples"][0]["candidates"][1]["apply_alignment"] = True
+    manifest["samples"][0]["candidates"][1]["apply_loudness"] = True
+    manifest["publish"] = True
+    manifest_path = work / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "prepared"
+    prepare_assets(manifest, work, out)
+    state = tmp_path / "state.json"
+
+    # 首次编排（未加 --publish）：处理成功、保留草稿，回执含 lag/gain。
+    receipt = agent_tasks.run_apply(
+        manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
+    )
+    assert receipt["published"] is False
+    record = receipt["processing"][0]
+    assert record["applied"] is True
+    item = record["applied_items"][0]
+    assert item["lag"] == 320 and abs(item["gain_db"]) > 0
+    derived_sha = item["派生资产SHA256"]
+    state_payload = json.loads(state.read_text(encoding="utf-8"))
+    track_id = state_payload["samples"]["sample-001"]["tracks"]["cand-b"]["track_id"]
+
+    # 发布（双确认齐备）：派生 SHA 复核通过后发布成功。
+    receipt = agent_tasks.run_apply(
+        manifest_path,
+        base,
+        "编排组织者",
+        "organizer-agent-pass",
+        state,
+        out / "mapping.json",
+        publish_flag=True,
+    )
+    assert receipt["published"] is True
+    client = TestClient(app)
+    client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
+    assert client.get(f"/api/tasks/{receipt['task_id']}").json()["status"] == "active"
+    # 下载派生轨核对 SHA 与回执一致。
+    downloaded = client.get(f"/api/audio/{track_id}")
+    import hashlib
+
+    assert hashlib.sha256(downloaded.content).hexdigest() == derived_sha
+
+
+def test_processing_rejection_evidence_survives_retry(tmp_path, server):
+    """失败项 6：部分应用+拒绝 → 重跑 --publish 仍被持久化证据阻止。"""
+    base, app = server
+    # 三候选：参考宽带、延迟候选（可处理）、周期纯音（对齐拒绝）。
+    rate = 16000
+    t = np.arange(int(rate * 4)) / rate
+    rng = np.random.default_rng(6789)
+    ref = (0.6 * rng.standard_normal(len(t)) + 0.3 * np.sin(
+        2 * np.pi * (40 * t + (900 * t**2) / 2)
+    )).astype(np.float32)
+    delayed = np.zeros_like(ref)
+    delayed[160:] = ref[:-160] * 0.8
+    pure = (0.5 * np.sin(2 * np.pi * 300 * t)).astype(np.float32)
+    work = tmp_path / "work"
+    for sub in ("a", "b", "c"):
+        (work / "sources" / sub).mkdir(parents=True, exist_ok=True)
+    sf.write(str(work / "sources" / "a" / "clip.wav"), ref, rate, subtype="FLOAT")
+    sf.write(str(work / "sources" / "b" / "clip.wav"), delayed, rate, subtype="FLOAT")
+    sf.write(str(work / "sources" / "c" / "clip.wav"), pure, rate, subtype="FLOAT")
+    manifest = base_manifest(
+        {
+            "cand-a": "sources/a/clip.wav",
+            "cand-b": "sources/b/clip.wav",
+            "cand-c": "sources/c/clip.wav",
+        }
+    )
+    manifest["samples"][0]["candidates"][1]["apply_alignment"] = True
+    manifest["samples"][0]["candidates"][2]["apply_alignment"] = True
+    manifest["publish"] = True
+    manifest_path = work / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "prepared"
+    prepare_assets(manifest, work, out)
+    state = tmp_path / "state.json"
+
+    # 首次：部分成功（延迟候选）+ 拒绝（纯音）→ 默认停止。
+    with pytest.raises(AgentError, match="拒绝"):
+        agent_tasks.run_apply(
+            manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
+        )
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    record = payload["processing"]["sample-001"]
+    assert record["applied"] is True  # 部分成功已持久化
+    assert record["rejections"] and "纯音" not in "".join(record["rejections"])
+
+    # 第二次：即便 --publish 也被持久化证据阻止。
+    with pytest.raises(AgentError, match="混合口径"):
+        agent_tasks.run_apply(
+            manifest_path,
+            base,
+            "编排组织者",
+            "organizer-agent-pass",
+            state,
+            out / "mapping.json",
+            publish_flag=True,
+        )
+    client = TestClient(app)
+    client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
+    assert client.get(f"/api/tasks/{payload['task_id']}").json()["status"] == "draft"
+
+
+def test_publish_without_implicit_owner_and_rejects_disabled(tmp_path, server):
+    """失败项 7：owner 不隐式受邀；停用参与者解析被拒绝。"""
+    base, app = server
+    import httpx
+
+    with httpx.Client(base_url=base) as probe:
+        probe.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
+        csrf = probe.get("/api/me").json()["csrf_token"]
+        probe.post(
+            "/api/users",
+            json={"name": "受邀同事", "password": "invited-agent-pass"},
+            headers={"x-csrf-token": csrf},
+        )
+        users = probe.get("/api/users").json()
+        invited_id = next(u["id"] for u in users if u["name"] == "受邀同事")
+        # 停用该账号。
+        probe.post(
+            f"/api/users/{invited_id}/status",
+            json={"active": False},
+            headers={"x-csrf-token": csrf},
+        )
+
+    manifest_path, manifest, out = prepare_media_and_mapping(tmp_path)
+    # 停用参与者：解析拒绝。
+    manifest["participants"] = [{"name": "受邀同事"}]
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    state = tmp_path / "state-disabled.json"
+    with pytest.raises(AgentError, match="已停用"):
+        agent_tasks.run_apply(
+            manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
+        )
+    # 服务端无任务副作用。
+    client = TestClient(app)
+    client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
+    assert client.get("/api/tasks").json() == []
+
+    # 空 participants + 发布：受邀名单为空；owner 仍可管理但不承担评测义务。
+    manifest["participants"] = []
+    manifest["publish"] = True
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    state2 = tmp_path / "state-empty.json"
+    receipt = agent_tasks.run_apply(
+        manifest_path,
+        base,
+        "编排组织者",
+        "organizer-agent-pass",
+        state2,
+        out / "mapping.json",
+        publish_flag=True,
+    )
+    assert receipt["published"] is True
+    detail = client.get(f"/api/tasks/{receipt['task_id']}").json()
+    assert detail["review_assignments"] == []
+    assert detail["can_manage"] is True  # owner 保留管理权

@@ -209,8 +209,9 @@ def _resolve_source(base_dir: Path, source: str) -> Path:
 def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
     """离线校验（无服务副作用）：返回问题列表；空列表表示可用。
 
-    检查：候选文件存在且可解码、每题候选数 2–6、同题长度一致、通道在源内、
-    stable key 唯一、发布所需字段完整、参考候选唯一、非 16 kHz 源需显式许可。
+    长度口径：比较的是最终比较区间的 16 kHz 目标样本数——
+    无 segment 时由 源帧数/源采样率 推导，有 segment 时由区间时长推导；
+    不比较原始总帧数，避免把"同一时长、不同采样率"误判为不一致。
     """
     problems: list[str] = []
     sample_keys: set[str] = set()
@@ -220,12 +221,20 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
     for sample in samples:
         key = sample["key"]
         if key in sample_keys:
-            problems.append(f"片段 stable key 重复：{key}")
+            problems.append(f"片段 stable key 重复：{key}（后续重复项已跳过）")
+            continue
         sample_keys.add(key)
         candidate_keys: set[str] = set()
-        lengths: dict[int, int] = {}
+        targets: dict[int, list[str]] = {}
         references = 0
         needs_resample: list[str] = []
+        segment = sample.get("segment")
+        if segment and segment["start_seconds"] >= segment["end_seconds"]:
+            problems.append(
+                f"{key}: segment 起点必须小于终点"
+                f"（{segment['start_seconds']} ≥ {segment['end_seconds']}）"
+            )
+            continue
         for candidate in sample["candidates"]:
             ckey = candidate["key"]
             if ckey in candidate_keys:
@@ -254,13 +263,32 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
                 problems.append(
                     f"{key}/{ckey}: channel={candidate['channel']} 超出源通道数 {info.channels}"
                 )
-            lengths.setdefault(info.frames, 0)
-            lengths[info.frames] += 1
+            if segment:
+                # 区间必须完整落在每个源内：按该源的采样率精确换算帧边界。
+                start_frame = round(segment["start_seconds"] * info.samplerate)
+                end_frame = round(segment["end_seconds"] * info.samplerate)
+                source_seconds = info.frames / info.samplerate
+                if start_frame < 0 or end_frame > info.frames or start_frame >= end_frame:
+                    problems.append(
+                        f"{key}/{ckey}: segment {segment['start_seconds']}–"
+                        f"{segment['end_seconds']} 秒超出源长度"
+                        f"（源 {source_seconds:.3f} 秒 / {info.frames} 帧 @ {info.samplerate} Hz）"
+                    )
+                    continue
+                target = round(
+                    (segment["end_seconds"] - segment["start_seconds"]) * TARGET_RATE
+                )
+            else:
+                target = round(info.frames / info.samplerate * TARGET_RATE)
+            targets.setdefault(target, []).append(ckey)
         if len(sample["candidates"]) < 2 or len(sample["candidates"]) > 6:
             problems.append(f"{key}: 候选数必须是 2–6，当前 {len(sample['candidates'])}")
-        if len(lengths) > 1:
-            detail = "、".join(f"{frames} 帧 ×{count}" for frames, count in lengths.items())
-            problems.append(f"{key}: 同题候选长度不一致（{detail}）；请先向用户确认截取规则")
+        if len(targets) > 1:
+            detail = "、".join(f"{frames} samples（{names}）" for frames, names in sorted(targets.items()))
+            problems.append(
+                f"{key}: 同题候选的最终目标样本数不一致（{detail}）；"
+                "请先向用户确认截取规则或源时长"
+            )
         if references != 1 and any(
             c.get("apply_alignment") or c.get("apply_loudness")
             for c in sample["candidates"]
@@ -308,8 +336,10 @@ def prepare_assets(
         for candidate in sample["candidates"]:
             source = _resolve_source(base_dir, candidate["source"])
             source_dir = source.parent.resolve()
-            if output_resolved == source_dir or source_dir.is_relative_to(
-                output_resolved
+            if (
+                output_resolved == source_dir
+                or output_resolved.is_relative_to(source_dir)  # 输出在源目录内部
+                or source_dir.is_relative_to(output_resolved)  # 输出是源目录祖先
             ):
                 raise AgentError(
                     f"输出目录 {output} 会覆盖候选源目录（{source_dir}）；请使用独立目录"
@@ -410,6 +440,209 @@ def prepare_assets(
             )
         mapping["samples"].append(entry)
     atomic_write_json(output / "mapping.json", mapping)
+    return mapping
+
+
+# ---------- mapping 校验（与 manifest/源文件重新核对）----------
+
+
+MAPPING_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "听鉴 Agent 素材准备映射",
+    "type": "object",
+    "required": ["schema_version", "target_rate", "samples"],
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"const": 1},
+        "target_rate": {"const": TARGET_RATE},
+        "resample_licensed": {"type": "boolean"},
+        "conversion_note": {"type": "string"},
+        "samples": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["key", "name", "candidates"],
+                "additionalProperties": False,
+                "properties": {
+                    "key": {"type": "string"},
+                    "name": {"type": "string"},
+                    "segment": {"type": ["object", "null"]},
+                    "candidates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["key", "source", "output", "transforms"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "key": {"type": "string"},
+                                "source": {
+                                    "type": "object",
+                                    "required": [
+                                        "path",
+                                        "sha256",
+                                        "samplerate",
+                                        "channels",
+                                        "frames",
+                                        "channel_used",
+                                        "segment_frames",
+                                    ],
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                                        "samplerate": {"type": "integer", "minimum": 1},
+                                        "channels": {"type": "integer", "minimum": 1},
+                                        "frames": {"type": "integer", "minimum": 0},
+                                        "channel_used": {"type": "integer", "minimum": 0},
+                                        "segment_frames": {
+                                            "type": ["array", "null"], "minItems": 2, "maxItems": 2
+                                        },
+                                    },
+                                },
+                                "output": {
+                                    "type": "object",
+                                    "required": [
+                                        "path",
+                                        "sha256",
+                                        "pcm_sha256",
+                                        "samplerate",
+                                        "channels",
+                                        "frames",
+                                    ],
+                                    "additionalProperties": False,
+                                    "properties": {
+                                        "path": {"type": "string"},
+                                        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                                        "pcm_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                                        "samplerate": {"type": "integer", "minimum": 1},
+                                        "channels": {"type": "integer", "minimum": 1},
+                                        "frames": {"type": "integer", "minimum": 0},
+                                    },
+                                },
+                                "transforms": {"type": "array"},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+}
+
+
+def _safe_relative(mapping_dir: Path, rel: str) -> Path:
+    """mapping 内相对路径的安全解析：拒绝绝对路径与目录逃逸（含 symlink）。"""
+    if Path(rel).is_absolute():
+        raise AgentError(f"mapping 输出路径必须是相对路径，拒绝绝对路径：{rel}")
+    resolved = (mapping_dir / rel).resolve()
+    if not resolved.is_relative_to(mapping_dir.resolve()):
+        raise AgentError(
+            f"mapping 输出路径逃逸出 mapping 目录：{rel}"
+        )
+    return resolved
+
+
+def load_and_check_mapping(
+    mapping_path: str | Path, manifest: dict[str, Any], base_dir: Path
+) -> dict[str, Any]:
+    """加载 mapping 并逐项与 manifest 及源文件重新核对；返回 mapping。
+
+    检查：schema、key 集合与 manifest 精确一一对应（无缺失/额外/重复）、
+    output 路径安全、源文件 SHA/通道/采样率与当前源一致、
+    副本容器 SHA/PCM SHA/采样率/通道/帧数与 mapping 实测一致。
+    """
+    path = Path(mapping_path)
+    if not path.is_file():
+        raise AgentError(f"mapping.json 不存在：{path}")
+    try:
+        mapping = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AgentError(f"mapping.json 无法读取或不是合法 JSON：{exc}") from exc
+    try:
+        jsonschema.validate(mapping, MAPPING_SCHEMA)
+    except jsonschema.ValidationError as exc:
+        location = ".".join(str(part) for part in exc.absolute_path) or "(根)"
+        raise AgentError(f"mapping 不符合 schema（{location}）：{exc.message}") from exc
+    mapping_dir = path.resolve().parent
+
+    manifest_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    for sample in manifest["samples"]:
+        for candidate in sample["candidates"]:
+            manifest_pairs[(sample["key"], candidate["key"])] = {
+                "sample": sample,
+                "candidate": candidate,
+            }
+    mapping_pairs: dict[tuple[str, str], dict[str, Any]] = {}
+    seen: set[tuple[str, str]] = set()
+    for entry in mapping["samples"]:
+        for candidate in entry["candidates"]:
+            pair = (entry["key"], candidate["key"])
+            if pair in seen:
+                raise AgentError(f"mapping 存在重复条目：{pair[0]}/{pair[1]}")
+            seen.add(pair)
+            mapping_pairs[pair] = {"sample_entry": entry, "candidate": candidate}
+    missing = sorted(set(manifest_pairs) - set(mapping_pairs))
+    extra = sorted(set(mapping_pairs) - set(manifest_pairs))
+    if missing:
+        raise AgentError(
+            "mapping 缺少 manifest 中的条目：" + "、".join(f"{a}/{b}" for a, b in missing)
+        )
+    if extra:
+        raise AgentError(
+            "mapping 含有 manifest 之外的额外条目：" + "、".join(f"{a}/{b}" for a, b in extra)
+        )
+
+    import numpy as np
+    import soundfile as sf
+
+    for (sample_key, cand_key), info in manifest_pairs.items():
+        candidate = info["candidate"]
+        mapping_candidate = mapping_pairs[(sample_key, cand_key)]["candidate"]
+        source = _resolve_source(base_dir, candidate["source"])
+        actual_source_sha = sha256_file(source)
+        if actual_source_sha != mapping_candidate["source"]["sha256"]:
+            raise AgentError(
+                f"{sample_key}/{cand_key}: 源文件 SHA256 与 mapping 不符"
+                f"（当前 {actual_source_sha[:12]}…，mapping {mapping_candidate['source']['sha256'][:12]}…）；"
+                "源文件在 prepare 后被改动"
+            )
+        source_info = sf.info(str(source))
+        if source_info.samplerate != mapping_candidate["source"]["samplerate"]:
+            raise AgentError(f"{sample_key}/{cand_key}: 源采样率与 mapping 不符")
+        if source_info.channels != mapping_candidate["source"]["channels"]:
+            raise AgentError(f"{sample_key}/{cand_key}: 源通道数与 mapping 不符")
+        if source_info.frames != mapping_candidate["source"]["frames"]:
+            raise AgentError(f"{sample_key}/{cand_key}: 源帧数与 mapping 不符")
+        if candidate["channel"] != mapping_candidate["source"]["channel_used"]:
+            raise AgentError(
+                f"{sample_key}/{cand_key}: manifest channel 与 mapping channel_used 不一致"
+            )
+        manifest_segment = info["sample"].get("segment")
+        mapping_segment = mapping_pairs[(sample_key, cand_key)]["sample_entry"].get(
+            "segment"
+        )
+        if (manifest_segment or None) != (mapping_segment or None):
+            raise AgentError(f"{sample_key}/{cand_key}: segment 与 mapping 不一致")
+
+        copy_path = _safe_relative(mapping_dir, mapping_candidate["output"]["path"])
+        if not copy_path.is_file():
+            raise AgentError(f"合规副本缺失：{copy_path}")
+        actual_copy_sha = sha256_file(copy_path)
+        if actual_copy_sha != mapping_candidate["output"]["sha256"]:
+            raise AgentError(f"{sample_key}/{cand_key}: 副本 SHA256 与 mapping 不符")
+        copy_info = sf.info(str(copy_path))
+        if (
+            copy_info.samplerate != mapping_candidate["output"]["samplerate"]
+            or copy_info.channels != mapping_candidate["output"]["channels"]
+            or copy_info.frames != mapping_candidate["output"]["frames"]
+        ):
+            raise AgentError(f"{sample_key}/{cand_key}: 副本采样率/通道/帧数与 mapping 不符")
+        samples, _ = sf.read(str(copy_path), dtype="float32")
+        pcm_sha = hashlib.sha256(
+            np.asarray(samples, dtype=np.float32).tobytes()
+        ).hexdigest()
+        if pcm_sha != mapping_candidate["output"]["pcm_sha256"]:
+            raise AgentError(f"{sample_key}/{cand_key}: 副本逐样本 SHA 与 mapping 不符")
     return mapping
 
 
@@ -540,6 +773,16 @@ def check_server_url(url: str, allow_insecure_http: bool) -> str:
     return url.rstrip("/")
 
 
+def _decode_audio_bytes(payload: bytes):
+    """把服务端音频字节解码为 float32 样本（用于逐样本复核）。"""
+    import io as _io
+
+    import soundfile as _sf
+
+    samples, _rate = _sf.read(_io.BytesIO(payload), dtype="float32")
+    return samples, _rate
+
+
 class AgentClient:
     """面向编排的薄客户端：会话/CSRF 只在内存；错误不回显凭据。"""
 
@@ -664,6 +907,9 @@ def resolve_participants(
             problems.append(f"参与者不存在：{name}")
         elif len(matches) > 1:
             problems.append(f"参与者歧义（{name} 命中 {len(matches)} 个账号）")
+        elif not matches[0].get("active", 1):
+            # 停用账号无法登录，不能作为受邀评测者发布。
+            problems.append(f"参与者账号已停用：{name}；请先由管理员启用")
         else:
             resolved[name] = matches[0]["id"]
     if problems:
@@ -712,7 +958,8 @@ def run_apply(
     """把 manifest 编排到正在运行的服务；返回 JSON 回执。
 
     幂等：同一 manifest + state 重试不会重复创建任务/片段/候选；
-    每步成功立即原子落盘；manifest 关键配置或源文件变化时停止并列出差异。
+    每步成功立即原子落盘；manifest、源文件或 mapping 变化时停止并列出差异。
+    所有 mapping/state/参与者校验都在创建服务端任务之前完成。
     """
     manifest, base = load_manifest(manifest_path)
     problems = validate_manifest(manifest, base)
@@ -724,6 +971,34 @@ def run_apply(
     state = ApplyState.load(Path(state_path))
     if state is None:
         state = ApplyState(Path(state_path))
+
+    # mapping 加载与全量核对是纯本地操作，必须在创建任何服务端副作用之前。
+    if state.payload.get("mapping_sha256") is None:
+        if mapping_path is None:
+            raise AgentError("首次 apply 需要 --mapping 指向 prepare 生成的 mapping.json")
+        mapping_file = Path(mapping_path)
+        mapping = load_and_check_mapping(mapping_file, manifest, base)
+        state.payload["mapping_path"] = str(mapping_file.resolve())
+        state.payload["mapping_sha256"] = sha256_file(mapping_file)
+    else:
+        mapping_file = Path(state.payload["mapping_path"])
+        if mapping_path is not None and Path(mapping_path).resolve() != mapping_file.resolve():
+            raise AgentError(
+                "本次 --mapping 与 state 记录的 mapping 文件不同；"
+                "mapping 不允许中途更换。如确需更换，请使用新的 state 文件"
+            )
+        recorded_sha = state.payload["mapping_sha256"]
+        current_sha = sha256_file(mapping_file) if mapping_file.is_file() else None
+        if current_sha is None:
+            raise AgentError(f"mapping.json 不存在：{mapping_file}")
+        if current_sha != recorded_sha:
+            raise AgentError(
+                "mapping.json 与首次 apply 时的内容不一致（SHA "
+                f"{recorded_sha[:12]}… → {current_sha[:12]}…）；"
+                "mapping 不允许中途修改。请恢复文件或使用新的 state 与输出目录"
+            )
+        mapping = load_and_check_mapping(mapping_file, manifest, base)
+    mapping_by_key = {entry["key"]: entry for entry in mapping["samples"]}
 
     client = AgentClient(url)
     try:
@@ -754,6 +1029,13 @@ def run_apply(
                 )
         state.save()
 
+        # 参与者解析与校验（含停用账号拒绝）在创建任务之前完成，避免留下空任务副作用。
+        participants_resolved: dict[str, str] = dict(state.payload["participants"])
+        if manifest.get("participants") and not participants_resolved:
+            participants_resolved = resolve_participants(client, manifest)
+            state.payload["participants"] = participants_resolved
+            state.save()
+
         # 任务：首次创建，之后校验仍存在且可管理。
         if state.payload["task_id"] is None:
             task_id = client.create_task(manifest["task"])
@@ -770,19 +1052,6 @@ def run_apply(
                 raise AgentError(
                     f"任务 {task_id} 已是 {detail['status']} 状态，不可继续修改"
                 )
-
-        # mapping：首次必须提供；state 记录路径。
-        if state.payload.get("mapping_path") is None:
-            if mapping_path is None:
-                raise AgentError(
-                    "首次 apply 需要 --mapping 指向 prepare 生成的 mapping.json"
-                )
-            state.payload["mapping_path"] = str(Path(mapping_path).resolve())
-        mapping_file = Path(state.payload["mapping_path"])
-        if not mapping_file.is_file():
-            raise AgentError(f"mapping.json 不存在：{mapping_file}")
-        mapping = json.loads(mapping_file.read_text(encoding="utf-8"))
-        mapping_by_key = {entry["key"]: entry for entry in mapping["samples"]}
 
         receipt_samples: list[dict[str, Any]] = []
         for sample in manifest["samples"]:
@@ -866,18 +1135,13 @@ def run_apply(
                 {"key": sample["key"], "sample_id": entry["sample_id"], "tracks": tracks_view}
             )
 
-        # 参与者：解析为稳定 ID 后立即增补受邀名单（幂等；closed 任务会被服务端拒绝）。
-        participants_resolved: dict[str, str] = dict(state.payload["participants"])
-        if manifest.get("participants") and not participants_resolved:
-            participants_resolved = resolve_participants(client, manifest)
-            if participants_resolved:
-                client.update_members(task_id, sorted(set(participants_resolved.values())))
-            state.payload["participants"] = participants_resolved
-            state.save()
+        # 受邀名单增补：解析已完成，任务创建后幂等同步（幂等 PATCH；closed 被服务端拒绝）。
+        if participants_resolved:
+            client.update_members(task_id, sorted(set(participants_resolved.values())))
 
-        # 对齐与响度：服务端判据拒绝时默认停止。
+        # 对齐与响度：服务端判据拒绝时，拒绝证据持久化进 state，
+        # 任何未解决的 rejection 永久阻止发布（重跑不丢失）。
         processing_receipt: list[dict[str, Any]] = []
-        rejections: list[str] = []
         for sample in manifest["samples"]:
             requested = [
                 c for c in sample["candidates"] if c.get("apply_alignment") or c.get("apply_loudness")
@@ -885,7 +1149,11 @@ def run_apply(
             if not requested:
                 continue
             key = sample["key"]
-            if state.payload["processing"].get(key, {}).get("applied"):
+            record = state.payload["processing"].setdefault(
+                key, {"applied": False, "applied_items": [], "rejections": []}
+            )
+            if record["applied"]:
+                processing_receipt.append({"key": key, **record})
                 continue
             reference = next(c for c in sample["candidates"] if c.get("reference"))
             entry = state.sample_entry(key)
@@ -900,14 +1168,14 @@ def run_apply(
                 if target is None:
                     raise AgentError(f"{key}: 对齐分析缺少候选 {candidate['key']}")
                 if candidate.get("apply_alignment") and not target["延迟"]["可应用"]:
-                    rejections.append(
-                        f"{key}/{candidate['key']}: 对齐拒绝（{target['延迟']['拒绝码']}）"
-                    )
+                    reason = f"{key}/{candidate['key']}: 对齐拒绝（{target['延迟']['拒绝码']}）"
+                    if reason not in record["rejections"]:
+                        record["rejections"].append(reason)
                     continue
                 if candidate.get("apply_loudness") and not target["响度"]["可应用"]:
-                    rejections.append(
-                        f"{key}/{candidate['key']}: 响度拒绝（{target['响度']['拒绝码']}）"
-                    )
+                    reason = f"{key}/{candidate['key']}: 响度拒绝（{target['响度']['拒绝码']}）"
+                    if reason not in record["rejections"]:
+                        record["rejections"].append(reason)
                     continue
                 items.append(
                     {
@@ -916,77 +1184,99 @@ def run_apply(
                         "响度": bool(candidate.get("apply_loudness")),
                     }
                 )
-            result: dict[str, Any] = {"applied": False, "items": []}
             if items:
                 outcome = client.apply_processing(
                     entry["sample_id"], {"参考": ref_track, "处理": items}
                 )
-                result = {"applied": True, "items": outcome.get("处理结果", items)}
-            state.payload["processing"][key] = result
+                record["applied"] = True
+                record["applied_items"] = outcome.get("已应用", [])
+            # 拒绝证据与结果立即落盘：重跑不能丢失。
             state.save()
-            processing_receipt.append({"key": key, **result})
-        if rejections and not keep_original_on_rejection:
+            processing_receipt.append({"key": key, **record})
+            # 默认口径：出现拒绝即停止编排（部分已应用项已持久化，重跑不丢失证据）；
+            # --keep-original-on-rejection 只允许继续草稿编排。
+            if record["rejections"] and not keep_original_on_rejection:
+                raise AgentError(
+                    "服务端拒绝部分对齐/响度处理，已停止；拒绝证据已保存在 state，"
+                    "未解决前不能发布：\n- " + "\n- ".join(record["rejections"])
+                )
+
+        # 拒绝守卫：任何未解决的 rejection 永久阻止发布；
+        # --keep-original-on-rejection 只允许完成草稿编排，绝不发布。
+        all_rejections = [
+            reason
+            for record in state.payload["processing"].values()
+            for reason in record.get("rejections", [])
+        ]
+        if all_rejections and want_publish:
             raise AgentError(
-                "服务端拒绝部分对齐/响度处理，默认停止发布（可保留原始并继续草稿）：\n- "
-                + "\n- ".join(rejections)
+                "存在未解决的对齐/响度拒绝，禁止发布（混合口径不可发布）：\n- "
+                + "\n- ".join(all_rejections)
             )
 
-        # 发布前重拉任务并复核。
+        # 发布前重拉任务并复核：未处理轨对 mapping 原始 PCM；已处理轨按
+        # processing 回执的派生 SHA 验证，并保留原始 SHA 证据。
         detail = client.task_detail(task_id)
         checks: list[str] = []
         if len(detail.get("samples") or []) != len(manifest["samples"]):
             checks.append(
                 f"片段数不符：服务端 {len(detail.get('samples') or [])}，manifest {len(manifest['samples'])}"
             )
+        derived_by_track = {
+            item["track_id"]: item
+            for record in state.payload["processing"].values()
+            for item in record.get("applied_items", [])
+        }
         for sample, view in zip(manifest["samples"], detail.get("samples") or []):
             if view["track_count"] != len(sample["candidates"]):
                 checks.append(
                     f"{sample['key']}: 候选数不符（服务端 {view['track_count']}）"
                 )
-        assigned = set(detail.get("review_assignments") or [])
-        for name, user_id in participants_resolved.items():
-            if user_id not in assigned:
-                checks.append(f"参与者未在受邀名单：{name}")
-        for sample in manifest["samples"]:
+                continue
             entry = state.sample_entry(sample["key"])
             mapping_sample = mapping_by_key[sample["key"]]
-            for candidate, view in zip(
-                sample["candidates"], detail.get("samples") or []
-            ):
-                if view["id"] != entry["sample_id"]:
-                    continue
-                if view["track_count"] != len(sample["candidates"]):
-                    continue
-            # SHA 复核：逐候选下载服务端音频并与 mapping 比对。
             for candidate in sample["candidates"]:
                 track_id = entry["tracks"][candidate["key"]]["track_id"]
                 mapping_candidate = next(
                     c
-                    for c in mapping_by_key[sample["key"]]["candidates"]
+                    for c in mapping_sample["candidates"]
                     if c["key"] == candidate["key"]
                 )
                 payload = client.download_audio(track_id)
-                import io as _io
-
-                import soundfile as _sf
-
-                samples, _rate = _sf.read(_io.BytesIO(payload), dtype="float32")
-                actual = hashlib.sha256(
-                    np.asarray(samples, dtype=np.float32).tobytes()
-                ).hexdigest()
-                if actual != mapping_candidate["output"]["pcm_sha256"]:
-                    checks.append(
-                        f"{sample['key']}/{candidate['key']}: 服务端音频样本与 mapping 不符"
-                    )
+                actual_container = hashlib.sha256(payload).hexdigest()
+                derived = derived_by_track.get(track_id)
+                if derived:
+                    # 已处理轨：核对派生资产 SHA（服务端 /api/audio 即派生文件）。
+                    if actual_container != derived["派生资产SHA256"]:
+                        checks.append(
+                            f"{sample['key']}/{candidate['key']}: 派生音频 SHA256 与处理回执不符"
+                        )
+                    # 原始 SHA 证据仍在 mapping 中保留。
+                    original_pcm = mapping_candidate["output"]["pcm_sha256"]
+                    if not original_pcm:
+                        checks.append(f"{sample['key']}/{candidate['key']}: 缺少原始 PCM 证据")
+                else:
+                    samples_bytes, _ = _decode_audio_bytes(payload)
+                    actual = hashlib.sha256(
+                        np.asarray(samples_bytes, dtype=np.float32).tobytes()
+                    ).hexdigest()
+                    if actual != mapping_candidate["output"]["pcm_sha256"]:
+                        checks.append(
+                            f"{sample['key']}/{candidate['key']}: 服务端音频样本与 mapping 不符"
+                        )
+        assigned = set(detail.get("review_assignments") or [])
+        for name, user_id in participants_resolved.items():
+            if user_id not in assigned:
+                checks.append(f"参与者未在受邀名单：{name}")
         if checks:
             raise AgentError("发布前检查未通过：\n- " + "\n- ".join(checks))
 
+        # 发布：owner 不隐式受邀；只有 manifest participants 显式列出的账号才承担评测义务。
         published = False
         if want_publish:
-            member_ids = sorted(
-                set(participants_resolved.values()) | {client.user["id"]}
-            )
-            client.update_members(task_id, member_ids)
+            if all_rejections:
+                raise AgentError("存在未解决的处理拒绝，不能发布")  # 双保险
+            member_ids = sorted(set(participants_resolved.values()))
             client.publish(task_id, member_ids)
             state.payload["published"] = True
             state.save()
@@ -1006,7 +1296,7 @@ def run_apply(
             "samples": receipt_samples,
             "participants": participants_resolved,
             "processing": processing_receipt,
-            "processing_rejections": rejections,
+            "processing_rejections": sorted(set(all_rejections)),
             "published": published,
             "anonymous_mapping_note": "盲评任务的候选真实身份与匿名映射在任务关闭前不会对参与者揭晓",
         }
