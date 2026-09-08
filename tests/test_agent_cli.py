@@ -512,19 +512,27 @@ def test_apply_stops_on_tampered_source_or_manifest(tmp_path, server):
     manifest_path, manifest, out = prepare_media_and_mapping(tmp_path)
     work = tmp_path / "work"
     state = tmp_path / "state.json"
-    agent_tasks.run_apply(
-        manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
-    )
-    # 篡改源音频字节。
-    source = work / "sources" / "a" / "clip.wav"
-    data, rate = sf.read(str(source))
-    sf.write(str(source), (data * 0.5).astype(np.float32), rate, subtype="FLOAT")
-    with pytest.raises(AgentError, match="源文件 SHA256 与 mapping 不符"):
+    try:
         agent_tasks.run_apply(
             manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
         )
-    # 恢复源，篡改 manifest 候选显示名。
-    sf.write(str(source), data, rate, subtype="FLOAT")
+    except Exception as _exc:  # 临时诊断
+        print("FIRST-APPLY-FAILED:", type(_exc).__name__, str(_exc)[:300], flush=True)
+        raise
+    # 篡改源文件字节（保存原始字节，之后按字节精确恢复；
+    # 不经 soundfile 解码重编码——FLOAT WAV 容器在个别环境下字节不稳定）。
+    source = work / "sources" / "a" / "clip.wav"
+    original_bytes = source.read_bytes()
+    tampered_bytes = bytearray(original_bytes)
+    tampered_bytes[-1] ^= 0xFF
+    source.write_bytes(bytes(tampered_bytes))
+    with pytest.raises(AgentError, match="源文件 SHA256 与 mapping 不符") as e1:
+        agent_tasks.run_apply(
+            manifest_path, base, "编排组织者", "organizer-agent-pass", state, out / "mapping.json"
+        )
+    print("TAMPER-DETECT-OK:", str(e1.value)[:120], flush=True)
+    # 按字节恢复源，篡改 manifest 候选显示名。
+    source.write_bytes(original_bytes)
     manifest["samples"][0]["candidates"][0]["name"] = "被篡改的显示名"
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(AgentError, match="差异") as excinfo:
