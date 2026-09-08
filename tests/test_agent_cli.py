@@ -602,20 +602,46 @@ def test_apply_credentials_never_leak(tmp_path, server, capsys):
     manifest_path, _manifest, out = prepare_media_and_mapping(tmp_path)
     state = tmp_path / "state.json"
     secret = "organizer-agent-pass"
+    wrong = "definitely-wrong-pass"
     agent_tasks.run_apply(
         manifest_path, base, "编排组织者", secret, state, out / "mapping.json"
     )
-    # 故意用错误密码触发失败路径；输出不得包含密码。
-    with pytest.raises(AgentError, match="401"):
+    # 故意用错误密码触发失败路径；异常文本与 CLI 输出都不得包含任何密码。
+    with pytest.raises(AgentError, match="401") as excinfo:
         agent_tasks.run_apply(
-            manifest_path, base, "编排组织者", "definitely-wrong-pass", state, out / "mapping.json"
+            manifest_path, base, "编排组织者", wrong, state, out / "mapping.json"
         )
+    assert wrong not in str(excinfo.value)
+    # 走一遍 CLI 打印路径（agent_cli.run 把错误写到 stderr）。
+    leak_args = argparse_namespace(
+        "apply",
+        str(manifest_path),
+        "--server",
+        base,
+        "--user",
+        "编排组织者",
+        "--password-stdin",
+        "--state",
+        str(state),
+        "--mapping",
+        str(out / "mapping.json"),
+        "--json",
+    )
+    import getpass
+
+    original = getpass.getpass
+    getpass.getpass = lambda prompt="": wrong
+    try:
+        assert agent_cli.run(leak_args) == 1
+    finally:
+        getpass.getpass = original
     captured = capsys.readouterr()
-    assert secret not in captured.out + captured.err
-    assert "definitely-wrong-pass" not in captured.out + captured.err
-    assert secret not in state.read_text(encoding="utf-8")
-    mapping_text = (out / "mapping.json").read_text(encoding="utf-8")
-    assert secret not in mapping_text
+    # 正确密码与错误密码都不得出现在任何输出或落盘文件中。
+    for sensitive in (secret, wrong):
+        assert sensitive not in captured.out + captured.err, sensitive
+        assert sensitive not in state.read_text(encoding="utf-8"), sensitive
+        mapping_text = (out / "mapping.json").read_text(encoding="utf-8")
+        assert sensitive not in mapping_text, sensitive
 
 
 def test_apply_publish_double_confirmation(tmp_path, server):
