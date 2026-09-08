@@ -128,6 +128,7 @@ def run_cli(args, cwd=None):
         [sys.executable, "-m", "workbench.cli", *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",  # CLI 输出固定 UTF-8；Windows 默认编码会破坏中文回执
         cwd=cwd,
         timeout=300,
         check=False,
@@ -818,6 +819,7 @@ def test_end_to_end_command_flow(tmp_path, server):
             [sys.executable, "-c", "from workbench.cli import main; raise SystemExit(main())", *step],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             env=env,
             timeout=300,
             cwd=str(Path(__file__).resolve().parent.parent),
