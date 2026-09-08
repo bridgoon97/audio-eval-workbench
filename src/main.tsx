@@ -37,6 +37,7 @@ import { ProcessingModal } from './ProcessingModal';
 import { Waveform } from './Waveform';
 import { ApplyFlow } from './ApplyFlow';
 import { AccessAdmin, DeviceAdmin } from './AccessAdmin';
+import { SecuritySettings } from './SecuritySettings';
 import './style.css';
 
 const stateName: Record<string, string> = {
@@ -111,7 +112,8 @@ function Modal({
 function App() {
   const [user, setUser] = useState<User | null>(null);
   const [ready, setReady] = useState(false);
-  const [authView, setAuthView] = useState<'login' | 'apply'>('login');
+  const [authView, setAuthView] = useState<'login' | 'apply' | 'recover'>('login');
+  const [authKind, setAuthKind] = useState<'session' | 'device'>('session');
   const [pendingCount, setPendingCount] = useState(0);
   const [serverVersion, setServerVersion] = useState('');
   const [serverInfo, setServerInfo] = useState<{
@@ -179,9 +181,11 @@ function App() {
           role: string;
           csrf_token?: string;
           pending_applications?: number;
+          auth_kind?: 'session' | 'device';
         }>('/me');
         // CSRF 令牌随 /api/me 下发，供敏感管理操作回传。
         setCsrfToken(me.csrf_token || '');
+        setAuthKind(me.auth_kind === 'device' ? 'device' : 'session');
         setPendingCount(me.pending_applications || 0);
         setUser(me);
         await refreshTasks();
@@ -466,7 +470,84 @@ function App() {
       </div>
     );
   if (!user)
-    return authView === 'apply' ? (
+    return authView === 'recover' ? (
+      <div className="auth-shell">
+        <div className="auth-brand">
+          <AudioLines size={46} />
+          <h1>听鉴</h1>
+          <p>让每一次听感判断，有据可循。</p>
+          <div className="auth-lines">
+            {Array.from({ length: 45 }, (_, i) => (
+              <i
+                key={i}
+                style={{
+                  height: `${15 + Math.abs(Math.sin(i * 0.7) * Math.cos(i * 0.14)) * 100}px`,
+                }}
+              />
+            ))}
+          </div>
+          <span>音频版本比较 · 片段标注 · 团队评测</span>
+        </div>
+        <form
+          className="apply-flow"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const data = Object.fromEntries(new FormData(e.currentTarget));
+            void run(async () => {
+              await api('/recover', 'POST', data);
+              setAuthView('login');
+              await initialize();
+            });
+          }}
+        >
+          <span className="eyebrow">账号恢复</span>
+          <h2>凭恢复凭证设置新密码</h2>
+          <p className="muted">
+            输入管理员提供的一次性恢复凭证并设置新密码；成功后本浏览器直接登录，旧密码作废。
+          </p>
+          <label>
+            恢复凭证
+            <input
+              name="recovery_code"
+              required
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="形如 xxxx.yyyy 的一次性凭证"
+            />
+          </label>
+          <label>
+            新密码（至少 10 个字符）
+            <input
+              name="new_password"
+              type="password"
+              required
+              minLength={10}
+              maxLength={200}
+              autoComplete="new-password"
+            />
+          </label>
+          {error && (
+            <p role="alert" className="error">
+              {error}
+            </p>
+          )}
+          <button className="primary full" disabled={busy}>
+            {busy ? '正在恢复…' : '设置新密码并登录'}
+          </button>
+          <small>凭证一次性有效；过期或已使用时请联系管理员重新生成。</small>
+          <button
+            type="button"
+            className="full"
+            onClick={() => {
+              setError('');
+              setAuthView('login');
+            }}
+          >
+            返回登录
+          </button>
+        </form>
+      </div>
+    ) : authView === 'apply' ? (
       <div className="auth-shell">
         <div className="auth-brand">
           <AudioLines size={46} />
@@ -560,18 +641,31 @@ function App() {
             <ArrowRight size={18} />
           </button>
           {!setup && (
-            <button
-              type="button"
-              className="full apply-entry"
-              onClick={() => {
-                setError('');
-                setNotice('');
-                setAuthView('apply');
-              }}
-            >
-              申请加入评测
-              <ArrowRight size={16} />
-            </button>
+            <>
+              <button
+                type="button"
+                className="full apply-entry"
+                onClick={() => {
+                  setError('');
+                  setNotice('');
+                  setAuthView('apply');
+                }}
+              >
+                申请加入评测
+                <ArrowRight size={16} />
+              </button>
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => {
+                  setError('');
+                  setNotice('');
+                  setAuthView('recover');
+                }}
+              >
+                凭恢复凭证设置新密码
+              </button>
+            </>
           )}
           <small>音频和评测结果保存在托管这项服务的电脑上。</small>
         </form>
@@ -653,6 +747,9 @@ function App() {
                 {{ admin: '管理员', organizer: '组织者', reviewer: '评测者' }[user.role]}
               </small>
             </div>
+            <button className="text-button security-entry" onClick={() => setModal('security')}>
+              账号与安全
+            </button>
             <button
               className="icon"
               aria-label="退出登录"
@@ -1436,6 +1533,7 @@ function App() {
               users: '团队成员',
               access: '加入申请与邀请凭证',
               devices: '登录设备',
+              security: '账号与安全',
               help: '使用指南',
               system: '当前服务信息',
               report: '评测结果',
@@ -1946,6 +2044,7 @@ function App() {
           )}
           {modal === 'access' && <AccessAdmin onBusy={setBusy} />}
           {modal === 'devices' && deviceTarget && <DeviceAdmin target={deviceTarget} />}
+          {modal === 'security' && <SecuritySettings authKind={authKind} onBusy={setBusy} />}
           {modal === 'system' && serverInfo && (
             <div className="server-info">
               <p>

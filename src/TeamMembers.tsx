@@ -28,9 +28,12 @@ export function TeamMembers({
     ? `听鉴登录地址：${address.trim() || window.location.origin}\n账号：${credential.name}\n密码：${credential.password}`
     : '';
   const [copied, setCopied] = useState('');
+  const [recoveryTarget, setRecoveryTarget] = useState<User | null>(null);
+  const [recoveryCode, setRecoveryCode] = useState<{ code: string; expires: string } | null>(null);
   const [target, setTarget] = useState<User | null>(null);
   const [resetPassword, setResetPassword] = useState('');
   const credentialRef = useRef<HTMLTextAreaElement>(null);
+  const recoveryRef = useRef<HTMLTextAreaElement>(null);
   function showCredential(name: string, value: string) {
     setCredential({ name, password: value });
     setCopied('');
@@ -113,8 +116,11 @@ export function TeamMembers({
       )}
       <div className="member-list">
         {members.map((m) => (
-          <div key={m.id}>
-            <span>{m.name}</span>
+          <div key={m.id} className={m.active === 0 ? 'disabled-member' : ''}>
+            <span>
+              {m.name}
+              {m.active === 0 && <em className="pill-badge">已停用</em>}
+            </span>
             {m.role === 'admin' ? (
               <span className="muted">管理员</span>
             ) : (
@@ -122,7 +128,7 @@ export function TeamMembers({
                 <select
                   aria-label={`${m.name}的角色`}
                   value={m.role}
-                  disabled={busy || !!target}
+                  disabled={busy || !!target || m.active === 0}
                   onChange={(e) => {
                     const role = e.target.value;
                     void run(async () => {
@@ -155,10 +161,135 @@ export function TeamMembers({
                 >
                   重置密码
                 </button>
+                <button
+                  type="button"
+                  disabled={busy || !!target}
+                  aria-label={`生成 ${m.name} 的恢复凭证`}
+                  onClick={() => {
+                    setRecoveryTarget(recoveryTarget?.id === m.id ? null : m);
+                    setRecoveryCode(null);
+                    setError('');
+                  }}
+                >
+                  恢复凭证
+                </button>
+                <button
+                  type="button"
+                  disabled={busy || !!target}
+                  aria-label={m.active === 0 ? `启用 ${m.name} 的账号` : `停用 ${m.name} 的账号`}
+                  onClick={() => {
+                    const disable = m.active !== 0;
+                    if (
+                      disable &&
+                      !window.confirm(
+                        `停用「${m.name}」？该同事的所有登录立即失效，历史记录保留；启用后需重新登录。`,
+                      )
+                    )
+                      return;
+                    void run(async () => {
+                      await api('/users/' + m.id + '/status', 'POST', {
+                        active: !disable,
+                      });
+                      setRecoveryTarget(null);
+                      setRecoveryCode(null);
+                      onChange(await api('/users'));
+                    });
+                  }}
+                >
+                  {m.active === 0 ? '启用账号' : '停用账号'}
+                </button>
               </>
             )}
           </div>
         ))}
+        {recoveryTarget && (
+          <form
+            className="recovery-form"
+            aria-label={`为 ${recoveryTarget.name} 生成恢复凭证`}
+            onSubmit={(e) => {
+              e.preventDefault();
+              const data = Object.fromEntries(new FormData(e.currentTarget));
+              void run(async () => {
+                const result = await api<{ code: string; expires: string }>(
+                  '/users/' + recoveryTarget.id + '/recovery',
+                  'POST',
+                  { purpose: data.purpose || '', expires_hours: Number(data.expires_hours) },
+                );
+                setRecoveryCode({ code: result.code, expires: result.expires });
+              });
+            }}
+          >
+            <h3>为「{recoveryTarget.name}」生成一次性恢复凭证</h3>
+            <label>
+              用途 / 备注
+              <input name="purpose" maxLength={120} placeholder="例如：浏览器重装后恢复" />
+            </label>
+            <label>
+              有效期（小时）
+              <input
+                name="expires_hours"
+                type="number"
+                min={1}
+                max={72}
+                defaultValue={24}
+                required
+              />
+            </label>
+            <button className="primary full" disabled={busy}>
+              生成恢复凭证
+            </button>
+          </form>
+        )}
+        {recoveryCode && (
+          <section className="credential-card" aria-label="本次恢复凭证">
+            <h3>恢复凭证已生成</h3>
+            <p>
+              明文只显示这一次，到期（{recoveryCode.expires.slice(0, 16).replace('T', ' ')}
+              ）或使用后失效；请让本人打开登录页的“凭恢复凭证设置新密码”完成领取。
+            </p>
+            <textarea
+              ref={recoveryRef}
+              aria-label="本次恢复凭证内容"
+              readOnly
+              value={recoveryCode.code}
+              rows={2}
+              spellCheck={false}
+            />
+            <div className="actions">
+              <button
+                type="button"
+                onClick={() => {
+                  setCopied('');
+                  void (async () => {
+                    try {
+                      if (navigator.clipboard?.writeText) {
+                        await navigator.clipboard.writeText(recoveryCode.code);
+                        setCopied('已复制恢复凭证');
+                        return;
+                      }
+                    } catch {
+                      /* HTTP 局域网回退到选区复制 */
+                    }
+                    recoveryRef.current?.focus();
+                    recoveryRef.current?.select();
+                    try {
+                      if (document.execCommand('copy')) setCopied('已复制恢复凭证');
+                      else setCopied('已选中文本，请按 Ctrl+C（Mac 为 ⌘C）复制。');
+                    } catch {
+                      setCopied('已选中文本，请按 Ctrl+C（Mac 为 ⌘C）复制。');
+                    }
+                  })();
+                }}
+              >
+                复制恢复凭证
+              </button>
+              <button type="button" onClick={() => setRecoveryCode(null)}>
+                隐藏凭证
+              </button>
+            </div>
+            <small role="status">{copied}</small>
+          </section>
+        )}
       </div>
       {target ? (
         <form
