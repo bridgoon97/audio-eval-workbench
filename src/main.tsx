@@ -313,11 +313,12 @@ function App() {
   const run = async (action: () => Promise<void>) => {
     setError('');
     setNotice('');
+    // action 一旦开始就作废此前启动的后台同步。React 的 busy state
+    // 要到下一次 render 才进入 live ref，不能靠它阻止已经在飞的旧响应。
+    syncEpoch.current += 1;
     setBusy(true);
     try {
       await action();
-      // 本地 mutation 成功：作废在飞同步（其响应可能已过期）。
-      syncEpoch.current += 1;
     } catch (e) {
       setError((e as Error).message);
     } finally {

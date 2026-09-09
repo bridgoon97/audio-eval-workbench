@@ -804,9 +804,41 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
     },
   });
   await page.locator('.sample-item').filter({ hasText: '待删除片段' }).click();
+
+  // 精确制造陈旧同步：先拦住一次删除前的任务详情响应，再执行删除。
+  // DELETE 完成并刷新为新状态后才放行旧响应；旧同步不得写回已删片段。
+  let releaseStale: (() => void) | undefined;
+  const staleReleased = new Promise<void>((resolve) => {
+    releaseStale = resolve;
+  });
+  let staleRequestEntered: (() => void) | undefined;
+  const staleEntered = new Promise<void>((resolve) => {
+    staleRequestEntered = resolve;
+  });
+  let holdNextTaskDetail = true;
+  await page.route(`**/api/tasks/${created.id}`, async (route) => {
+    if (holdNextTaskDetail && route.request().method() === 'GET') {
+      holdNextTaskDetail = false;
+      staleRequestEntered?.();
+      await staleReleased;
+    }
+    await route.continue();
+  });
+  await page.getByRole('button', { name: '同步', exact: true }).click();
+  await staleEntered;
+
+  const deleteDone = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'DELETE' && response.url().includes('/api/samples/'),
+  );
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: '删除片段', exact: true }).click();
+  expect((await deleteDone).status()).toBe(200);
   await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0);
+  releaseStale?.();
+  await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0);
+  await expect(page.locator('.tracks-heading h2')).toHaveText(/对齐片段（修订）/);
+  await page.unroute(`**/api/tasks/${created.id}`);
 
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
