@@ -114,7 +114,7 @@ test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 
     await expect(row).toContainText('工号 A-1024');
     await row.getByRole('button', { name: '批准…' }).click();
     await expect(row.getByLabel('账号名称')).toHaveValue('免密申请员');
-    await row.getByLabel('免密登录验收任务').check();
+    await row.getByLabel('免密登录验收任务').first().check();
     await row.getByRole('button', { name: '确认批准并创建账号' }).click();
     await expect(
       page.locator('.application-row').filter({ hasText: '免密申请员' }),
