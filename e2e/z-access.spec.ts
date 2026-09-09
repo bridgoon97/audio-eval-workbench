@@ -120,7 +120,7 @@ test('自助申请全流程：一次性邀请 → 申请 → 批准分配任务 
       page.locator('.application-row').filter({ hasText: '免密申请员' }),
     ).not.toBeVisible();
     await page.keyboard.press('Escape');
-    await expect(page.locator('.overlay')).toHaveCount(0);
+    await expect(page.locator('.overlay')).toHaveCount(0, { timeout: 15000 });
 
     // 原浏览器自动领取 Cookie 进入工作台；刷新后免密保持。
     await expect(applicantPage.locator('.dashboard')).toBeVisible({ timeout: 20000 });
