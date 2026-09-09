@@ -11,6 +11,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows CI/控制台的 cp1252 输出无法编码中文提示；固定 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8', errors='backslashreplace')
+
 root = Path(__file__).resolve().parent.parent
 if not (root / "dist" / "index.html").exists():
     # Agent CLI 不含前端；dist 只作为"服务端已构建"的仓库一致性提示，不进包。
