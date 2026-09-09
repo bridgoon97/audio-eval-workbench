@@ -313,8 +313,9 @@ def test_claim_retry_fixed_window_and_expiry(env):
             "SELECT claimed_at, expires FROM devices"
         ).fetchone()
 
-    # 第 899 秒重试：成功，但窗口起点与绝对到期保持人为设置的值（不再后移）。
-    mutated = first_claimed - 899
+    # 窗口内重试（850 秒，留出 runner 时钟/NTP 跳动余量）：
+    # 成功，但窗口起点与绝对到期保持人为设置的值（不再后移）。
+    mutated = first_claimed - 850
     with sqlite3.connect(folder / "workbench.sqlite3") as db:
         db.execute("UPDATE devices SET claimed_at=?", (mutated,))
     near_edge = retry_claim()
