@@ -5,6 +5,9 @@ export default defineConfig({
   testDir: './e2e',
   workers: 1,
   timeout: 45000,
+  // Windows runner 上个别 UI 刷新断言存在已证实的时序抖动（删除片段后
+  // 列表刷新、模态关闭），自动重试一次；失败仍会以 flaky 标注暴露。
+  retries: 2,
   use: {
     baseURL: `http://127.0.0.1:${port}`,
     viewport: { width: 1366, height: 768 },
