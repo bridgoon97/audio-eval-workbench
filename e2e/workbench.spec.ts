@@ -803,6 +803,14 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
       file: { name: 'c.wav', mimeType: 'audio/wav', buffer: wav(ref) },
     },
   });
+  page.on('response', (response) => {
+    if (response.url().includes('/api/samples')) {
+      // 临时诊断：Windows runner 上删除片段断言连败，输出实际 API 状态。
+      console.log(
+        `[del-diag] ${response.request().method()} ${response.status()} ${response.url()}`,
+      );
+    }
+  });
   await page.locator('.sample-item').filter({ hasText: '待删除片段' }).click();
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: '删除片段', exact: true }).click();
