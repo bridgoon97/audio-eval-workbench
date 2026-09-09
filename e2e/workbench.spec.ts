@@ -803,18 +803,17 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
       file: { name: 'c.wav', mimeType: 'audio/wav', buffer: wav(ref) },
     },
   });
-  page.on('response', (response) => {
-    if (response.url().includes('/api/samples')) {
-      // 临时诊断：Windows runner 上删除片段断言连败，输出实际 API 状态。
-      console.log(
-        `[del-diag] ${response.request().method()} ${response.status()} ${response.url()}`,
-      );
-    }
-  });
   await page.locator('.sample-item').filter({ hasText: '待删除片段' }).click();
+  // 显式等待删除 API 的响应（含 confirm 对话框 accept），再断言列表刷新；
+  // 不依赖 5 秒同步轮询的时序。
+  const deleteDone = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'DELETE' && response.url().includes('/api/samples/'),
+  );
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: '删除片段', exact: true }).click();
-  // 删除与列表刷新在慢 runner 上可能超过 15 秒。
+  const deleteStatus = (await deleteDone).status();
+  expect(deleteStatus, '删除片段 API 应成功').toBe(200);
   await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0, {
     timeout: 30000,
   });
