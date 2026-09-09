@@ -34,8 +34,21 @@ jobs:
       - run: npx playwright test
       - run: uv run --locked python scripts/package.py
       - run: uv run --locked python scripts/package_smoke.py
+      - name: 构建独立 Agent CLI（Windows）
+        if: matrix.os == 'windows-latest'
+        run: uv run --locked python scripts/package_agent.py
+      - name: 验证独立 Agent CLI（Windows）
+        if: matrix.os == 'windows-latest'
+        run: uv run --locked python scripts/package_agent_smoke.py
       - uses: actions/upload-artifact@v4
         with:
           name: audio-eval-${{ matrix.os }}
           path: release/audio-eval/
+          retention-days: 14
+      - name: 上传独立 Agent CLI（Windows）
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-eval-agent-cli-windows-latest
+          path: release-agent/audio-eval-agent/
           retention-days: 14
