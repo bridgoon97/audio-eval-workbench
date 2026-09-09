@@ -110,4 +110,7 @@ usage = f"""开始使用 · 听鉴独立 Agent CLI
 """
 (package_root / "开始使用.txt").write_text(usage, encoding="utf-8")
 
-print(f"独立 Agent CLI 包已生成：{package_root}")
+try:
+    print(f"独立 Agent CLI 包已生成：{package_root}")
+except UnicodeEncodeError:  # Windows cp1252 控制台的兜底输出
+    print("Agent CLI package generated: release-agent/audio-eval-agent")
