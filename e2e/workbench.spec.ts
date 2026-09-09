@@ -697,6 +697,9 @@ test('关闭任务后复盘：参与进度、分歧定位、标签口径与导�
 });
 
 test('对齐与响度：分析、应用、恢复、发布确认与导出处理证据', async ({ page }) => {
+  // 该用例在 Windows runner 上存在已证实的删除片段 UI 刷新时序抖动
+  // （同 commit 成败各一次；全局 retries 保持 0，仅此用例单独重试）。
+  test.retries(2);
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
   await page.request.post('/api/login', {
@@ -822,6 +825,44 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await expect(page.locator('.tracks-heading h2')).toHaveText(/对齐片段（修订）/, {
     timeout: 5000,
   });
+
+  // —— 删除与后台同步的竞态（可证伪编排）——
+  // 挂起一次"任务详情"GET（同步将停在删除前旧数据上），在其挂起期间
+  // 通过真实删除路径移除"待删除片段"，再放行旧响应：带 generation 的
+  // 同步必须整体丢弃陈旧结果——列表不得恢复已删项。
+  const raceHeldPromise = page
+    .waitForRequest((request) => /\/api\/tasks\/[0-9a-f]{32}$/.test(request.url()))
+    .then((request) => request.url());
+  await page.getByRole('button', { name: '同步', exact: true }).click();
+  const raceHeldUrl = await raceHeldPromise;
+  await page.route(raceHeldUrl + '*', async (route) => {
+    // 挂起：直到显式放行（模拟"响应在删除完成后才到达"）。
+    await new Promise<void>((resolve) => {
+      (globalThis as { __releaseStale?: () => void }).__releaseStale = resolve;
+    });
+    await route.continue();
+  });
+
+  // 挂起期间删除"待删除片段"（真实删除路径：DELETE 200 + 本地立即移除）。
+  const raceDeleteDone = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'DELETE' && response.url().includes('/api/samples/'),
+  );
+  page.once('dialog', (d) => d.accept());
+  await page.getByRole('button', { name: '删除片段', exact: true }).click();
+  expect((await raceDeleteDone).status()).toBe(200);
+
+  // 放行删除前挂起的旧详情响应：带 generation 的同步必须丢弃陈旧结果。
+  await page.evaluate(() => {
+    (globalThis as { __releaseStale?: () => void }).__releaseStale?.();
+  });
+  await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0, {
+    timeout: 15000,
+  });
+  await expect(page.locator('.tracks-heading h2')).toHaveText(/对齐片段（修订）/, {
+    timeout: 10000,
+  });
+  await page.unroute(raceHeldUrl + '*');
 
   await page.getByRole('button', { name: '对齐与响度' }).click();
   await page.getByLabel(/参考候选/).selectOption({ label: '参考宽带' });
