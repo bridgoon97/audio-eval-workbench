@@ -1124,8 +1124,23 @@ function App() {
                                   )
                                 )
                                   void run(async () => {
-                                    await api('/samples/' + sample!.id, 'DELETE');
-                                    await openTask(task.id);
+                                    const deletedId = sample!.id;
+                                    const remaining = (task.samples || []).filter(
+                                      (s) => s.id !== deletedId,
+                                    );
+                                    await api('/samples/' + deletedId, 'DELETE');
+                                    // 基于返回/本地状态立即移除：不依赖二次 GET
+                                    // 或后台同步；删除期间的周期同步也不会再
+                                    // 请求已删片段（与 openTask 无竞态）。
+                                    setSample(null);
+                                    setModal('');
+                                    setTask((previous) =>
+                                      previous ? { ...previous, samples: remaining } : previous,
+                                    );
+                                    await refreshTasks();
+                                    // 删除后切换到相邻剩余片段（避免停留在已删
+                                    // 片段详情或空白态）。
+                                    if (remaining.length) await openSample(remaining[0].id);
                                     setNotice('片段已删除；未被引用的音频空间已释放。');
                                   });
                               }}

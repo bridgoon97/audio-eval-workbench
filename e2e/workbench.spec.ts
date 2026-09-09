@@ -814,8 +814,13 @@ test('对齐与响度：分析、应用、恢复、发布确认与导出处理�
   await page.getByRole('button', { name: '删除片段', exact: true }).click();
   const deleteStatus = (await deleteDone).status();
   expect(deleteStatus, '删除片段 API 应成功').toBe(200);
+  // DELETE 200 后基于本地状态立即移除：单次运行中断言列表消失、
+  // 当前片段切换到相邻剩余片段（不再指向已删 ID，不依赖重试或后台同步）。
   await expect(page.locator('.sample-item').filter({ hasText: '待删除片段' })).toHaveCount(0, {
-    timeout: 30000,
+    timeout: 5000,
+  });
+  await expect(page.locator('.tracks-heading h2')).toHaveText(/对齐片段（修订）/, {
+    timeout: 5000,
   });
 
   await page.getByRole('button', { name: '对齐与响度' }).click();
