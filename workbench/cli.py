@@ -1,4 +1,4 @@
-"""跨平台启动入口；默认只监听本机。"""
+"""跨平台启动入口；默认只监听本机，并提供 `agent` 编排子命令。"""
 
 import argparse
 import socket
@@ -10,16 +10,19 @@ from pathlib import Path
 
 import uvicorn
 
+from . import agent_cli
 from .app import create_app
+from .streams import configure_streams
 from .version import VERSION
 
+SUBCOMMANDS = ("serve", "agent")
 
-def main():
-    # Windows 重定向输出可能采用 cp1252；中文启动提示必须可编码。
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
-    parser = argparse.ArgumentParser(description="听鉴 · 音频算法评测工作台")
+
+def _build_serve_parser(prog: str = "audio-eval") -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="启动听鉴服务（等价于传统 `audio-eval --data ...` 调用）",
+    )
     parser.add_argument(
         "--data",
         type=Path,
@@ -36,7 +39,10 @@ def main():
         "--public-origin",
         help="HTTPS 代理的确切外部源，例如 https://audio.example.internal",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def _run_server(args: argparse.Namespace) -> None:
     root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
     if args.public_origin:
         from urllib.parse import urlsplit
@@ -50,7 +56,9 @@ def main():
             or parsed.fragment
             or parsed.username
         ):
-            parser.error("--public-origin 必须是无路径、无凭据的 HTTPS 源")
+            raise SystemExit(
+                "audio-eval：--public-origin 必须是无路径、无凭据的 HTTPS 源"
+            )
     host = "0.0.0.0" if args.lan else "127.0.0.1"
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         if sys.platform == "win32":
@@ -117,5 +125,24 @@ def serve(args, root, host, listener):
         server.should_exit = True
 
 
+def main() -> int:
+    configure_streams()
+    argv = sys.argv[1:]
+    if argv and argv[0] in SUBCOMMANDS:
+        if argv[0] == "agent":
+            parser = argparse.ArgumentParser(
+                prog="audio-eval agent",
+                description="Agent 驱动的评测任务编排（详见 docs/Agent创建评测任务.md）",
+            )
+            agent_cli.register(parser)
+            args = parser.parse_args(argv[1:])
+            return agent_cli.run(args)
+        argv = argv[1:]  # serve：剥掉子命令名，沿用传统参数
+    parser = _build_serve_parser()
+    args = parser.parse_args(argv)
+    _run_server(args)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

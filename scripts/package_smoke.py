@@ -1,4 +1,6 @@
-"""启动真实打包产物，核对接口和网页可用，然后正常终止测试进程。"""
+"""启动真实服务端打包产物，核对接口和网页可用，然后正常终止测试进程。
+
+独立 Agent CLI 包的 smoke 见 scripts/package_agent_smoke.py（缺包必然失败）。"""
 
 import json
 import subprocess

@@ -26,6 +26,8 @@ subprocess.run(
         "soundfile",
         "--collect-all",
         "_soundfile_data",
+        "--collect-all",
+        "soxr",
         "--collect-submodules",
         "uvicorn",
         "launcher.py",

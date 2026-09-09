@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "task": {
+    "title": "AIBF v1 与 v2 · 室内第一轮",
+    "kind": "算法版本",
+    "mode": "blind"
+  },
+  "participants": [
+    {
+      "name": "评测同事甲"
+    },
+    {
+      "name": "评测同事乙"
+    }
+  ],
+  "samples": [
+    {
+      "key": "indoor-001",
+      "name": "室内 001",
+      "scene": "安静室内 · 女声",
+      "provenance": "PUBLIC reproducible",
+      "segment": {
+        "start_seconds": 0.0,
+        "end_seconds": 10.0
+      },
+      "candidates": [
+        {
+          "key": "aibf-v1",
+          "name": "AIBF v1",
+          "version": "commit 9f3a1c2",
+          "source": "sources/aibf-v1/indoor-001.wav",
+          "channel": 0,
+          "reference": true,
+          "apply_alignment": false,
+          "apply_loudness": false
+        },
+        {
+          "key": "aibf-v2",
+          "name": "AIBF v2",
+          "version": "commit 7d2e881",
+          "source": "sources/aibf-v2/indoor-001.wav",
+          "channel": 0,
+          "apply_alignment": true,
+          "apply_loudness": true
+        }
+      ]
+    }
+  ],
+  "publish": false,
+  "conversion": {
+    "resample_to_16000": true,
+    "note": "源为 48 kHz；已与用户确认整体重采样到 16 kHz，仅重采样不增益"
+  }
+}

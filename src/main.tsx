@@ -211,7 +211,11 @@ function App() {
   const live = useRef({ user, task, sample, engine, busy, batchBusy });
   live.current = { user, task, sample, engine, busy, batchBusy };
   const syncing = useRef(false);
+  // 同步代次：本地 mutation 成功时递增；在飞同步在每个写 state 点前核对，
+  // 陈旧结果直接丢弃（防止删除片段后被旧响应覆盖）。
+  const syncEpoch = useRef(0);
   const synchronize = async () => {
+    const epoch = syncEpoch.current;
     const current = live.current;
     if (!current.user || syncing.current || current.busy || current.batchBusy) return;
     syncing.current = true;
@@ -224,7 +228,7 @@ function App() {
         read<Task[]>('/tasks'),
         read<{ version: string }>('/status'),
       ]);
-      if (live.current.user?.id !== current.user.id) return;
+      if (syncEpoch.current !== epoch || live.current.user?.id !== current.user.id) return;
       setServerVersion(status.version);
       if (nextUser.role === 'admin' && typeof (nextUser as any).pending_applications === 'number')
         setPendingCount((nextUser as any).pending_applications);
@@ -245,6 +249,7 @@ function App() {
           setNotice('当前任务已移除或访问权限已变更，列表已同步。');
         } else {
           const nextTask = await read<Task>('/tasks/' + current.task.id);
+          if (syncEpoch.current !== epoch) return; // 陈旧同步：本地 mutation 已更新状态
           if (
             live.current.user?.id !== current.user.id ||
             live.current.task?.id !== current.task.id
@@ -257,7 +262,10 @@ function App() {
             setModal('');
           setTask(nextTask);
           if (current.sample && live.current.sample?.id === current.sample.id) {
-            const nextSample = await read<Sample>('/samples/' + current.sample.id);
+            const nextSample = await read<Sample>('/samples/' + current.sample.id).catch(
+              () => null, // 片段已被本地 mutation 删除：静默丢弃，不视为连接错误
+            );
+            if (syncEpoch.current !== epoch || !nextSample) return;
             if (
               live.current.user?.id === current.user.id &&
               live.current.sample?.id === current.sample.id
@@ -305,6 +313,9 @@ function App() {
   const run = async (action: () => Promise<void>) => {
     setError('');
     setNotice('');
+    // action 一旦开始就作废此前启动的后台同步。React 的 busy state
+    // 要到下一次 render 才进入 live ref，不能靠它阻止已经在飞的旧响应。
+    syncEpoch.current += 1;
     setBusy(true);
     try {
       await action();
@@ -1124,7 +1135,16 @@ function App() {
                                   )
                                 )
                                   void run(async () => {
-                                    await api('/samples/' + sample!.id, 'DELETE');
+                                    const deletedId = sample!.id;
+                                    await api('/samples/' + deletedId, 'DELETE');
+                                    // 第一步：基于本地状态立即清空当前片段（不等
+                                    // 二次 GET；删除期间 sync 因 epoch 递增而丢弃
+                                    // 陈旧结果，也不会再请求已删片段）。
+                                    setSample(null);
+                                    setModal('');
+                                    // 第二步：重拉任务详情与列表（此时 UI 已离开
+                                    // 已删片段，无竞态窗口）。
+                                    await refreshTasks();
                                     await openTask(task.id);
                                     setNotice('片段已删除；未被引用的音频空间已释放。');
                                   });
