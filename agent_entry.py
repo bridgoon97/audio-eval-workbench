@@ -9,7 +9,6 @@ import argparse
 import sys
 
 from workbench import agent_cli
-from workbench.cli import _configure_streams
 from workbench.version import VERSION
 
 BANNER = f"""听鉴 · 独立 Agent CLI（版本 {VERSION}）
@@ -22,13 +21,17 @@ BANNER = f"""听鉴 · 独立 Agent CLI（版本 {VERSION}）
 
 
 def main() -> int:
-    _configure_streams()
+    # Windows 重定向输出可能采用 cp1252；中文输出必须可编码。
+    # 此处内联等价逻辑，避免 import workbench.cli 把服务端依赖带进分析图。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     argv = sys.argv[1:]
     parser = argparse.ArgumentParser(
         prog="audio-eval-agent",
         description="听鉴独立 Agent CLI · 评测任务编排（不含服务端）",
     )
-    agent_cli.register(parser)
+    agent_cli.register(parser, entry_program="audio-eval-agent")
     if not argv:
         # 双击/无参数：显示帮助并停留，不静默退出，也不监听任何端口。
         print(BANNER)

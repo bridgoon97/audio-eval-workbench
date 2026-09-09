@@ -91,7 +91,9 @@ def cmd_manifest_init(args) -> int:
         json.dumps(MANIFEST_TEMPLATE, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(f"已生成 manifest 模板：{output}（请编辑后运行 audio-eval agent validate）")
+    # 按调用入口提示正确的校验命令（独立 EXE 与服务端 CLI 的程序名不同）。
+    program = getattr(args, "entry_program", "audio-eval")
+    print(f"已生成 manifest 模板：{output}（请编辑后运行 {program} validate 校验）")
     return 0
 
 
@@ -172,12 +174,13 @@ def cmd_status(args) -> int:
     return 0
 
 
-def register(parser) -> None:
+def register(parser, entry_program: str = "audio-eval") -> None:
+    """注册 agent 子命令；entry_program 用于提示文案中的程序名。"""
     sub = parser.add_subparsers(dest="agent_command", required=True)
 
     init = sub.add_parser("manifest-init", help="生成 manifest 模板（JSON）")
     init.add_argument("--output", required=True, help="模板输出路径")
-    init.set_defaults(func=cmd_manifest_init)
+    init.set_defaults(func=cmd_manifest_init, entry_program=entry_program)
 
     validate = sub.add_parser("validate", help="离线校验 manifest（无服务副作用）")
     validate.add_argument("manifest", help="manifest JSON 路径")

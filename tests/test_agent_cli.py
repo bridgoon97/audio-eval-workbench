@@ -907,7 +907,7 @@ def test_end_to_end_command_flow(tmp_path, server):
         ],
         ["agent", "status", "--state", str(tmp_path / "state.json"), "--json"],
     ):
-        result = run_cli(step) if False else subprocess.run(
+        result = subprocess.run(
             [sys.executable, "-c", "from workbench.cli import main; raise SystemExit(main())", *step],
             capture_output=True,
             text=True,
@@ -972,35 +972,15 @@ def test_apply_processing_success_then_publish(tmp_path, server):
     track_id = state_payload["samples"]["sample-001"]["tracks"]["cand-b"]["track_id"]
 
     # 发布（双确认齐备）：派生 SHA 复核通过后发布成功。
-    import hashlib as _hl
-
-    print(
-        "DIAG source-sha:",
-        _hl.sha256((work / "sources" / "a" / "clip.wav").read_bytes()).hexdigest()[:12],
-        "mapping-file-sha:",
-        _hl.sha256((out / "mapping.json").read_bytes()).hexdigest()[:12],
-        flush=True,
+    receipt = agent_tasks.run_apply(
+        manifest_path,
+        base,
+        "编排组织者",
+        "organizer-agent-pass",
+        state,
+        out / "mapping.json",
+        publish_flag=True,
     )
-    try:
-        receipt = agent_tasks.run_apply(
-            manifest_path,
-            base,
-            "编排组织者",
-            "organizer-agent-pass",
-            state,
-            out / "mapping.json",
-            publish_flag=True,
-        )
-    except Exception as exc:
-        print(
-            "DIAG second-apply-failed:",
-            type(exc).__name__,
-            str(exc)[:200],
-            "source-now:",
-            _hl.sha256((work / "sources" / "a" / "clip.wav").read_bytes()).hexdigest()[:12],
-            flush=True,
-        )
-        raise
     assert receipt["published"] is True
     client = TestClient(app)
     client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
@@ -1124,8 +1104,20 @@ def test_publish_without_implicit_owner_and_rejects_disabled(tmp_path, server):
     )
     assert receipt["published"] is True
     detail = client.get(f"/api/tasks/{receipt['task_id']}").json()
-    assert detail["review_assignments"] == []
+    assert detail["review_assignments"] == []  # 未显式列出 ⇒ 无人承担评测义务
     assert detail["can_manage"] is True  # owner 保留管理权
+    assert detail["status"] == "active"  # 真实走到发布端点
+    # owner 未受邀：首次评分 403 且不产生评分行（既有受邀评分语义）。
+    organizer_view = client.get(f"/api/samples/{detail['samples'][0]['id']}").json()
+    assert organizer_view["blind"] is False
+    rating = client.post(
+        f"/api/samples/{detail['samples'][0]['id']}/rating", json={"choice": "tie"}
+    )
+    assert rating.status_code == 403
+    client.post(
+        f"/api/samples/{detail['samples'][0]['id']}/comments",
+        json={"start": 0, "end": 100, "body": "owner 的管理标注"},
+    )  # owner 仍可评论（访问权限保留）
 
 
 def test_apply_rejects_tampered_mapping(tmp_path, server):
@@ -1133,7 +1125,6 @@ def test_apply_rejects_tampered_mapping(tmp_path, server):
     服务端无任务副作用。"""
     base, app = server
     manifest_path, _manifest, out = prepare_media_and_mapping(tmp_path)
-    _manifest = _manifest | {"participants": [{"name": "受邀同事"}]} if False else _manifest
     client = TestClient(app)
     client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
     mapping_path = out / "mapping.json"
@@ -1229,3 +1220,33 @@ def test_mapping_sha_binding_rejects_midway_changes(tmp_path, server):
     client.post("/api/login", json={"name": "管理员", "password": "admin-agent-pass"})
     detail = client.get(f"/api/tasks/{task_id}").json()
     assert detail["samples"][0]["track_count"] == 2
+
+
+def test_agent_entry_import_isolation():
+    """独立入口的 import 图不得触达服务端模块（fastapi/uvicorn/starlette/cli）。"""
+    import ast
+
+    entry = Path(__file__).resolve().parent.parent / "agent_entry.py"
+    tree = ast.parse(entry.read_text(encoding="utf-8"))
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            imported.extend(
+                f"{module}.{alias.name}" if node.level == 0 else alias.name
+                for alias in node.names
+            )
+    forbidden = (
+        "workbench.cli",
+        "workbench.app",
+        "uvicorn",
+        "fastapi",
+        "starlette",
+        "workbench.align",
+    )
+    violations = [
+        name for name in imported for bad in forbidden if name == bad or name.startswith(bad + ".")
+    ]
+    assert violations == [], f"独立入口引入了服务端依赖：{violations}"

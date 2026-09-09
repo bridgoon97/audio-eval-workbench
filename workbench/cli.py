@@ -12,16 +12,10 @@ import uvicorn
 
 from . import agent_cli
 from .app import create_app
+from .streams import configure_streams
 from .version import VERSION
 
 SUBCOMMANDS = ("serve", "agent")
-
-
-def _configure_streams():
-    # Windows 重定向输出可能采用 cp1252；中文启动提示必须可编码。
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 def _build_serve_parser(prog: str = "audio-eval") -> argparse.ArgumentParser:
@@ -132,7 +126,7 @@ def serve(args, root, host, listener):
 
 
 def main() -> int:
-    _configure_streams()
+    configure_streams()
     argv = sys.argv[1:]
     if argv and argv[0] in SUBCOMMANDS:
         if argv[0] == "agent":

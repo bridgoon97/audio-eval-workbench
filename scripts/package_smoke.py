@@ -86,6 +86,42 @@ if agent_dir.is_dir():
         if help_result.returncode != 0 or "manifest-init" not in help_result.stdout:
             raise RuntimeError(f"agent --help 异常：{help_result.stderr[:200]}")
 
+        # serve 子命令不可用（独立 CLI 不含服务端）。
+        serve_result = agent("serve")
+        if serve_result.returncode == 0 or "invalid choice" not in (
+            serve_result.stderr + serve_result.stdout
+        ):
+            raise RuntimeError("独立 CLI 不应提供 serve 子命令")
+
+        # 解包内容：无服务端组件（fastapi/uvicorn/starlette）。
+        internal = agent_dir / "_internal"
+        for forbidden in ("fastapi", "uvicorn", "starlette"):
+            if any(
+                p.name.lower() == forbidden or p.name.lower().startswith(forbidden)
+                for p in internal.iterdir()
+            ):
+                raise RuntimeError(f"独立 CLI 包混入服务端组件：{forbidden}")
+
+        # 必需文档齐全；开始使用.txt 的命令前缀必须为独立程序名。
+        for required in (
+            "AGENTS.md",
+            "docs/Agent创建评测任务.md",
+            "docs/task-manifest.schema.json",
+            "docs/task-manifest.example.json",
+            "开始使用.txt",
+        ):
+            if not (agent_dir / required).is_file():
+                raise RuntimeError(f"独立 CLI 包缺少必需文件：{required}")
+        usage_text = (agent_dir / "开始使用.txt").read_text(encoding="utf-8")
+        for line in usage_text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("audio-eval "):
+                raise RuntimeError(f"开始使用.txt 含服务端程序前缀：{stripped}")
+        if "audio-eval-agent manifest-init" not in usage_text:
+            raise RuntimeError("开始使用.txt 缺少 audio-eval-agent 命令示例")
+        if "--password-stdin" not in usage_text or "--allow-insecure-http" not in usage_text:
+            raise RuntimeError("开始使用.txt 缺少密码/明文 HTTP 安全说明")
+
         # manifest-init → 填充真实路径 → validate → prepare。
         manifest_path = work_path / "manifest.json"
         result = agent("manifest-init", "--output", str(manifest_path))

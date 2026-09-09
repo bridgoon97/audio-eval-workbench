@@ -80,11 +80,20 @@ usage = f"""开始使用 · 听鉴独立 Agent CLI
 最小命令（在本目录下打开终端执行；Windows 为 audio-eval-agent.exe）：
 
   audio-eval-agent manifest-init --output manifest.json
-  audio-eval agent validate manifest.json
-  audio-eval agent prepare manifest.json --output-dir prepared
-  audio-eval agent apply manifest.json --server <服务地址> \\
+  audio-eval-agent validate manifest.json
+  audio-eval-agent prepare manifest.json --output-dir prepared
+  audio-eval-agent apply manifest.json --server <服务地址> \\
       --user <账号> --password-stdin --state agent-state.json \\
       --mapping prepared/mapping.json --json
+  audio-eval-agent status --state agent-state.json --json
+
+安全说明：
+- 密码只允许 --password-stdin（终端输入，不回显）或 --password-env <变量名>；
+  没有 --password 参数，密码不会进入命令行历史。
+- 默认只允许本机（127.0.0.1/localhost）或 HTTPS 服务地址；
+  访问局域网明文 HTTP 必须显式加 --allow-insecure-http
+  （凭据与音频不加密传输，仅限获准的可信内网）。
+- 发布需要双确认：manifest.json 的 publish=true 且命令行加 --publish。
 
 完整流程、确认清单、失败恢复与安全边界见同目录：
   docs/Agent创建评测任务.md
