@@ -132,6 +132,7 @@ function App() {
   const [playing, setPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [region, setRegion] = useState<[number, number]>([0, 0]);
+  const [contentGuide, setContentGuide] = useState<number[]>([]);
   const [loop, setLoop] = useState(false);
   const [volume, setVolume] = useState(0.7);
   const [loaded, setLoaded] = useState(false);
@@ -369,6 +370,7 @@ function App() {
     setLoaded(false);
     setPlaying(false);
     setAnalyses({});
+    setContentGuide([]);
     const abort = new AbortController();
     let valid = true;
     void next
@@ -377,7 +379,10 @@ function App() {
         abort.signal,
       )
       .then(() => {
-        if (valid) setLoaded(true);
+        if (valid) {
+          setLoaded(true);
+          if (sample.blind) setContentGuide(next.contentGuide());
+        }
       })
       .catch((e) => {
         if (valid) setError(e.message);
@@ -402,7 +407,7 @@ function App() {
     const timer = window.setInterval(() => {
       if (engine?.playing) {
         setPosition(engine.position);
-        if (!engine.loop && engine.position >= engine.duration) {
+        if (!engine.loop && engine.position >= (engine.stopAt ?? engine.duration)) {
           engine.stop();
           setPlaying(false);
         }
@@ -416,7 +421,16 @@ function App() {
       engine.stop();
       setPlaying(false);
     } else {
-      await engine.play(undefined, loop ? region : undefined);
+      const hasRegion = region[1] > region[0];
+      const offset =
+        hasRegion && (engine.offset < region[0] || engine.offset >= region[1])
+          ? region[0]
+          : engine.offset;
+      await engine.play(
+        offset,
+        loop && hasRegion ? region : undefined,
+        !loop && hasRegion ? region[1] : undefined,
+      );
       setPlaying(true);
     }
   };
@@ -426,9 +440,12 @@ function App() {
   };
   const selectRegion = (r: [number, number]) => {
     setRegion(r);
-    if (loop && engine) {
+    if (engine) {
       engine.stop();
       engine.loop = undefined;
+      engine.stopAt = undefined;
+      engine.offset = r[0];
+      setPosition(r[0]);
       setPlaying(false);
     }
   };
@@ -1228,6 +1245,7 @@ function App() {
                               selected={selected === i}
                               duration={duration}
                               region={region}
+                              contentGuide={sample.blind ? contentGuide : undefined}
                               onRegion={selectRegion}
                             />
                             <div

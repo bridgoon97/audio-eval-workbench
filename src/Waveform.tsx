@@ -7,6 +7,7 @@ export function Waveform({
   selected,
   duration,
   region,
+  contentGuide,
   onRegion,
 }: {
   data?: Analysis;
@@ -14,6 +15,7 @@ export function Waveform({
   selected: boolean;
   duration: number;
   region: [number, number];
+  contentGuide?: number[];
   onRegion: (r: [number, number]) => void;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
@@ -69,6 +71,18 @@ export function Waveform({
           ctx.lineTo((i / data.peaks.length) * w, h / 2 - min * h * 0.47);
           ctx.stroke();
         });
+      } else if (contentGuide?.length) {
+        ctx.fillStyle = '#5e7f91';
+        const gap = Math.min(2, w / contentGuide.length / 3);
+        contentGuide.forEach((active, i) => {
+          if (!active) return;
+          const x = (i / contentGuide.length) * w;
+          const bw = w / contentGuide.length;
+          ctx.fillRect(x + gap / 2, h * 0.3, Math.max(1, bw - gap), h * 0.4);
+        });
+        ctx.fillStyle = '#9db1c3';
+        ctx.font = '12px sans-serif';
+        ctx.fillText('共享内容提示 · 不显示候选波形', 12, 18);
       } else {
         ctx.fillStyle = '#8da2b7';
         ctx.font = '14px sans-serif';
@@ -87,14 +101,18 @@ export function Waveform({
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [data, spectrum, selected, duration, region]);
+  }, [data, spectrum, selected, duration, region, contentGuide]);
   const timeAt = (event: React.PointerEvent) => {
     const r = ref.current!.getBoundingClientRect();
     return Math.max(0, Math.min(duration, ((event.clientX - r.left) / r.width) * duration));
   };
   return (
     <canvas
-      aria-label="拖动选择音频片段，或使用下方时间输入"
+      aria-label={
+        contentGuide?.length
+          ? '共享内容提示，拖动选择音频片段'
+          : '拖动选择音频片段，或使用下方时间输入'
+      }
       ref={ref}
       className="waveform"
       onPointerDown={(e) => {
