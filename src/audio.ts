@@ -4,11 +4,35 @@ export function timelinePosition(
   elapsed: number,
   duration: number,
   loop?: [number, number],
+  stopAt?: number,
 ) {
   const position = offset + Math.max(0, elapsed);
   if (loop && loop[1] > loop[0] && position >= loop[1])
     return loop[0] + ((position - loop[0]) % (loop[1] - loop[0]));
-  return Math.min(position, duration);
+  return Math.min(position, stopAt ?? duration, duration);
+}
+
+/** 把所有候选聚合为同一条二值内容提示，不暴露任一候选的幅度轮廓。 */
+export function sharedContentGuide(tracks: Float32Array[], bins = 96) {
+  if (!tracks.length || bins <= 0) return [];
+  const length = Math.min(...tracks.map((track) => track.length));
+  if (!length) return Array(bins).fill(0) as number[];
+  const energies = Array.from({ length: bins }, (_, bin) => {
+    const start = Math.floor((bin * length) / bins);
+    const end = Math.max(start + 1, Math.floor(((bin + 1) * length) / bins));
+    const perTrack = tracks
+      .map((track) => {
+        let sum = 0;
+        const limit = Math.min(end, track.length);
+        for (let i = start; i < limit; i++) sum += track[i] ** 2;
+        return Math.sqrt(sum / Math.max(1, limit - start));
+      })
+      .sort((a, b) => a - b);
+    return perTrack[Math.floor((perTrack.length - 1) / 2)];
+  });
+  const peak = Math.max(...energies);
+  const threshold = Math.max(1e-4, peak * 0.08);
+  return energies.map((energy) => (energy >= threshold ? 1 : 0));
 }
 
 export class AudioEngine {
@@ -23,6 +47,7 @@ export class AudioEngine {
   playing = false;
   generation = 0;
   loop?: [number, number];
+  stopAt?: number;
   constructor(context?: AudioContext) {
     this.context = context || new AudioContext();
     this.master = this.context.createGain();
@@ -39,6 +64,7 @@ export class AudioEngine {
           this.context.currentTime - this.started,
           this.duration,
           this.loop,
+          this.stopAt,
         )
       : this.offset;
   }
@@ -54,13 +80,14 @@ export class AudioEngine {
     this.offset = 0;
     this.selected = 0;
   }
-  async play(offset = this.offset, loop?: [number, number]) {
+  async play(offset = this.offset, loop?: [number, number], stopAt?: number) {
     if (!this.buffers.length) return;
     this.stop();
     const generation = this.generation;
     await this.context.resume();
     if (generation !== this.generation) return;
     this.loop = loop;
+    this.stopAt = loop ? undefined : stopAt;
     this.offset = Math.max(0, Math.min(offset, this.duration));
     if (loop && (this.offset < loop[0] || this.offset >= loop[1])) this.offset = loop[0];
     if (this.offset >= this.duration) this.offset = 0;
@@ -77,7 +104,9 @@ export class AudioEngine {
       gain.gain.value = i === this.selected ? 1 : 0;
       source.connect(gain);
       gain.connect(this.master);
-      source.start(this.started, this.offset);
+      if (this.stopAt && this.stopAt > this.offset)
+        source.start(this.started, this.offset, this.stopAt - this.offset);
+      else source.start(this.started, this.offset);
       this.sources.push(source);
       this.gains.push(gain);
     });
@@ -111,7 +140,7 @@ export class AudioEngine {
     const wasPlaying = this.playing;
     this.stop();
     this.offset = time;
-    if (wasPlaying) void this.play(time, this.loop);
+    if (wasPlaying) void this.play(time, this.loop, this.stopAt);
   }
   setVolume(value: number) {
     this.master.gain.setTargetAtTime(value, this.context.currentTime, 0.01);
@@ -119,5 +148,11 @@ export class AudioEngine {
   dispose() {
     this.stop();
     void this.context.close();
+  }
+  contentGuide(bins = 96) {
+    return sharedContentGuide(
+      this.buffers.map((buffer) => buffer.getChannelData(0)),
+      bins,
+    );
   }
 }

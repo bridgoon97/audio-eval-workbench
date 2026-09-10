@@ -31,6 +31,22 @@ test('首次使用、合成音播放、片段标注、发布判断和重开', as
   await page.getByRole('button', { name: '暂停', exact: true }).click();
   await page.getByLabel('起点', { exact: true }).fill('3.2');
   await page.getByLabel('终点', { exact: true }).fill('3.8');
+  await page.getByRole('button', { name: '播放', exact: true }).click();
+  await expect
+    .poll(async () => Number(await page.getByRole('slider', { name: '播放位置' }).inputValue()))
+    .toBeGreaterThan(3.25);
+  await expect(page.getByRole('button', { name: '播放', exact: true })).toBeVisible({
+    timeout: 3000,
+  });
+  expect(Number(await page.getByRole('slider', { name: '播放位置' }).inputValue())).toBeCloseTo(
+    3.8,
+    1,
+  );
+  await page.getByRole('button', { name: '播放', exact: true }).click();
+  await expect
+    .poll(async () => Number(await page.getByRole('slider', { name: '播放位置' }).inputValue()))
+    .toBeLessThan(3.5);
+  await page.getByRole('button', { name: '暂停', exact: true }).click();
   await page.locator('#comment').fill('测试标注：选区中有短暂衰减');
   await page.getByRole('button', { name: '保存标注', exact: true }).click();
   await expect(page.getByText('测试标注：选区中有短暂衰减', { exact: true })).toBeVisible();
@@ -58,6 +74,25 @@ test('首次使用、合成音播放、片段标注、发布判断和重开', as
   await page.getByRole('button', { name: '查看结果' }).click();
   await expect(page.getByText('1 人已提交', { exact: false })).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test('隐藏版本显示共享内容提示而不暴露候选波形', async ({ page }) => {
+  await page.request.post('/api/login', {
+    data: { name: '浏览器测试', password: 'test-password-only' },
+  });
+  const me = await (await page.request.get('/api/me')).json();
+  const demo = await (await page.request.post('/api/demo')).json();
+  await page.request.patch(`/api/tasks/${demo.id}`, {
+    data: { title: '隐藏内容时间轴测试', kind: '算法版本', mode: 'blind' },
+  });
+  await page.request.post(`/api/tasks/${demo.id}/publish`, {
+    data: { users: [me.id], alignment_confirmed: true },
+  });
+  await page.goto('/');
+  await page.locator('.task-card').filter({ hasText: '隐藏内容时间轴测试' }).click();
+  await expect(page.getByLabel('共享内容提示，拖动选择音频片段')).toHaveCount(3);
+  await expect(page.getByRole('button', { name: '波形', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '频谱', exact: true })).toBeDisabled();
 });
 
 test('真实 Web Audio 渲染：原始增益、共同起点、重复轨道切换与非恒等变异', async ({ page }) => {
