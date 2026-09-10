@@ -9,6 +9,7 @@ export function Waveform({
   region,
   contentGuide,
   onRegion,
+  onSeek,
 }: {
   data?: Analysis;
   spectrum: boolean;
@@ -17,9 +18,13 @@ export function Waveform({
   region: [number, number];
   contentGuide?: number[];
   onRegion: (r: [number, number]) => void;
+  onSeek: (time: number) => void;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const down = useRef<number | null>(null);
+  const moved = useRef(false);
+  const visibleRegion =
+    duration > 0 && region[1] > region[0] && (region[0] > 0.001 || region[1] < duration - 0.001);
   useEffect(() => {
     const canvas = ref.current!;
     const draw = () => {
@@ -88,7 +93,7 @@ export function Waveform({
         ctx.font = '14px sans-serif';
         ctx.fillText('独立试听 · 图形与指标已隐藏', 18, h / 2 + 5);
       }
-      if (duration && region[1] > region[0]) {
+      if (visibleRegion) {
         const x = (region[0] / duration) * w,
           rw = ((region[1] - region[0]) / duration) * w;
         ctx.fillStyle = '#5ee6cf20';
@@ -101,7 +106,7 @@ export function Waveform({
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [data, spectrum, selected, duration, region, contentGuide]);
+  }, [data, spectrum, selected, duration, region, contentGuide, visibleRegion]);
   const timeAt = (event: React.PointerEvent) => {
     const r = ref.current!.getBoundingClientRect();
     return Math.max(0, Math.min(duration, ((event.clientX - r.left) / r.width) * duration));
@@ -110,30 +115,39 @@ export function Waveform({
     <canvas
       aria-label={
         contentGuide?.length
-          ? '共享内容提示，拖动选择音频片段'
-          : '拖动选择音频片段，或使用下方时间输入'
+          ? '共享内容提示；单击跳转，拖动选择，双击清除选区'
+          : '音频时间轴；单击跳转，拖动选择，双击清除选区'
       }
+      data-selection-visible={visibleRegion ? 'true' : 'false'}
       ref={ref}
       className="waveform"
       onPointerDown={(e) => {
         down.current = timeAt(e);
+        moved.current = false;
         e.currentTarget.setPointerCapture(e.pointerId);
       }}
       onPointerMove={(e) => {
-        if (down.current !== null)
-          onRegion([Math.min(down.current, timeAt(e)), Math.max(down.current, timeAt(e))]);
+        if (down.current !== null) {
+          const current = timeAt(e);
+          if (Math.abs(current - down.current) > 0.01) moved.current = true;
+          if (moved.current)
+            onRegion([Math.min(down.current, current), Math.max(down.current, current)]);
+        }
       }}
       onPointerUp={(e) => {
         if (down.current !== null) {
           const end = timeAt(e);
-          if (Math.abs(end - down.current) > 0.01)
-            onRegion([Math.min(end, down.current), Math.max(end, down.current)]);
+          if (moved.current) onRegion([Math.min(end, down.current), Math.max(end, down.current)]);
+          else onSeek(end);
         }
         down.current = null;
+        moved.current = false;
       }}
       onPointerCancel={() => {
         down.current = null;
+        moved.current = false;
       }}
+      onDoubleClick={() => onRegion([0, duration])}
     />
   );
 }
