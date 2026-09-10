@@ -12,7 +12,9 @@
 
 # Agent 创建评测任务
 
-通用 Agent 可以在用户授权下，通过 `audio-eval agent ...` CLI 把已整理的音频编排为评测任务（生成/校验 manifest、准备 16 kHz 合规副本、幂等创建草稿、显式双确认发布）。入口与完整流程见 [docs/Agent创建评测任务.md](docs/Agent创建评测任务.md)，清单结构见 `docs/task-manifest.schema.json`。
+通用 Agent 可以在用户授权下，通过 agent 子命令 CLI 把已整理的音频编排为评测任务（生成/校验 manifest、准备 16 kHz 合规副本、幂等创建草稿、显式双确认发布）。入口与完整流程见 [docs/Agent创建评测任务.md](docs/Agent创建评测任务.md)，清单结构见 `docs/task-manifest.schema.json`。
+
+**双入口命令映射**：完整服务端 Windows 包内的 Agent 使用 `audio-eval.exe agent ...`（同机调用，无需另装）；独立 Agent CLI 包使用 `audio-eval-agent.exe ...`（无 `agent` 前缀段，不含服务端）。两者子命令与参数一致，程序名不同，不要混用。
 
 Agent 附加禁止事项：
 

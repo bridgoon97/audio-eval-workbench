@@ -50,6 +50,8 @@ manifest 字段以 `docs/task-manifest.schema.json` 为准，示例见 `docs/tas
 
 ## 3. 命令序列
 
+**双入口命令映射**：本手册统一使用 `audio-eval agent ...` 书写。实际程序名按安装方式选择——完整服务端 Windows 包内为 `audio-eval.exe agent ...`（同机调用，无需另装）；独立 Agent CLI 包内为 `audio-eval-agent.exe ...`（无 `agent` 前缀段，不含服务端）。三者的子命令与参数完全一致，仅程序名不同，不要混用。
+
 ```bash
 # 0) 生成模板并按第 1 节问题填写
 audio-eval agent manifest-init --output manifest.json
