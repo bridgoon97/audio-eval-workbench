@@ -47,6 +47,21 @@ test('首次使用、合成音播放、片段标注、发布判断和重开', as
     .poll(async () => Number(await page.getByRole('slider', { name: '播放位置' }).inputValue()))
     .toBeLessThan(3.5);
   await page.getByRole('button', { name: '暂停', exact: true }).click();
+  const timeline = page.getByLabel('音频时间轴；单击跳转，拖动选择，双击清除选区').first();
+  await expect(timeline).toHaveAttribute('data-selection-visible', 'true');
+  const timelineBox = await timeline.boundingBox();
+  await timeline.click({
+    position: { x: timelineBox!.width * 0.25, y: timelineBox!.height / 2 },
+  });
+  await expect
+    .poll(async () => Number(await page.getByRole('slider', { name: '播放位置' }).inputValue()))
+    .toBeCloseTo(2, 1);
+  await timeline.dblclick({
+    position: { x: timelineBox!.width * 0.25, y: timelineBox!.height / 2 },
+  });
+  await expect(timeline).toHaveAttribute('data-selection-visible', 'false');
+  await expect(page.getByLabel('起点', { exact: true })).toHaveValue('0');
+  await expect(page.getByLabel('终点', { exact: true })).toHaveValue('8');
   await page.locator('#comment').fill('测试标注：选区中有短暂衰减');
   await page.getByRole('button', { name: '保存标注', exact: true }).click();
   await expect(page.getByText('测试标注：选区中有短暂衰减', { exact: true })).toBeVisible();
@@ -90,7 +105,7 @@ test('隐藏版本显示共享内容提示而不暴露候选波形', async ({ pa
   });
   await page.goto('/');
   await page.locator('.task-card').filter({ hasText: '隐藏内容时间轴测试' }).click();
-  await expect(page.getByLabel('共享内容提示，拖动选择音频片段')).toHaveCount(3);
+  await expect(page.getByLabel('共享内容提示；单击跳转，拖动选择，双击清除选区')).toHaveCount(3);
   await expect(page.getByRole('button', { name: '波形', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: '频谱', exact: true })).toBeDisabled();
 });

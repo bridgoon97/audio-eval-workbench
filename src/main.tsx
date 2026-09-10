@@ -1247,6 +1247,10 @@ function App() {
                               region={region}
                               contentGuide={sample.blind ? contentGuide : undefined}
                               onRegion={selectRegion}
+                              onSeek={(at) => {
+                                engine?.seek(at);
+                                setPosition(at);
+                              }}
                             />
                             <div
                               className="playhead"
