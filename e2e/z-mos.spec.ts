@@ -14,10 +14,15 @@ test('多维 MOS：创建、指定参考、完整评分、刷新锁定与结果�
   await page.locator('input[name="title"]').fill('多维 MOS 浏览器验收');
   await page.locator('select[name="mode"]').selectOption('blind');
   await page.locator('select[name="evaluation"]').selectOption('mos');
+  const created = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/tasks',
+  );
   await page.getByRole('button', { name: '创建任务', exact: true }).click();
+  const creationResponse = await created;
+  expect(creationResponse.status()).toBe(200);
+  const task = await creationResponse.json();
   // 从运行时合成演示取 WAV，真实上传到新建的 MOS 任务。
-  const tasks = await (await page.request.get('/api/tasks')).json();
-  const task = tasks.find((t: { title: string }) => t.title === '多维 MOS 浏览器验收');
   const demo = await (await page.request.post('/api/demo')).json();
   const demoTask = await (await page.request.get(`/api/tasks/${demo.id}`)).json();
   const demoSample = await (
