@@ -67,6 +67,23 @@ test('首次使用、合成音播放、片段标注、发布判断和重开', as
   await expect(page.getByText('测试标注：选区中有短暂衰减', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '频谱', exact: true }).click();
   await expect(page.getByText('共用色阶 −100～0 dB')).toBeVisible();
+  // 点击频谱直接切换实际试听轨，暂停时仅定位；播放中保持播放并跳到点击位置。
+  const spectrumA = page.locator('.track').nth(0).locator('canvas');
+  const spectrumB = page.locator('.track').nth(1).locator('canvas');
+  await spectrumB.click({ position: { x: 80, y: 30 } });
+  await expect(page.locator('.current-label')).toHaveText('试听 B');
+  await expect(page.locator('.track').nth(1)).toHaveClass(/selected/);
+  await expect(page.getByRole('button', { name: '播放', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '播放', exact: true }).click();
+  await spectrumA.click({ position: { x: 100, y: 30 } });
+  await expect(page.locator('.current-label')).toHaveText('试听 A');
+  await expect(page.getByRole('button', { name: '暂停', exact: true })).toBeVisible();
+  const clickedPosition = Number(await page.getByRole('slider', { name: '播放位置' }).inputValue());
+  await expect
+    .poll(async () => Number(await page.getByRole('slider', { name: '播放位置' }).inputValue()))
+    .toBeGreaterThan(clickedPosition);
+  await page.getByRole('button', { name: '暂停', exact: true }).click();
+
   const footer = await page.locator('.transport').boundingBox();
   expect(footer!.y + footer!.height).toBeLessThanOrEqual(768);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
@@ -108,6 +125,12 @@ test('隐藏版本显示共享内容提示而不暴露候选波形', async ({ pa
   await expect(page.getByLabel('共享内容提示；单击跳转，拖动选择，双击清除选区')).toHaveCount(3);
   await expect(page.getByRole('button', { name: '波形', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: '频谱', exact: true })).toBeDisabled();
+  await page
+    .locator('.track')
+    .nth(2)
+    .locator('canvas')
+    .click({ position: { x: 70, y: 25 } });
+  await expect(page.locator('.current-label')).toHaveText('试听 C');
 });
 
 test('真实 Web Audio 渲染：原始增益、共同起点、重复轨道切换与非恒等变异', async ({ page }) => {
