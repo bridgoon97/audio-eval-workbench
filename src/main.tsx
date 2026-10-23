@@ -1494,6 +1494,8 @@ function App() {
                         onListen={select}
                         notify={setNotice}
                         onSaved={async () => {
+                          // 评分提交已成功，丢弃提交前在飞的同步，避免旧的未提交状态写回。
+                          syncEpoch.current += 1;
                           await refreshSample();
                           await refreshTasks();
                         }}
