@@ -1252,7 +1252,8 @@ def test_agent_entry_import_isolation():
     assert violations == [], f"独立入口引入了服务端依赖：{violations}"
 
 
-def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatch):
+@pytest.mark.parametrize("with_reference", [True, False])
+def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatch, with_reference):
     """真实 CLI 编排后的参考标记及发布行为，而非仅检查 manifest 字符串。"""
     base, _ = server
     work = tmp_path / "mos-work"
@@ -1265,8 +1266,8 @@ def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatc
     path = work / "manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
     loaded, directory = load_manifest(path)
-    assert any("timbre_reference" in p for p in validate_manifest(loaded, directory))
-    manifest["samples"][0]["candidates"][0]["timbre_reference"] = True
+    assert validate_manifest(loaded, directory) == []
+    manifest["samples"][0]["candidates"][0]["timbre_reference"] = with_reference
     path.write_text(json.dumps(manifest), encoding="utf-8")
     loaded, directory = load_manifest(path)
     assert validate_manifest(loaded, directory) == []
@@ -1287,6 +1288,11 @@ def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatc
         patch.setattr(agent_tasks.AgentClient, "identity", lambda self: {**original_identity(self), "mos_custom_dimensions": False})
         with pytest.raises(AgentError, match="尚不支持自定义评分指标"):
             agent_tasks.run_apply(path, base, "编排组织者", "organizer-agent-pass", tmp_path / "unsupported-custom-state.json", out / "mapping.json", publish_flag=True)
+    if not with_reference:
+        with monkeypatch.context() as patch:
+            patch.setattr(agent_tasks.AgentClient, "identity", lambda self: {**original_identity(self), "mos_optional_reference": False})
+            with pytest.raises(AgentError, match="尚不支持无参考 MOS"):
+                agent_tasks.run_apply(path, base, "编排组织者", "organizer-agent-pass", tmp_path / "unsupported-no-ref-state.json", out / "mapping.json", publish_flag=True)
     receipt = agent_tasks.run_apply(
         path,
         base,
@@ -1308,4 +1314,4 @@ def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatc
         assert detail["status"] == "active" and detail["evaluation"] == "mos"
         sample = c.get("/api/samples/" + detail["samples"][0]["id"]).json()
         assert sample["dimensions"] == manifest["task"]["dimensions"]
-        assert len([t for t in sample["tracks"] if t["is_reference"]]) == 1
+        assert len([t for t in sample["tracks"] if t["is_reference"]]) == int(with_reference)

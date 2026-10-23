@@ -172,14 +172,8 @@ def test_incomplete_wrong_track_and_invalid_scores_leave_no_rows(env):
     assert peers[0][0].get(f"/api/samples/{sid}").json()["rating"] is None
 
 
-def test_reference_permissions_publish_gate_and_freeze(env):
+def test_reference_permissions_and_freeze(env):
     app, a, peers, tid, sid, tracks, _ = env
-    assert (
-        a.post(
-            f"/api/tasks/{tid}/publish", json={"users": [], "alignment_confirmed": True}
-        ).status_code
-        == 422
-    )
     assert (
         TestClient(app)
         .put(f"/api/samples/{sid}/timbre-reference", json={"track_id": tracks[0]})
@@ -273,12 +267,7 @@ def test_mos_reference_deletion_and_purge_cascade(env):
         == 200
     )
     assert a.delete(f"/api/tracks/{tracks[0]}").status_code == 200
-    assert (
-        a.post(
-            f"/api/tasks/{tid}/publish", json={"users": [], "alignment_confirmed": True}
-        ).status_code
-        == 422
-    )
+    assert not any(t["is_reference"] for t in a.get(f"/api/samples/{sid}").json()["tracks"])
     assert a.delete(f"/api/samples/{sid}").status_code == 200
     assert (
         a.request("DELETE", f"/api/tasks/{tid}", json={"title": "多维测试"}).status_code
@@ -461,3 +450,74 @@ def test_custom_scale_edit_blocks_existing_draft_contribution(env):
     )
     assert response.status_code == 409
     assert a.get(f"/api/tasks/{tid}").json()["dimensions"] == original
+
+
+def test_mos_optional_reference_full_flow(env):
+    """无参考时所有轨都必须评分，支持设定后取消，结果保留完整证据。"""
+    _, a, peers, tid, sid, tracks, _ = env
+    dimensions = [
+        {
+            "key": "quality",
+            "name": "音质",
+            "anchors": ["很差", "较差", "一般", "较好", "很好"],
+        }
+    ]
+    assert (
+        a.patch(
+            f"/api/tasks/{tid}",
+            json={"title": "无参考音质评分", "mode": "blind", "evaluation": "mos", "dimensions": dimensions},
+        ).status_code
+        == 200
+    )
+    assert (
+        a.put(
+            f"/api/samples/{sid}/timbre-reference", json={"track_id": tracks[0]}
+        ).status_code
+        == 200
+    )
+    assert (
+        a.put(
+            f"/api/samples/{sid}/timbre-reference", json={"track_id": None}
+        ).status_code
+        == 200
+    )
+    assert (
+        a.post(
+            f"/api/tasks/{tid}/publish",
+            json={"users": [peers[0][1]], "alignment_confirmed": True},
+        ).status_code
+        == 200
+    )
+    client = peers[0][0]
+    detail = client.get(f"/api/samples/{sid}").json()
+    assert not any(t["is_reference"] for t in detail["tracks"])
+    values = {tr: {"quality": i + 2} for i, tr in enumerate(tracks)}
+    assert (
+        client.post(
+            f"/api/samples/{sid}/rating",
+            json={"scores": {tr: values[tr] for tr in tracks[1:]}},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(f"/api/samples/{sid}/rating", json={"scores": values}).status_code
+        == 200
+    )
+    assert (
+        a.put(
+            f"/api/samples/{sid}/timbre-reference", json={"track_id": None}
+        ).status_code
+        == 409
+    )
+    assert a.post(f"/api/tasks/{tid}/close").status_code == 200
+    report = a.get(f"/api/tasks/{tid}/report").json()
+    result = report["样本"][0]["MOS"]
+    assert result["参考ID"] is None
+    assert {t["ID"] for t in result["候选"]} == set(tracks)
+    for track in result["候选"]:
+        assert track["维度"][0]["均值"] == values[track["ID"]]["quality"]
+        assert track["维度"][0]["人数"] == 1
+    for suffix in ["export", "export.csv", "export.md"]:
+        response = a.get(f"/api/tasks/{tid}/{suffix}")
+        assert response.status_code == 200
+        assert "秘密算法0" in response.text
