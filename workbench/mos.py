@@ -83,8 +83,8 @@ def validate_scores(db, sample_id, scores):
         r[0]
         for r in db.execute("SELECT id FROM tracks WHERE sample_id=?", (sample_id,))
     } - {ref}
-    if not ref or not ids:
-        raise HTTPException(422, "请先配置音色参考与待评分候选")
+    if not ids:
+        raise HTTPException(422, "请先添加待评分候选")
     if not isinstance(scores, dict) or set(scores) != ids:
         raise HTTPException(422, "必须为全部待测候选评分；参考音色不参与评分")
     task_id = db.execute(

@@ -479,7 +479,7 @@ def results_markdown(value) -> str:
                     )
             lines += [
                 "",
-                f"参考轨 ID：{sample['MOS']['参考ID']}",
+                f"参考轨 ID：{sample['MOS']['参考ID'] or '未设置（全部序列评分）'}",
                 "",
                 "原始评分（含稳定用户 ID 与候选 ID）：",
                 "",
@@ -884,6 +884,7 @@ def create_app(
             return {
                 "evaluation_methods": ["preference", "mos"],
                 "mos_custom_dimensions": True,
+                "mos_optional_reference": True,
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
                 "version": VERSION,
                 "instance_id": app.state.instance_id,
@@ -2454,7 +2455,7 @@ def create_app(
         return {"id": request_id, "reused": False}
 
     class ReferenceInput(BaseModel):
-        track_id: str
+        track_id: str | None = None
 
     @app.put("/api/samples/{sample_id}/timbre-reference")
     def set_timbre_reference(sample_id: str, body: ReferenceInput, request: Request):
@@ -2465,7 +2466,7 @@ def create_app(
                 raise HTTPException(409, "发布后参考音色冻结")
             if t["evaluation"] != "mos":
                 raise HTTPException(422, "仅多维评分任务可配置音色参考")
-            if not db.execute(
+            if body.track_id is not None and not db.execute(
                 "SELECT 1 FROM tracks WHERE id=? AND sample_id=?",
                 (body.track_id, sample_id),
             ).fetchone():
@@ -2479,10 +2480,13 @@ def create_app(
                 ).fetchone()
             ):
                 raise HTTPException(409, "已有贡献，不能更换参考")
-            db.execute(
-                "INSERT INTO timbre_references VALUES(?,?) ON CONFLICT(sample_id) DO UPDATE SET track_id=excluded.track_id",
-                (sample_id, body.track_id),
-            )
+            if body.track_id is None:
+                db.execute("DELETE FROM timbre_references WHERE sample_id=?", (sample_id,))
+            else:
+                db.execute(
+                    "INSERT INTO timbre_references VALUES(?,?) ON CONFLICT(sample_id) DO UPDATE SET track_id=excluded.track_id",
+                    (sample_id, body.track_id),
+                )
         return {"ok": True}
 
     @app.post("/api/tasks/{task_id}/publish")
@@ -2500,10 +2504,6 @@ def create_app(
             ).fetchall()
             if not rows or any(r["n"] < 2 for r in rows):
                 raise HTTPException(422, "每个样本至少需要两个版本")
-            if t["evaluation"] == "mos" and any(
-                not mos.reference(db, r["id"]) for r in rows
-            ):
-                raise HTTPException(422, "每个多维评分片段必须指定音色参考")
             # body.users 才是受邀评测者；owner 自动获得访问权限，但不构成评测义务。
             for member in set(body.users):
                 if not db.execute(

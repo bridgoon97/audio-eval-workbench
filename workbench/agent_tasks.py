@@ -253,9 +253,9 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
         sample_keys.add(key)
         timbre_refs = [c for c in sample["candidates"] if c.get("timbre_reference")]
         if manifest["task"].get("evaluation", "preference") == "mos":
-            if len(timbre_refs) != 1:
+            if len(timbre_refs) > 1:
                 problems.append(
-                    f"{key}: 多维 MOS 必须恰有一条 timbre_reference 音色参考"
+                    f"{key}: 多维 MOS 最多设置一条 timbre_reference 音色参考（可不设置）"
                 )
         elif timbre_refs:
             problems.append(f"{key}: 偏好任务不能设置 timbre_reference")
@@ -909,7 +909,7 @@ class AgentClient:
                 f"服务版本 {status.get('version')} 与 CLI {VERSION} 不一致，"
                 "请先核对正在运行的服务"
             )
-        return {**me, "instance_id": status.get("instance_id"), "evaluation_methods": status.get("evaluation_methods", ["preference"]), "mos_custom_dimensions": status.get("mos_custom_dimensions", False)}
+        return {**me, "instance_id": status.get("instance_id"), "evaluation_methods": status.get("evaluation_methods", ["preference"]), "mos_custom_dimensions": status.get("mos_custom_dimensions", False), "mos_optional_reference": status.get("mos_optional_reference", False)}
 
     def login(self, user: str, password: str) -> dict[str, Any]:
         self._post("/api/login", json={"name": user, "password": password})
@@ -1085,6 +1085,12 @@ def run_apply(
             raise AgentError("服务端尚不支持多维 MOS，请使用配套试用服务端或升级服务；未创建任务")
         if manifest["task"].get("dimensions") is not None and not identity.get("mos_custom_dimensions"):
             raise AgentError("服务端尚不支持自定义评分指标，请升级配套服务端；未创建任务")
+        if (
+            manifest["task"].get("evaluation") == "mos"
+            and any(not any(c.get("timbre_reference") for c in sample["candidates"]) for sample in manifest["samples"])
+            and not identity.get("mos_optional_reference")
+        ):
+            raise AgentError("服务端尚不支持无参考 MOS，请升级配套服务端；未创建任务")
         client.login(user, password)
         data_id = client.data_id()
         _verify_server_binding(state, identity, data_id)
@@ -1217,10 +1223,10 @@ def run_apply(
                 )
 
             if manifest["task"].get("evaluation") == "mos":
-                ref = next(c for c in sample["candidates"] if c.get("timbre_reference"))
+                ref = next((c for c in sample["candidates"] if c.get("timbre_reference")), None)
                 client._put(
                     f"/api/samples/{entry['sample_id']}/timbre-reference",
-                    json={"track_id": entry["tracks"][ref["key"]]["track_id"]},
+                    json={"track_id": entry["tracks"][ref["key"]]["track_id"] if ref else None},
                 )
             receipt_samples.append(
                 {

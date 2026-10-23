@@ -1226,8 +1226,8 @@ function App() {
                         <div className="mos-reference-note">
                           <strong>参考音色</strong>
                           <p>
-                            标记的参考只用于音色比较，不参与评分。首版参考与候选须为同长度的 16 kHz
-                            音频；参考身份公开，候选身份按任务模式隐藏。
+                            参考可选，不需要对照时选择“不使用参考”。标记的参考不参与评分，未指定时全部序列参与评分。参考与候选须为同长度的
+                            16 kHz 音频；参考身份公开，候选身份按任务模式隐藏。
                           </p>
                           {task.can_manage && task.status === 'draft' && (
                             <label>
@@ -1238,15 +1238,13 @@ function App() {
                                 onChange={(e) =>
                                   void run(async () => {
                                     await api(`/samples/${sample.id}/timbre-reference`, 'PUT', {
-                                      track_id: e.target.value,
+                                      track_id: e.target.value || null,
                                     });
                                     await refreshSample();
                                   })
                                 }
                               >
-                                <option value="" disabled>
-                                  请选择已导入的参考序列
-                                </option>
+                                <option value="">不使用参考（全部序列参与评分）</option>
                                 {sample.tracks?.map((t) => (
                                   <option key={t.id} value={t.id}>
                                     {t.name}
