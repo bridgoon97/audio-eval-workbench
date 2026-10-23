@@ -2532,3 +2532,33 @@ kbd {
   line-height: 1.65;
   font-size: 13px;
 }
+
+.mos-config {
+  margin: 16px 0;
+}
+.mos-config > p {
+  color: var(--muted);
+  font-size: 13px;
+}
+.mos-config-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  margin: 14px 0;
+}
+.mos-config-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.mos-config-actions button {
+  padding: 5px 9px;
+  font-size: 12px;
+}
+.mos-anchor-editor {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}

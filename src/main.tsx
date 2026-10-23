@@ -36,6 +36,7 @@ import { CommentThread } from './CommentThread';
 import { ProcessingModal } from './ProcessingModal';
 import { Waveform } from './Waveform';
 import { MosPanel } from './MosPanel';
+import { MosTaskSettings } from './MosTaskSettings';
 import { ApplyFlow } from './ApplyFlow';
 import { AccessAdmin, DeviceAdmin } from './AccessAdmin';
 import { SecuritySettings } from './SecuritySettings';
@@ -1868,7 +1869,10 @@ function App() {
                 e.preventDefault();
                 const data = Object.fromEntries(new FormData(e.currentTarget));
                 void run(async () => {
-                  const t = await api('/tasks', 'POST', data);
+                  const t = await api('/tasks', 'POST', {
+                    ...data,
+                    dimensions: data.dimensions ? JSON.parse(String(data.dimensions)) : undefined,
+                  });
                   setModal('');
                   await refreshTasks();
                   await openTask(t.id);
@@ -1899,13 +1903,7 @@ function App() {
                   <option value="blind">独立评测：隐藏版本，关闭后统一揭晓</option>
                 </select>
               </label>
-              <label>
-                评分方式
-                <select name="evaluation">
-                  <option value="preference">偏好判断：选择更倾向的候选</option>
-                  <option value="mos">多维 MOS：降噪、音色相似度、音质、可懂度</option>
-                </select>
-              </label>
+              <MosTaskSettings />
               <p className="muted">
                 多维 MOS
                 每题需导入并指定一条参考音色，其余序列逐一评分。参考计入首版每题最多六条音频的上限。
@@ -1957,7 +1955,10 @@ function App() {
                 e.preventDefault();
                 const data = Object.fromEntries(new FormData(e.currentTarget));
                 void run(async () => {
-                  await api('/tasks/' + task.id, 'PATCH', data);
+                  await api('/tasks/' + task.id, 'PATCH', {
+                    ...data,
+                    dimensions: data.dimensions ? JSON.parse(String(data.dimensions)) : undefined,
+                  });
                   await openTask(task.id);
                   await refreshTasks();
                   setModal('');
@@ -1965,7 +1966,11 @@ function App() {
                 });
               }}
             >
-              <input type="hidden" name="evaluation" value={task.evaluation} />
+              <MosTaskSettings
+                initialMethod={task.evaluation}
+                initialDimensions={task.dimensions}
+                lockedMethod
+              />
               <p className="muted">仅准备中的任务可修改；发布后名称、比较类型和模式冻结。</p>
               <label>
                 任务名称
@@ -2321,6 +2326,34 @@ function App() {
                   受邀名单来自评测分配；负责人自动拥有访问权限，但不自动受邀。已完成＝已提交全部片段；进行中＝部分片段；未开始＝尚未提交；评论不算提交。
                 </small>
               </section>
+              {report.任务.evaluation === 'mos' && (
+                <details className="mos-scale-snapshot mos-result">
+                  <summary>指标与档位说明（发布时量表）</summary>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>指标</th>
+                        {[1, 2, 3, 4, 5].map((n) => (
+                          <th key={n}>{n} 分</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {report.任务.dimensions?.map((d) => (
+                        <tr key={d.key}>
+                          <td>
+                            {d.name}
+                            <small>{d.question}</small>
+                          </td>
+                          {d.anchors.map((a, n) => (
+                            <td key={n}>{a}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </details>
+              )}
               <section>
                 <h3>{report.任务.evaluation === 'mos' ? '逐片段多维 MOS' : '逐片段偏好'}</h3>
                 <small>

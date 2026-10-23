@@ -5,6 +5,7 @@ export type Task = {
   kind: string;
   mode: string;
   evaluation: 'preference' | 'mos';
+  dimensions: Dimension[];
   status: string;
   owner: string;
   can_manage: boolean;

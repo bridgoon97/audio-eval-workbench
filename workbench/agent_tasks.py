@@ -44,6 +44,17 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                 },
                 "mode": {"enum": ["development", "blind"]},
                 "evaluation": {"enum": ["preference", "mos"]},
+                "dimensions": {
+                    "type": "array", "minItems": 1, "maxItems": 8,
+                    "items": {"type": "object", "required": ["key", "name", "anchors"], "additionalProperties": False,
+                        "properties": {
+                            "key": {"type": "string", "pattern": "^[a-zA-Z][a-zA-Z0-9_]{0,63}$"},
+                            "name": {"type": "string", "minLength": 1, "maxLength": 40},
+                            "question": {"type": "string", "maxLength": 200},
+                            "anchors": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 80}}
+                        }
+                    }
+                },
             },
         },
         "participants": {
@@ -222,6 +233,14 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
     不比较原始总帧数，避免把"同一时长、不同采样率"误判为不一致。
     """
     problems: list[str] = []
+    dims = manifest["task"].get("dimensions")
+    if dims is not None:
+        if manifest["task"].get("evaluation") != "mos":
+            problems.append("自定义指标仅适用于多维 MOS")
+        if len({d["key"] for d in dims}) != len(dims) or len({d["name"].strip() for d in dims}) != len(dims):
+            problems.append("自定义指标标识与名称不能重复")
+        if any(not d["name"].strip() or any(not a.strip() for a in d["anchors"]) for d in dims):
+            problems.append("指标名称和档位说明不能为空白")
     sample_keys: set[str] = set()
     samples = manifest["samples"]
     want_publish = manifest.get("publish", False)
@@ -890,7 +909,7 @@ class AgentClient:
                 f"服务版本 {status.get('version')} 与 CLI {VERSION} 不一致，"
                 "请先核对正在运行的服务"
             )
-        return {**me, "instance_id": status.get("instance_id"), "evaluation_methods": status.get("evaluation_methods", ["preference"])}
+        return {**me, "instance_id": status.get("instance_id"), "evaluation_methods": status.get("evaluation_methods", ["preference"]), "mos_custom_dimensions": status.get("mos_custom_dimensions", False)}
 
     def login(self, user: str, password: str) -> dict[str, Any]:
         self._post("/api/login", json={"name": user, "password": password})
@@ -1064,6 +1083,8 @@ def run_apply(
         identity = client.identity()
         if manifest["task"].get("evaluation") == "mos" and "mos" not in identity["evaluation_methods"]:
             raise AgentError("服务端尚不支持多维 MOS，请使用配套试用服务端或升级服务；未创建任务")
+        if manifest["task"].get("dimensions") is not None and not identity.get("mos_custom_dimensions"):
+            raise AgentError("服务端尚不支持自定义评分指标，请升级配套服务端；未创建任务")
         client.login(user, password)
         data_id = client.data_id()
         _verify_server_binding(state, identity, data_id)

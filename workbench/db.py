@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS tracks(id TEXT PRIMARY KEY, sample_id TEXT NOT NULL R
 CREATE TABLE IF NOT EXISTS aliases(user_id TEXT REFERENCES users(id), sample_id TEXT REFERENCES samples(id), track_id TEXT REFERENCES tracks(id), position INTEGER NOT NULL, PRIMARY KEY(user_id,track_id), UNIQUE(user_id,sample_id,position));
 CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY, sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), track_id TEXT REFERENCES tracks(id), start INTEGER NOT NULL, end INTEGER NOT NULL, body TEXT NOT NULL, tag TEXT NOT NULL, parent TEXT REFERENCES comments(id), created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ratings(sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), choice TEXT NOT NULL, reason TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY(sample_id,user_id));
-CREATE TABLE IF NOT EXISTS evaluation_config(task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, method TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS evaluation_config(task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, method TEXT NOT NULL, dimensions TEXT);
 CREATE TABLE IF NOT EXISTS timbre_references(sample_id TEXT PRIMARY KEY REFERENCES samples(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS mos_submissions(sample_id TEXT NOT NULL, user_id TEXT NOT NULL, scores TEXT NOT NULL, PRIMARY KEY(sample_id,user_id), FOREIGN KEY(sample_id,user_id) REFERENCES ratings(sample_id,user_id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS review_assignments(task_id TEXT NOT NULL REFERENCES tasks(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(task_id,user_id));
@@ -55,6 +55,14 @@ def init(path):
     with connect(path) as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript(SCHEMA)
+        # 量表保留任务快照；兼容首版试用库并补齐当时的默认四维。
+        config_columns = {row[1] for row in db.execute("PRAGMA table_info(evaluation_config)")}
+        if "dimensions" not in config_columns:
+            db.execute("ALTER TABLE evaluation_config ADD COLUMN dimensions TEXT")
+        import json
+
+        from .mos import DIMENSIONS
+        db.execute("UPDATE evaluation_config SET dimensions=? WHERE method='mos' AND dimensions IS NULL", (json.dumps(DIMENSIONS, ensure_ascii=False),))
         # 无损迁移：v0.7.0 旧库 users 表没有 active 列，补齐后默认全部可用；
         # 重复执行与重复启动均无副作用。
         columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}

@@ -99,7 +99,9 @@ def test_mos_full_flow_stats_exports_and_sealing(env):
     for index, (c, _) in enumerate(peers):
         if index == 1:
             assert c.get(f"/api/samples/{sid}").json()["rating"] is None
-            assert "scores" not in json.dumps(a.get(f"/api/tasks/{tid}/progress").json())
+            assert "scores" not in json.dumps(
+                a.get(f"/api/tasks/{tid}/progress").json()
+            )
         body = {"choice": "mos", "scores": scores(tracks, 1 if index == 0 else 5)}
         assert c.post(f"/api/samples/{sid}/rating", json=body).status_code == 200
         assert c.post(f"/api/samples/{sid}/rating", json=body).status_code == 200
@@ -264,39 +266,198 @@ def test_mos_backup_restore_and_legacy_defaults(env, tmp_path):
 
 def test_mos_reference_deletion_and_purge_cascade(env):
     _, a, _, tid, sid, tracks, _ = env
-    assert a.put(f'/api/samples/{sid}/timbre-reference', json={'track_id': tracks[0]}).status_code == 200
-    assert a.delete(f'/api/tracks/{tracks[0]}').status_code == 200
-    assert a.post(f'/api/tasks/{tid}/publish', json={'users': [], 'alignment_confirmed': True}).status_code == 422
-    assert a.delete(f'/api/samples/{sid}').status_code == 200
-    assert a.request('DELETE', f'/api/tasks/{tid}', json={'title': '多维测试'}).status_code == 200
-    headers = {'x-csrf-token': a.get('/api/me').json()['csrf_token']}
-    prepared = a.post(f'/api/tasks/{tid}/purge/prepare', headers=headers)
+    assert (
+        a.put(
+            f"/api/samples/{sid}/timbre-reference", json={"track_id": tracks[0]}
+        ).status_code
+        == 200
+    )
+    assert a.delete(f"/api/tracks/{tracks[0]}").status_code == 200
+    assert (
+        a.post(
+            f"/api/tasks/{tid}/publish", json={"users": [], "alignment_confirmed": True}
+        ).status_code
+        == 422
+    )
+    assert a.delete(f"/api/samples/{sid}").status_code == 200
+    assert (
+        a.request("DELETE", f"/api/tasks/{tid}", json={"title": "多维测试"}).status_code
+        == 200
+    )
+    headers = {"x-csrf-token": a.get("/api/me").json()["csrf_token"]}
+    prepared = a.post(f"/api/tasks/{tid}/purge/prepare", headers=headers)
     assert prepared.status_code == 200, prepared.text
-    assert a.post(f'/api/tasks/{tid}/purge', headers=headers, json={'确认令牌': prepared.json()['确认令牌']}).status_code == 200
+    assert (
+        a.post(
+            f"/api/tasks/{tid}/purge",
+            headers=headers,
+            json={"确认令牌": prepared.json()["确认令牌"]},
+        ).status_code
+        == 200
+    )
 
 
 def test_legacy_without_config_defaults_to_preference(env):
     app, a, _, _, _, _, _ = env
-    tid = a.post('/api/tasks', json={'title': '旧库任务'}).json()['id']
+    tid = a.post("/api/tasks", json={"title": "旧库任务"}).json()["id"]
     with sqlite3.connect(app.state.database) as db:
-        db.execute('DELETE FROM evaluation_config WHERE task_id=?', (tid,))
+        db.execute("DELETE FROM evaluation_config WHERE task_id=?", (tid,))
     from workbench.db import init
+
     init(app.state.database)
     init(app.state.database)
-    assert a.get(f'/api/tasks/{tid}').json()['evaluation'] == 'preference'
+    assert a.get(f"/api/tasks/{tid}").json()["evaluation"] == "preference"
 
 
 def test_mos_purge_removes_score_evidence_with_task(env):
     app, a, peers, tid, sid, tracks, _ = env
     start(env)
-    assert peers[0][0].post(f'/api/samples/{sid}/rating', json={'scores': scores(tracks, 4)}).status_code == 200
-    assert a.post(f'/api/tasks/{tid}/close').status_code == 200
-    assert a.request('DELETE', f'/api/tasks/{tid}', json={'title': '多维测试'}).status_code == 200
-    headers = {'x-csrf-token': a.get('/api/me').json()['csrf_token']}
-    token = a.post(f'/api/tasks/{tid}/purge/prepare', headers=headers).json()['确认令牌']
-    assert a.post(f'/api/tasks/{tid}/purge', headers=headers, json={'确认令牌': token}).status_code == 200
+    assert (
+        peers[0][0]
+        .post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 4)})
+        .status_code
+        == 200
+    )
+    assert a.post(f"/api/tasks/{tid}/close").status_code == 200
+    assert (
+        a.request("DELETE", f"/api/tasks/{tid}", json={"title": "多维测试"}).status_code
+        == 200
+    )
+    headers = {"x-csrf-token": a.get("/api/me").json()["csrf_token"]}
+    token = a.post(f"/api/tasks/{tid}/purge/prepare", headers=headers).json()[
+        "确认令牌"
+    ]
+    assert (
+        a.post(
+            f"/api/tasks/{tid}/purge", headers=headers, json={"确认令牌": token}
+        ).status_code
+        == 200
+    )
     with sqlite3.connect(app.state.database) as db:
-        assert db.execute('SELECT count(*) FROM mos_submissions').fetchone()[0] == 0
-        assert db.execute('SELECT count(*) FROM timbre_references').fetchone()[0] == 0
-        assert db.execute('SELECT count(*) FROM evaluation_config').fetchone()[0] == 0
-        assert db.execute('PRAGMA foreign_key_check').fetchall() == []
+        assert db.execute("SELECT count(*) FROM mos_submissions").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM timbre_references").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM evaluation_config").fetchone()[0] == 0
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_custom_dimensions_snapshot_freeze_and_exports(env, monkeypatch):
+    from workbench import mos
+
+    _, a, peers, tid, sid, tracks, _ = env
+    dims = [
+        {
+            "key": "speech",
+            "name": "语音可懂度",
+            "question": "能否听懂语音内容？",
+            "anchors": [
+                "完全听不懂",
+                "少数能听懂",
+                "一半能听懂",
+                "多数能听懂",
+                "全部能听懂",
+            ],
+        },
+        {
+            "key": "overall",
+            "name": "综合表现",
+            "question": "综合噪声和人声表现判断",
+            "anchors": ["完全不可用", "问题明显", "基本可用", "表现良好", "非常满意"],
+        },
+    ]
+    body = {
+        "title": "多维测试",
+        "mode": "blind",
+        "evaluation": "mos",
+        "dimensions": dims,
+    }
+    assert a.patch(f"/api/tasks/{tid}", json=body).status_code == 200
+    assert a.get(f"/api/tasks/{tid}").json()["dimensions"] == dims
+    # 不靠当下代码中的默认常量解释历史任务，真正从数据库快照读取。
+    monkeypatch.setattr(
+        mos, "DIMENSIONS", [{"key": "wrong", "name": "错误的新默认量表"}]
+    )
+    assert a.get(f"/api/samples/{sid}").json()["dimensions"] == dims
+    start(env)
+    modified = json.loads(json.dumps(body))
+    modified["dimensions"][0]["anchors"][0] = "被事后改写"
+    assert a.patch(f"/api/tasks/{tid}", json=modified).status_code == 409
+    assert (
+        peers[0][0]
+        .post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 4)})
+        .status_code
+        == 422
+    )
+    custom = {t: {"speech": 2, "overall": 5} for t in tracks[1:]}
+    assert (
+        peers[0][0]
+        .post(f"/api/samples/{sid}/rating", json={"scores": custom})
+        .status_code
+        == 200
+    )
+    assert a.post(f"/api/tasks/{tid}/close").status_code == 200
+    report = a.get(f"/api/tasks/{tid}/report").json()
+    assert report["任务"]["dimensions"] == dims
+    assert [d["均值"] for d in report["样本"][0]["MOS"]["候选"][0]["维度"]] == [2, 5]
+    for fmt in ("export", "export.csv", "export.md"):
+        text = a.get(f"/api/tasks/{tid}/{fmt}").text
+        assert "完全听不懂" in text and "非常满意" in text and "被事后改写" not in text
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        [],
+        [{"key": "x", "name": "测试", "anchors": ["差"]}],
+        [{"key": "x", "name": "  ", "anchors": ["差"] * 5}],
+        [{"key": "x", "name": "测试", "anchors": [" "] * 5}],
+        [{"key": "x", "name": "重复", "anchors": ["差"] * 5}] * 2,
+        [{"key": "bad key", "name": "测试", "anchors": ["差"] * 5}],
+        [{"key": f"x{i}", "name": str(i), "anchors": ["差"] * 5} for i in range(9)],
+    ],
+)
+def test_custom_dimension_validation_before_creation(env, invalid):
+    _, a, _, _, _, _, _ = env
+    before = a.get("/api/tasks").json()
+    response = a.post(
+        "/api/tasks",
+        json={"title": "无效量表", "evaluation": "mos", "dimensions": invalid},
+    )
+    assert response.status_code == 422
+    assert a.get("/api/tasks").json() == before
+
+
+def test_fixed_mos_trial_database_migrates_scale_snapshot(env):
+    app, a, _, tid, _, _, _ = env
+    from workbench.db import init
+
+    expected = a.get(f"/api/tasks/{tid}").json()["dimensions"]
+    with sqlite3.connect(app.state.database) as db:
+        db.execute("ALTER TABLE evaluation_config DROP COLUMN dimensions")
+    init(app.state.database)
+    init(app.state.database)
+    assert a.get(f"/api/tasks/{tid}").json()["dimensions"] == expected
+
+
+def test_custom_scale_edit_blocks_existing_draft_contribution(env):
+    _, a, _, tid, sid, _, _ = env
+    original = a.get(f"/api/tasks/{tid}").json()["dimensions"]
+    assert (
+        a.post(
+            f"/api/samples/{sid}/comments",
+            json={"start": 0, "end": 16000, "body": "草稿中的已有贡献"},
+        ).status_code
+        == 200
+    )
+    changed = json.loads(json.dumps(original))
+    changed[0]["anchors"][0] = "事后改变口径"
+    response = a.patch(
+        f"/api/tasks/{tid}",
+        json={
+            "title": "多维测试",
+            "mode": "blind",
+            "evaluation": "mos",
+            "dimensions": changed,
+        },
+    )
+    assert response.status_code == 409
+    assert a.get(f"/api/tasks/{tid}").json()["dimensions"] == original

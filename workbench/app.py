@@ -340,6 +340,8 @@ def results_csv(value) -> bytes:
             ]
         )
     if task.get("evaluation") == "mos":
+        for d in task.get("dimensions", []):
+            rows.append(["评分量表", d["key"], "", "", d["name"], "", "", "", "", json.dumps({"问题": d["question"], "1–5分说明": d["anchors"]}, ensure_ascii=False)])
         rows.append(["评分口径", "", "", "", "", "", "", "", "", mos.BOUNDARY])
         rows.append(
             [
@@ -458,6 +460,10 @@ def results_markdown(value) -> str:
             f"| {md_cell(member['名称'])} | {member['已提交片段数']}/{total} | {state} |"
         )
     if task.get("evaluation") == "mos":
+        lines += ["", "## 评分量表（任务快照）", "", "| 指标 | 说明 | 1 分 | 2 分 | 3 分 | 4 分 | 5 分 |", "| --- | --- | --- | --- | --- | --- | --- |"]
+        for d in task.get("dimensions", []):
+            lines.append("| " + " | ".join(md_cell(v) for v in [d["name"], d["question"], *d["anchors"]]) + " |")
+        lines += [""]
         lines += [
             "",
             "## 多维 MOS",
@@ -571,11 +577,19 @@ class UserInput(Login):
     role: str = "reviewer"
 
 
+class DimensionInput(BaseModel):
+    key: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_]{0,63}$")
+    name: str = Field(min_length=1, max_length=40)
+    question: str = Field(default="", max_length=200)
+    anchors: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(min_length=5, max_length=5)
+
+
 class TaskInput(BaseModel):
     title: str = Field(min_length=1, max_length=150)
     kind: str = "算法版本"
     mode: str = "development"
     evaluation: str = "preference"
+    dimensions: list[DimensionInput] | None = Field(default=None, min_length=1, max_length=8)
 
 
 class SampleInput(BaseModel):
@@ -833,7 +847,7 @@ def create_app(
             ).fetchone()
             if not member or t["status"] == "draft":
                 raise HTTPException(403, "没有此任务的访问权限")
-        return {**dict(t), "can_manage": owner, "evaluation": mos.method(db, task_id)}
+        return {**dict(t), "can_manage": owner, "evaluation": mos.method(db, task_id), "dimensions": mos.get_dimensions(db, task_id)}
 
     def sample_access(db, sample_id, u, manage=False):
         s = db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
@@ -869,6 +883,7 @@ def create_app(
         with connect(database) as db:
             return {
                 "evaluation_methods": ["preference", "mos"],
+                "mos_custom_dimensions": True,
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
                 "version": VERSION,
                 "instance_id": app.state.instance_id,
@@ -2093,6 +2108,9 @@ def create_app(
             raise HTTPException(422, "无效任务类型")
         if body.evaluation not in ("preference", "mos"):
             raise HTTPException(422, "无效评分方式")
+        if body.evaluation != "mos" and body.dimensions is not None:
+            raise HTTPException(422, "仅多维评分任务可配置指标")
+        dims = mos.normalize_dimensions(body.dimensions) if body.evaluation == "mos" else []
         task_id = uid()
         with connect(database) as db:
             db.execute(
@@ -2100,7 +2118,7 @@ def create_app(
                 (task_id, body.title, body.kind, body.mode, "draft", u["id"], now()),
             )
             db.execute(
-                "INSERT INTO evaluation_config VALUES(?,?)", (task_id, body.evaluation)
+                "INSERT INTO evaluation_config VALUES(?,?,?)", (task_id, body.evaluation, json.dumps(dims, ensure_ascii=False))
             )
         return {"id": task_id}
 
@@ -2121,9 +2139,12 @@ def create_app(
                 raise HTTPException(409, "发布后任务名称、类型和模式保持冻结")
             if body.evaluation != t["evaluation"]:
                 raise HTTPException(409, "评分方式创建后固定；请新建任务")
+            if t["evaluation"] != "mos" and body.dimensions is not None:
+                raise HTTPException(422, "仅多维评分任务可配置指标")
+            dims = mos.normalize_dimensions(body.dimensions) if body.dimensions is not None else t["dimensions"]
             if not body.title.strip():
                 raise HTTPException(422, "任务名称不能为空")
-            if body.mode != t["mode"] and (
+            if (body.mode != t["mode"] or dims != t["dimensions"]) and (
                 db.execute(
                     "SELECT 1 FROM comments c JOIN samples s ON s.id=c.sample_id "
                     "WHERE s.task_id=? LIMIT 1",
@@ -2137,12 +2158,14 @@ def create_app(
             ):
                 raise HTTPException(
                     409,
-                    "此任务已有标注或评分，比较模式保持冻结；需要更改时请创建新任务",
+                    "此任务已有标注或评分，比较模式保持冻结，指标与档位说明也不能更改；需要更改时请创建新任务",
                 )
             db.execute(
                 "UPDATE tasks SET title=?,kind=?,mode=? WHERE id=?",
                 (body.title.strip(), body.kind, body.mode, task_id),
             )
+            if t["evaluation"] == "mos":
+                db.execute("UPDATE evaluation_config SET dimensions=? WHERE task_id=?", (json.dumps(dims, ensure_ascii=False), task_id))
         return {"ok": True}
 
     @app.get("/api/tasks/{task_id}")
@@ -2963,7 +2986,7 @@ def create_app(
             ).fetchall()
             proc_modes = {} if blind else _processing_modes(db, sample_id)
             s["evaluation"] = t["evaluation"]
-            s["dimensions"] = mos.DIMENSIONS if t["evaluation"] == "mos" else []
+            s["dimensions"] = t["dimensions"]
             ref = mos.reference(db, sample_id)
             s["tracks"] = []
             for row in sorted(rows, key=lambda x: (x["id"] != ref, mapping[x["id"]])):

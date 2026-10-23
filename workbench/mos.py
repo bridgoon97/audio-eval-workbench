@@ -31,8 +31,7 @@ DIMENSIONS = [
         "anchors": ["完全听不清", "多数听不清", "部分听清", "多数听清", "完全听清"],
     },
 ]
-KEYS = {d["key"] for d in DIMENSIONS}
-BOUNDARY = "多维 1–5 分主观评分；音色维度相对明确参考，其余评价候选自身。均值为逐片段逐候选逐维度算术平均；标准差为样本标准差，少于两人不计算。不跨片段混合，不合成总分，不作显著性或标准测试合规声明。"
+BOUNDARY = "多维 1–5 分主观评分；指标及 1–5 分文字锚点按任务量表快照解释，参考音色不评分。均值为逐片段逐候选逐维度算术平均；标准差为样本标准差，少于两人不计算。不跨片段混合，不合成总分，不作显著性或标准测试合规声明。"
 
 
 def method(db, task_id):
@@ -40,6 +39,35 @@ def method(db, task_id):
         "SELECT method FROM evaluation_config WHERE task_id=?", (task_id,)
     ).fetchone()
     return row[0] if row else "preference"
+
+
+def get_dimensions(db, task_id):
+    row = db.execute(
+        "SELECT dimensions FROM evaluation_config WHERE task_id=?", (task_id,)
+    ).fetchone()
+    return json.loads(row[0]) if row and row[0] else []
+
+
+def normalize_dimensions(values):
+    raw = [d.model_dump() for d in values] if values is not None else DIMENSIONS
+    dims = [
+        {
+            **d,
+            "name": d["name"].strip(),
+            "question": d["question"].strip(),
+            "anchors": [a.strip() for a in d["anchors"]],
+        }
+        for d in raw
+    ]
+    if len({d["key"] for d in dims}) != len(dims) or len(
+        {d["name"] for d in dims}
+    ) != len(dims):
+        raise HTTPException(422, "指标标识和名称不能重复")
+    if any(
+        not d["name"].strip() or any(not a.strip() for a in d["anchors"]) for d in dims
+    ):
+        raise HTTPException(422, "指标名称与每个档位的说明不能为空白")
+    return dims
 
 
 def reference(db, sample_id):
@@ -59,9 +87,13 @@ def validate_scores(db, sample_id, scores):
         raise HTTPException(422, "请先配置音色参考与待评分候选")
     if not isinstance(scores, dict) or set(scores) != ids:
         raise HTTPException(422, "必须为全部待测候选评分；参考音色不参与评分")
+    task_id = db.execute(
+        "SELECT task_id FROM samples WHERE id=?", (sample_id,)
+    ).fetchone()[0]
+    keys = {d["key"] for d in get_dimensions(db, task_id)}
     for values in scores.values():
-        if not isinstance(values, dict) or set(values) != KEYS:
-            raise HTTPException(422, "每个候选须完整填写四个维度")
+        if not isinstance(values, dict) or set(values) != keys:
+            raise HTTPException(422, "每个候选须完整填写本任务的全部指标")
         if any(type(v) is not int or not 1 <= v <= 5 for v in values.values()):
             raise HTTPException(422, "分值须为 1–5 的整数")
     return json.dumps(scores, sort_keys=True, ensure_ascii=False)
@@ -89,7 +121,7 @@ def summary(db, task_id):
             if tr["id"] == ref:
                 continue
             dimensions = []
-            for d in DIMENSIONS:
+            for d in get_dimensions(db, task_id):
                 values = [r["scores"][tr["id"]][d["key"]] for r in raw]
                 dimensions.append(
                     {

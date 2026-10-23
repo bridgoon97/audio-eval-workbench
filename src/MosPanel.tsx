@@ -49,9 +49,7 @@ export function MosPanel({
     <div className="mos-panel">
       <span className="eyebrow">多维 MOS · 1–5 分</span>
       <h3>逐候选、逐维度评分</h3>
-      <p className="muted">
-        先听参考，再逐候选打分。音色与参考比较，其余维度评价候选自身；不预设分数。
-      </p>
+      <p className="muted">可随时回听参考，按本任务各指标的说明逐候选打分；不预设分数。</p>
       {sample.tracks?.some((t) => t.is_reference) ? (
         <button
           className="mos-reference"
@@ -127,7 +125,7 @@ export function MosPanel({
               : '提交全部评分'}
       </button>
       <small>
-        所有候选的四个维度完整填写后一次提交；提交后锁定。各维度单独汇总，不计算综合总分。
+        所有候选的全部指标完整填写后一次提交；提交后锁定。各指标分别汇总，不自动合成总分。
       </small>
     </div>
   );

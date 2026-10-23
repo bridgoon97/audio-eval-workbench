@@ -1260,6 +1260,7 @@ def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatc
     write_wav(work / "sources/b.wav", 16000, 1.0, 1)
     manifest = base_manifest({"ref": "sources/a.wav", "candidate": "sources/b.wav"})
     manifest["task"]["evaluation"] = "mos"
+    manifest["task"]["dimensions"] = [{"key": "overall", "name": "综合表现", "question": "整体听感是否满意？", "anchors": ["无法接受", "较差", "基本可用", "满意", "非常满意"]}]
     manifest["publish"] = True
     path = work / "manifest.json"
     path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -1282,6 +1283,10 @@ def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatc
         with httpx.Client(base_url=base) as probe:
             probe.post("/api/login", json={"name": "编排组织者", "password": "organizer-agent-pass"})
             assert probe.get("/api/tasks").json() == []
+    with monkeypatch.context() as patch:
+        patch.setattr(agent_tasks.AgentClient, "identity", lambda self: {**original_identity(self), "mos_custom_dimensions": False})
+        with pytest.raises(AgentError, match="尚不支持自定义评分指标"):
+            agent_tasks.run_apply(path, base, "编排组织者", "organizer-agent-pass", tmp_path / "unsupported-custom-state.json", out / "mapping.json", publish_flag=True)
     receipt = agent_tasks.run_apply(
         path,
         base,
@@ -1302,5 +1307,5 @@ def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatc
         detail = c.get(f"/api/tasks/{task_id}").json()
         assert detail["status"] == "active" and detail["evaluation"] == "mos"
         sample = c.get("/api/samples/" + detail["samples"][0]["id"]).json()
-        assert len(sample["dimensions"]) == 4
+        assert sample["dimensions"] == manifest["task"]["dimensions"]
         assert len([t for t in sample["tracks"] if t["is_reference"]]) == 1

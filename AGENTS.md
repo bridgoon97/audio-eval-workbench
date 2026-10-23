@@ -25,3 +25,5 @@ Agent 附加禁止事项：
 - CLI 只走公开 HTTP API；不得直接写服务端数据库或 assets，也不得绕过用户权限。
 - 发布需要双重确认（manifest.publish=true 且 CLI --publish）；处理被服务端拒绝时不得发布，拒绝证据持久化。owner 不因创建任务而自动成为受邀评测者。
 - 多维 MOS 任务需在 `task.evaluation` 写 `mos`，并由用户明确指定每题恰有一条 `timbre_reference=true` 音色参考。此标记与用于延迟/响度处理的 `reference` 独立；参考不评分，首版与候选等长且计入六条音频上限。不能自行把首个候选认作音色参考。
+
+- 自定义 MOS 量表通过 task.dimensions 声明 1–8 个指标，每项 anchors 恰含按 1–5 分排序的五条非空描述；key 和名称不可重复。量表发布后冻结并保留任务快照，“综合表现”作为独立主观项，不由其他分数自动合成。

@@ -14,6 +14,24 @@ test('多维 MOS：创建、指定参考、完整评分、刷新锁定与结果�
   await page.locator('input[name="title"]').fill('多维 MOS 浏览器验收');
   await page.locator('select[name="mode"]').selectOption('blind');
   await page.locator('select[name="evaluation"]').selectOption('mos');
+  await page.getByLabel('指标名称 1', { exact: true }).fill('降噪表现');
+  await page.getByLabel('指标 1 的 1 分说明', { exact: true }).fill('噪声明显干扰');
+  await page.getByLabel('指标 1 的 5 分说明', { exact: true }).fill('噪声几乎不可察觉');
+  await page.getByLabel('指标名称 2', { exact: true }).fill('音色');
+  await page.getByLabel('指标名称 3', { exact: true }).fill('综合表现');
+  await page.getByLabel('指标说明 3', { exact: true }).fill('整体听感是否满意？');
+  await page.getByLabel('指标名称 4', { exact: true }).fill('语音可懂度');
+  await page.getByRole('button', { name: '增加评测指标', exact: true }).click();
+  await page.getByLabel('指标名称 5', { exact: true }).fill('临时指标');
+  await page.getByRole('button', { name: '上移指标 5', exact: true }).click();
+  await expect(page.getByLabel('指标名称 4', { exact: true })).toHaveValue('临时指标');
+  await page.getByRole('button', { name: '删除指标 4', exact: true }).click();
+  await expect(page.getByLabel('指标名称 4', { exact: true })).toHaveValue('语音可懂度');
+  await page
+    .locator('.mos-config-card')
+    .first()
+    .screenshot({ path: test.info().outputPath('mos-config-preview.png') });
+
   const created = page.waitForResponse(
     (response) =>
       response.request().method() === 'POST' && new URL(response.url()).pathname === '/api/tasks',
@@ -55,6 +73,8 @@ test('多维 MOS：创建、指定参考、完整评分、刷新锁定与结果�
   await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
   const groups = page.getByRole('radiogroup');
   await expect(groups).toHaveCount(8);
+  await expect(page.locator('.mos-panel')).toContainText('噪声明显干扰');
+  await expect(page.locator('.mos-panel')).toContainText('综合表现');
   await expect(page.locator('.mos-options input:checked')).toHaveCount(0);
   for (let i = 0; i < 8; i++) await groups.nth(i).locator('input[value="4"]').check();
   await expect(page.getByText('已填 8/8 项', { exact: false })).toBeVisible();
@@ -75,7 +95,11 @@ test('多维 MOS：创建、指定参考、完整评分、刷新锁定与结果�
   await page.getByRole('button', { name: '关闭收集并统一揭晓' }).click();
   await page.getByRole('button', { name: '查看结果', exact: true }).click();
   await expect(page.getByRole('heading', { name: '逐片段多维 MOS' })).toBeVisible();
-  await expect(page.locator('.mos-result')).toHaveCount(2);
-  await expect(page.locator('.mos-result').first()).toContainText('4.00');
+  await expect(page.locator('.review-sample .mos-result')).toHaveCount(2);
+  await expect(page.locator('.review-sample .mos-result').first()).toContainText('4.00');
+  await page.getByText('指标与档位说明（发布时量表）', { exact: true }).click();
+  await expect(
+    page.locator('.mos-scale-snapshot').getByText('噪声明显干扰', { exact: true }),
+  ).toBeVisible();
   await expect(page.locator('.report')).not.toContainText('无分歧');
 });

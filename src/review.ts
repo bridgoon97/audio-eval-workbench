@@ -1,6 +1,6 @@
 // 复盘视图的纯展示口径：数据由服务端 /report 统一计算，界面只负责呈现与跳转。
 
-import type { Sample } from './types';
+import type { Sample, Dimension } from './types';
 
 export type VoteRow = { ID: string; 名称: string; 票数: number };
 export type SampleSummary = {
@@ -46,6 +46,7 @@ export type ReportPayload = {
     mode: string;
     status: string;
     evaluation?: string;
+    dimensions?: Dimension[];
   };
   样本: (Sample & SampleSummary)[];
   参与进度: ProgressSummary;
