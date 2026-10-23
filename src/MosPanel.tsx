@@ -61,7 +61,7 @@ export function MosPanel({
         <p className="error">请组织者在草稿时间轴下方指定参考音色。</p>
       )}
       {candidates.map((t) => (
-        <fieldset className="mos-card" key={t.id} disabled={!!sample.rating || saving}>
+        <fieldset className="mos-card" key={t.id} disabled={!active || !!sample.rating || saving}>
           <legend>{sample.blind ? `候选 ${t.label}` : t.name}</legend>
           <button
             type="button"
@@ -119,7 +119,7 @@ export function MosPanel({
         {sample.rating
           ? '已提交'
           : !active
-            ? '发布后开放评分'
+            ? '当前任务不接受评分'
             : saving
               ? '正在提交…'
               : '提交全部评分'}

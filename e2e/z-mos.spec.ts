@@ -64,6 +64,8 @@ test('多维 MOS：创建、指定参考、完整评分、刷新锁定与结果�
   await page.locator('.task-card').filter({ hasText: '多维 MOS 浏览器验收' }).click();
   await page.getByLabel('指定参考音色').selectOption({ label: '音色参考素材' });
   await expect(page.getByLabel('指定参考音色').locator('option:checked')).toHaveText('参考音色');
+  await page.getByRole('button', { name: '多维评分', exact: true }).click();
+  await expect(page.getByRole('radio').first()).toBeDisabled();
   await page.getByRole('button', { name: '发布评测', exact: true }).click();
   await page.getByRole('checkbox', { name: '我也参与评测（提交偏好并计入进度）' }).check();
   await page.locator('input[name="alignment"]').check();
