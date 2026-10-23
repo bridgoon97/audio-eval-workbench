@@ -193,3 +193,9 @@ uv run --locked python scripts/package_smoke.py
 参照：[Web Audio](https://www.w3.org/TR/webaudio-1.0/) · [ITU-R BS.1534](https://www.itu.int/rec/R-REC-BS.1534/en)
 
 指南内容维护：修改 `src/guide-content.json` 后运行 `uv run --locked python scripts/build_guide.py` 同步仓库手册；内置阅读与下载直接使用同一份内容。
+
+### 多维 MOS 与参考音色（试用功能）
+
+新建评测时选择“多维 MOS”，再选择开发诊断或隐藏版本模式。每题先导入 16 kHz 等长序列，在时间轴上方指定一条“参考音色”；参考不参与评分，其余候选分别填写降噪、音色相似度、音质、可懂度四项 1–5 分。量表不预选分数，完整提交整题后计入完成度并锁定，刷新前未提交分数会在当前浏览器按账号暂存。
+
+关闭任务后逐片段展示每个候选、维度的人数、均值、中位数和样本标准差，并通过 JSON/CSV/Markdown 导出分布、原始分数与稳定 ID。参考计入每题最多六条音频的上限；首版参考必须与候选等长。这里的多维主观评分不等同于标准 MOS/MUSHRA 流程合规声明，不合成总分或跨片段混算。Agent CLI 可用 `task.evaluation="mos"` 及候选 `timbre_reference=true` 创建，见 Agent 手册。

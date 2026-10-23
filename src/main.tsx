@@ -35,6 +35,7 @@ import { BatchImport } from './BatchImport';
 import { CommentThread } from './CommentThread';
 import { ProcessingModal } from './ProcessingModal';
 import { Waveform } from './Waveform';
+import { MosPanel } from './MosPanel';
 import { ApplyFlow } from './ApplyFlow';
 import { AccessAdmin, DeviceAdmin } from './AccessAdmin';
 import { SecuritySettings } from './SecuritySettings';
@@ -940,7 +941,8 @@ function App() {
                     </div>
                     <h3>{t.title}</h3>
                     <p>
-                      {t.kind} · {t.mode === 'blind' ? '隐藏版本偏好评测' : '开发诊断与试听'}
+                      {t.kind} · {t.evaluation === 'mos' ? '多维 MOS · ' : ''}
+                      {t.mode === 'blind' ? '隐藏版本评测' : '开发诊断与试听'}
                     </p>
                     <div className="card-footer">
                       <span>{t.sample_count} 个片段</span>
@@ -1015,6 +1017,12 @@ function App() {
                     : task.mode === 'blind'
                       ? '隐藏版本评测'
                       : '开发诊断'}{' '}
+                  {task.evaluation === 'mos' && (
+                    <>
+                      {' '}
+                      <span>／</span> 多维 MOS
+                    </>
+                  )}
                   <span>／</span> 原始相对电平
                 </p>
               </div>
@@ -1092,7 +1100,7 @@ function App() {
                 )}
               </div>
             </section>
-            <main className="workspace">
+            <main className={task.evaluation === 'mos' ? 'workspace mos-workspace' : 'workspace'}>
               <aside className="sample-list">
                 <div className="sample-list-title">
                   音频片段 <span>{task.samples?.length || 0}</span>
@@ -1213,6 +1221,41 @@ function App() {
                         <span>{time(duration * 0.75)}</span>
                         <span>{time(duration)}</span>
                       </div>
+                      {task.evaluation === 'mos' && (
+                        <div className="mos-reference-note">
+                          <strong>参考音色</strong>
+                          <p>
+                            标记的参考只用于音色比较，不参与评分。首版参考与候选须为同长度的 16 kHz
+                            音频；参考身份公开，候选身份按任务模式隐藏。
+                          </p>
+                          {task.can_manage && task.status === 'draft' && (
+                            <label>
+                              指定参考音色
+                              <select
+                                aria-label="指定参考音色"
+                                value={sample.tracks?.find((t) => t.is_reference)?.id || ''}
+                                onChange={(e) =>
+                                  void run(async () => {
+                                    await api(`/samples/${sample.id}/timbre-reference`, 'PUT', {
+                                      track_id: e.target.value,
+                                    });
+                                    await refreshSample();
+                                  })
+                                }
+                              >
+                                <option value="" disabled>
+                                  请选择已导入的参考序列
+                                </option>
+                                {sample.tracks?.map((t) => (
+                                  <option key={t.id} value={t.id}>
+                                    {t.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+                        </div>
+                      )}
                       {sample.tracks?.map((tr, i) => (
                         <article
                           className={'track ' + (selected === i ? 'selected' : '')}
@@ -1221,7 +1264,7 @@ function App() {
                           <div className="track-head">
                             <button className="track-select" onClick={() => select(i)}>
                               <span className="track-letter">{tr.label}</span>
-                              <strong>{tr.name}</strong>
+                              <strong>{tr.is_reference ? '参考音色' : tr.name}</strong>
                               {selected === i && <span className="listening">当前试听</span>}
                             </button>
                             <span className="track-version">{tr.version}</span>
@@ -1350,7 +1393,7 @@ function App() {
                         onClick={() => setPanel('vote')}
                       >
                         <Check size={16} />
-                        偏好判断
+                        {task.evaluation === 'mos' ? '多维评分' : '偏好判断'}
                       </button>
                     </div>
                     {panel === 'notes' ? (
@@ -1442,6 +1485,19 @@ function App() {
                           />
                         </div>
                       </>
+                    ) : task.evaluation === 'mos' ? (
+                      <MosPanel
+                        key={`${user!.id}:${sample.id}`}
+                        sample={sample}
+                        userId={user!.id}
+                        active={task.status === 'active'}
+                        onListen={select}
+                        notify={setNotice}
+                        onSaved={async () => {
+                          await refreshSample();
+                          await refreshTasks();
+                        }}
+                      />
                     ) : (
                       <div className="vote-panel">
                         <span className="eyebrow">独立听感判断</span>
@@ -1841,6 +1897,17 @@ function App() {
                   <option value="blind">独立评测：隐藏版本，关闭后统一揭晓</option>
                 </select>
               </label>
+              <label>
+                评分方式
+                <select name="evaluation">
+                  <option value="preference">偏好判断：选择更倾向的候选</option>
+                  <option value="mos">多维 MOS：降噪、音色相似度、音质、可懂度</option>
+                </select>
+              </label>
+              <p className="muted">
+                多维 MOS
+                每题需导入并指定一条参考音色，其余序列逐一评分。参考计入首版每题最多六条音频的上限。
+              </p>
               <p className="muted">候选可来自自研或竞品。不同设备采集请选“竞品整机”。</p>
               <button className="primary full" disabled={busy}>
                 创建任务
@@ -1896,6 +1963,7 @@ function App() {
                 });
               }}
             >
+              <input type="hidden" name="evaluation" value={task.evaluation} />
               <p className="muted">仅准备中的任务可修改；发布后名称、比较类型和模式冻结。</p>
               <label>
                 任务名称
@@ -1994,7 +2062,7 @@ function App() {
           {modal === 'progress' && progress && (
             <div className="task-progress">
               <p className="muted">
-                收集期间可随时确认受邀同事的完成情况；此处只显示完成数量与状态，不含任何偏好内容。
+                收集期间可随时确认受邀同事的完成情况；此处只显示完成数量与状态，不含偏好或分数。
               </p>
               <div className="progress-numbers">
                 <span>
@@ -2252,8 +2320,12 @@ function App() {
                 </small>
               </section>
               <section>
-                <h3>逐片段偏好</h3>
-                <small>百分比以该片段的有效提交人数为分母；缺失判断不计入。</small>
+                <h3>{report.任务.evaluation === 'mos' ? '逐片段多维 MOS' : '逐片段偏好'}</h3>
+                <small>
+                  {report.任务.evaluation === 'mos'
+                    ? '各维度独立展示 1–5 分；未评分不算 0 分；标准差少于两人时不计算。'
+                    : '百分比以该片段的有效提交人数为分母；缺失判断不计入。'}
+                </small>
                 {report['样本'].map((s) => (
                   <div className="review-sample" key={s.id}>
                     <h4>
@@ -2264,6 +2336,33 @@ function App() {
                       {s.scene} · {s.分母} 人已提交（分母）
                       {s.分歧 && ` · 出现 ${distinctChoices(s.票数)} 种不同偏好，仅为描述性提示`}
                     </small>
+                    {s.MOS?.候选.map((tr) => (
+                      <div className="mos-result" key={tr.ID}>
+                        <h4>{tr.名称}</h4>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>维度</th>
+                              <th>人数</th>
+                              <th>均值</th>
+                              <th>中位数</th>
+                              <th>标准差</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {tr.维度.map((d) => (
+                              <tr key={d.key}>
+                                <td>{d.name}</td>
+                                <td>{d.人数}</td>
+                                <td>{d.均值?.toFixed(2) ?? '暂无评分'}</td>
+                                <td>{d.中位数?.toFixed(2) ?? '—'}</td>
+                                <td>{d.标准差?.toFixed(2) ?? '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ))}
                     {s.票数.map((v) => (
                       <div className="result-row" key={v.ID}>
                         <span>{v.名称}</span>

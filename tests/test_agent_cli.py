@@ -1250,3 +1250,57 @@ def test_agent_entry_import_isolation():
         name for name in imported for bad in forbidden if name == bad or name.startswith(bad + ".")
     ]
     assert violations == [], f"独立入口引入了服务端依赖：{violations}"
+
+
+def test_mos_cli_validate_prepare_apply_and_publish(tmp_path, server, monkeypatch):
+    """真实 CLI 编排后的参考标记及发布行为，而非仅检查 manifest 字符串。"""
+    base, _ = server
+    work = tmp_path / "mos-work"
+    write_wav(work / "sources/a.wav", 16000, 1.0, 1)
+    write_wav(work / "sources/b.wav", 16000, 1.0, 1)
+    manifest = base_manifest({"ref": "sources/a.wav", "candidate": "sources/b.wav"})
+    manifest["task"]["evaluation"] = "mos"
+    manifest["publish"] = True
+    path = work / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    loaded, directory = load_manifest(path)
+    assert any("timbre_reference" in p for p in validate_manifest(loaded, directory))
+    manifest["samples"][0]["candidates"][0]["timbre_reference"] = True
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    loaded, directory = load_manifest(path)
+    assert validate_manifest(loaded, directory) == []
+    out = tmp_path / "prepared-mos"
+    prepare_assets(loaded, directory, out)
+    original_identity = agent_tasks.AgentClient.identity
+    with monkeypatch.context() as patch:
+        def legacy_identity(self):
+            return {**original_identity(self), "evaluation_methods": ["preference"]}
+        patch.setattr(agent_tasks.AgentClient, "identity", legacy_identity)
+        with pytest.raises(AgentError, match="尚不支持多维 MOS"):
+            agent_tasks.run_apply(path, base, "编排组织者", "organizer-agent-pass", tmp_path / "unsupported-state.json", out / "mapping.json", publish_flag=True)
+        import httpx
+        with httpx.Client(base_url=base) as probe:
+            probe.post("/api/login", json={"name": "编排组织者", "password": "organizer-agent-pass"})
+            assert probe.get("/api/tasks").json() == []
+    receipt = agent_tasks.run_apply(
+        path,
+        base,
+        "编排组织者",
+        "organizer-agent-pass",
+        tmp_path / "mos-state.json",
+        out / "mapping.json",
+        publish_flag=True,
+    )
+    import httpx
+
+    with httpx.Client(base_url=base) as c:
+        c.post(
+            "/api/login",
+            json={"name": "编排组织者", "password": "organizer-agent-pass"},
+        )
+        task_id = receipt["task_id"]
+        detail = c.get(f"/api/tasks/{task_id}").json()
+        assert detail["status"] == "active" and detail["evaluation"] == "mos"
+        sample = c.get("/api/samples/" + detail["samples"][0]["id"]).json()
+        assert len(sample["dimensions"]) == 4
+        assert len([t for t in sample["tracks"] if t["is_reference"]]) == 1

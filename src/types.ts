@@ -4,6 +4,7 @@ export type Task = {
   title: string;
   kind: string;
   mode: string;
+  evaluation: 'preference' | 'mos';
   status: string;
   owner: string;
   can_manage: boolean;
@@ -13,7 +14,10 @@ export type Task = {
   members?: string[];
   review_assignments?: string[];
 };
+export type Dimension = { key: string; name: string; question: string; anchors: string[] };
+export type MosScores = Record<string, Record<string, number>>;
 export type Track = {
+  is_reference?: boolean;
   id: string;
   label: string;
   name: string;
@@ -50,7 +54,9 @@ export type Sample = {
   tracks?: Track[];
   comments?: Comment[];
   blind?: boolean;
-  rating?: { choice: string; reason: string } | null;
+  evaluation?: 'preference' | 'mos';
+  dimensions?: Dimension[];
+  rating?: { choice: string; reason: string; scores?: MosScores } | null;
 };
 export type Analysis = { peaks: number[][]; spectrogram: number[][] };
 export type Invite = {

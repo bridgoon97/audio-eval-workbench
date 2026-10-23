@@ -43,6 +43,7 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                     "enum": ["算法版本", "VPU 支路", "级联链路", "竞品算法", "竞品整机"]
                 },
                 "mode": {"enum": ["development", "blind"]},
+                "evaluation": {"enum": ["preference", "mos"]},
             },
         },
         "participants": {
@@ -118,7 +119,14 @@ MANIFEST_SCHEMA: dict[str, Any] = {
                                 "source": {"type": "string", "minLength": 1},
                                 "channel": {"type": "integer", "minimum": 0},
                                 "reference": {"type": "boolean", "default": False},
-                                "apply_alignment": {"type": "boolean", "default": False},
+                                "timbre_reference": {
+                                    "type": "boolean",
+                                    "default": False,
+                                },
+                                "apply_alignment": {
+                                    "type": "boolean",
+                                    "default": False,
+                                },
                                 "apply_loudness": {"type": "boolean", "default": False},
                             },
                         },
@@ -224,6 +232,14 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
             problems.append(f"片段 stable key 重复：{key}（后续重复项已跳过）")
             continue
         sample_keys.add(key)
+        timbre_refs = [c for c in sample["candidates"] if c.get("timbre_reference")]
+        if manifest["task"].get("evaluation", "preference") == "mos":
+            if len(timbre_refs) != 1:
+                problems.append(
+                    f"{key}: 多维 MOS 必须恰有一条 timbre_reference 音色参考"
+                )
+        elif timbre_refs:
+            problems.append(f"{key}: 偏好任务不能设置 timbre_reference")
         candidate_keys: set[str] = set()
         targets: dict[int, list[str]] = {}
         references = 0
@@ -268,7 +284,11 @@ def validate_manifest(manifest: dict[str, Any], base_dir: Path) -> list[str]:
                 start_frame = round(segment["start_seconds"] * info.samplerate)
                 end_frame = round(segment["end_seconds"] * info.samplerate)
                 source_seconds = info.frames / info.samplerate
-                if start_frame < 0 or end_frame > info.frames or start_frame >= end_frame:
+                if (
+                    start_frame < 0
+                    or end_frame > info.frames
+                    or start_frame >= end_frame
+                ):
                     problems.append(
                         f"{key}/{ckey}: segment {segment['start_seconds']}–"
                         f"{segment['end_seconds']} 秒超出源长度"
@@ -697,6 +717,7 @@ def manifest_snapshot(manifest: dict[str, Any], base_dir: Path) -> dict[str, Any
                         "source": c["source"],
                         "channel": c["channel"],
                         "reference": bool(c.get("reference")),
+                        **({"timbre_reference": True} if c.get("timbre_reference") else {}),
                         "apply_alignment": bool(c.get("apply_alignment")),
                         "apply_loudness": bool(c.get("apply_loudness")),
                         "source_sha256": sha256_file(_resolve_source(base_dir, c["source"])),
@@ -837,6 +858,12 @@ class AgentClient:
     def _get(self, path: str, **kwargs) -> dict[str, Any]:
         return self._json(self.http.get(path, **kwargs))
 
+    def _put(self, path: str, **kwargs) -> dict[str, Any]:
+        headers = kwargs.pop("headers", {})
+        if self.csrf:
+            headers["x-csrf-token"] = self.csrf
+        return self._json(self.http.put(path, headers=headers, **kwargs))
+
     def _patch(self, path: str, **kwargs) -> dict[str, Any]:
         headers = kwargs.pop("headers", {})
         if self.csrf:
@@ -863,7 +890,7 @@ class AgentClient:
                 f"服务版本 {status.get('version')} 与 CLI {VERSION} 不一致，"
                 "请先核对正在运行的服务"
             )
-        return {**me, "instance_id": status.get("instance_id")}
+        return {**me, "instance_id": status.get("instance_id"), "evaluation_methods": status.get("evaluation_methods", ["preference"])}
 
     def login(self, user: str, password: str) -> dict[str, Any]:
         self._post("/api/login", json={"name": user, "password": password})
@@ -1011,7 +1038,10 @@ def run_apply(
         state.payload["mapping_sha256"] = sha256_file(mapping_file)
     else:
         mapping_file = Path(state.payload["mapping_path"])
-        if mapping_path is not None and Path(mapping_path).resolve() != mapping_file.resolve():
+        if (
+            mapping_path is not None
+            and Path(mapping_path).resolve() != mapping_file.resolve()
+        ):
             raise AgentError(
                 "本次 --mapping 与 state 记录的 mapping 文件不同；"
                 "mapping 不允许中途更换。如确需更换，请使用新的 state 文件"
@@ -1032,6 +1062,8 @@ def run_apply(
     client = AgentClient(url)
     try:
         identity = client.identity()
+        if manifest["task"].get("evaluation") == "mos" and "mos" not in identity["evaluation_methods"]:
+            raise AgentError("服务端尚不支持多维 MOS，请使用配套试用服务端或升级服务；未创建任务")
         client.login(user, password)
         data_id = client.data_id()
         _verify_server_binding(state, identity, data_id)
@@ -1121,9 +1153,7 @@ def run_apply(
                     raise AgentError(
                         f"mapping.json 缺少候选 {sample['key']}/{candidate['key']}"
                     )
-                copy_path = (
-                    mapping_file.parent / mapping_candidate["output"]["path"]
-                )
+                copy_path = mapping_file.parent / mapping_candidate["output"]["path"]
                 if not copy_path.is_file():
                     raise AgentError(f"合规副本缺失：{copy_path}")
                 actual_sha = sha256_file(copy_path)
@@ -1164,8 +1194,19 @@ def run_apply(
                 tracks_view.append(
                     {"key": candidate["key"], "track_id": track_id, "stage": "uploaded"}
                 )
+
+            if manifest["task"].get("evaluation") == "mos":
+                ref = next(c for c in sample["candidates"] if c.get("timbre_reference"))
+                client._put(
+                    f"/api/samples/{entry['sample_id']}/timbre-reference",
+                    json={"track_id": entry["tracks"][ref["key"]]["track_id"]},
+                )
             receipt_samples.append(
-                {"key": sample["key"], "sample_id": entry["sample_id"], "tracks": tracks_view}
+                {
+                    "key": sample["key"],
+                    "sample_id": entry["sample_id"],
+                    "tracks": tracks_view,
+                }
             )
 
         # 受邀名单增补：解析已完成，任务创建后幂等同步（幂等 PATCH；closed 被服务端拒绝）。

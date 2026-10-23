@@ -24,3 +24,4 @@ Agent 附加禁止事项：
 - 盲评任务的候选匿名映射在任务关闭前不得提前揭晓。
 - CLI 只走公开 HTTP API；不得直接写服务端数据库或 assets，也不得绕过用户权限。
 - 发布需要双重确认（manifest.publish=true 且 CLI --publish）；处理被服务端拒绝时不得发布，拒绝证据持久化。owner 不因创建任务而自动成为受邀评测者。
+- 多维 MOS 任务需在 `task.evaluation` 写 `mos`，并由用户明确指定每题恰有一条 `timbre_reference=true` 音色参考。此标记与用于延迟/响度处理的 `reference` 独立；参考不评分，首版与候选等长且计入六条音频上限。不能自行把首个候选认作音色参考。

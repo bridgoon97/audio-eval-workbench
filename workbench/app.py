@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from . import mos
 from .align import (
     ALGORITHM_NAME,
     ERR_DELAY_NOT_APPLICABLE,
@@ -338,6 +339,71 @@ def results_csv(value) -> bytes:
                 f"涉及片段：{location}；仅统计根评论，回复不计入",
             ]
         )
+    if task.get("evaluation") == "mos":
+        rows.append(["评分口径", "", "", "", "", "", "", "", "", mos.BOUNDARY])
+        rows.append(
+            [
+                "MOS汇总列",
+                "候选ID",
+                "片段ID",
+                "片段名称",
+                "候选名称",
+                "维度",
+                "均值",
+                "人数",
+                "中位数",
+                "标准差、分布与参考",
+            ]
+        )
+    for sample in samples:
+        for track in sample.get("MOS", {}).get("候选", []):
+            for d in track["维度"]:
+                rows.append(
+                    [
+                        "MOS汇总",
+                        track["ID"],
+                        sample["id"],
+                        sample["name"],
+                        track["名称"],
+                        d["name"],
+                        d["均值"],
+                        d["人数"],
+                        d["中位数"],
+                        f"标准差：{d['标准差']}；分布1–5：{d['分布']}；参考：{sample['MOS']['参考ID']}",
+                    ]
+                )
+        if "MOS" in sample:
+            rows.append(
+                [
+                    "MOS原始列",
+                    "候选ID",
+                    "片段ID",
+                    "片段名称",
+                    "用户ID",
+                    "维度",
+                    "原始分数",
+                    "",
+                    "",
+                    "用户名称",
+                ]
+            )
+        for submission in sample.get("MOS", {}).get("原始评分", []):
+            for track_id, scores in submission["scores"].items():
+                for key, score in scores.items():
+                    rows.append(
+                        [
+                            "MOS原始评分",
+                            track_id,
+                            sample["id"],
+                            sample["name"],
+                            submission["user_id"],
+                            key,
+                            score,
+                            "",
+                            "",
+                            submission["author"],
+                        ]
+                    )
     buffer = io.StringIO(newline="")
     writer = csv.writer(buffer, lineterminator="\r\n")
     writer.writerows([[csv_safe(cell) for cell in row] for row in rows])
@@ -382,13 +448,45 @@ def results_markdown(value) -> str:
         "| 受邀评测者 | 已提交片段 | 状态 |",
         "| --- | --- | --- |",
     ]
+    if task.get("evaluation") == "mos":
+        lines[
+            lines.index(next(line for line in lines if line.startswith("> 分母口径")))
+        ] = "> 多维评分口径：仅完整提交全部候选全部维度的受邀评测者进入汇总。参考音色不计分，缺失不补零；每个候选、维度独立报告均值和人数。"
     for member in progress["成员"]:
         state = "已提交" if member["已提交片段数"] else "未提交"
         lines.append(
             f"| {md_cell(member['名称'])} | {member['已提交片段数']}/{total} | {state} |"
         )
-    lines += ["", "## 逐片段偏好", ""]
+    if task.get("evaluation") == "mos":
+        lines += [
+            "",
+            "## 多维 MOS",
+            "",
+            "| 片段 | 候选 | 维度 | 人数 | 均值 | 中位数 | 标准差 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for sample in value["样本"]:
+            for track in sample.get("MOS", {}).get("候选", []):
+                for d in track["维度"]:
+                    lines.append(
+                        f"| {md_cell(sample['name'])} | {md_cell(track['名称'])} | {d['name']} | {d['人数']} | {d['均值']} | {d['中位数']} | {d['标准差']} |"
+                    )
+            lines += [
+                "",
+                f"参考轨 ID：{sample['MOS']['参考ID']}",
+                "",
+                "原始评分（含稳定用户 ID 与候选 ID）：",
+                "",
+                "```json",
+                json.dumps(sample["MOS"]["原始评分"], ensure_ascii=False, indent=2),
+                "```",
+                "",
+            ]
+    if task.get("evaluation") != "mos":
+        lines += ["", "## 逐片段偏好", ""]
     for sample in value["样本"]:
+        if "MOS" in sample:
+            continue
         distinct = len({vote["ID"] for vote in sample["票数"] if vote["票数"]})
         if not sample["分母"]:
             hint = "该片段暂无提交。"
@@ -452,7 +550,14 @@ def results_markdown(value) -> str:
             lines.append(f"| {md_cell(tag['标签'])} | {tag['根评论数']} | {location} |")
     else:
         lines.append("暂无根评论标签。")
-    lines += ["", "## 口径与边界", "", f"- {value['播放口径']}", f"- {value['解释边界']}", ""]
+    lines += [
+        "",
+        "## 口径与边界",
+        "",
+        f"- {value['播放口径']}",
+        f"- {value['解释边界']}",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -470,6 +575,7 @@ class TaskInput(BaseModel):
     title: str = Field(min_length=1, max_length=150)
     kind: str = "算法版本"
     mode: str = "development"
+    evaluation: str = "preference"
 
 
 class SampleInput(BaseModel):
@@ -515,7 +621,8 @@ class CommentInput(BaseModel):
 
 
 class RatingInput(BaseModel):
-    choice: str
+    scores: dict | None = None
+    choice: str = "mos"
     reason: str = Field(default="", max_length=2000)
 
 
@@ -726,7 +833,7 @@ def create_app(
             ).fetchone()
             if not member or t["status"] == "draft":
                 raise HTTPException(403, "没有此任务的访问权限")
-        return {**dict(t), "can_manage": owner}
+        return {**dict(t), "can_manage": owner, "evaluation": mos.method(db, task_id)}
 
     def sample_access(db, sample_id, u, manage=False):
         s = db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
@@ -761,6 +868,7 @@ def create_app(
     def status():
         with connect(database) as db:
             return {
+                "evaluation_methods": ["preference", "mos"],
                 "needs_setup": not bool(db.execute("SELECT 1 FROM users").fetchone()),
                 "version": VERSION,
                 "instance_id": app.state.instance_id,
@@ -1983,11 +2091,16 @@ def create_app(
             "竞品整机",
         ):
             raise HTTPException(422, "无效任务类型")
+        if body.evaluation not in ("preference", "mos"):
+            raise HTTPException(422, "无效评分方式")
         task_id = uid()
         with connect(database) as db:
             db.execute(
                 "INSERT INTO tasks VALUES(?,?,?,?,?,?,?)",
                 (task_id, body.title, body.kind, body.mode, "draft", u["id"], now()),
+            )
+            db.execute(
+                "INSERT INTO evaluation_config VALUES(?,?)", (task_id, body.evaluation)
             )
         return {"id": task_id}
 
@@ -2006,6 +2119,8 @@ def create_app(
             t = task_access(db, task_id, u, True)
             if t["status"] != "draft":
                 raise HTTPException(409, "发布后任务名称、类型和模式保持冻结")
+            if body.evaluation != t["evaluation"]:
+                raise HTTPException(409, "评分方式创建后固定；请新建任务")
             if not body.title.strip():
                 raise HTTPException(422, "任务名称不能为空")
             if body.mode != t["mode"] and (
@@ -2315,6 +2430,38 @@ def create_app(
                 )
         return {"id": request_id, "reused": False}
 
+    class ReferenceInput(BaseModel):
+        track_id: str
+
+    @app.put("/api/samples/{sample_id}/timbre-reference")
+    def set_timbre_reference(sample_id: str, body: ReferenceInput, request: Request):
+        u = user(request)
+        with mutation_lock, connect(database) as db:
+            _, t = sample_access(db, sample_id, u, True)
+            if t["status"] != "draft":
+                raise HTTPException(409, "发布后参考音色冻结")
+            if t["evaluation"] != "mos":
+                raise HTTPException(422, "仅多维评分任务可配置音色参考")
+            if not db.execute(
+                "SELECT 1 FROM tracks WHERE id=? AND sample_id=?",
+                (body.track_id, sample_id),
+            ).fetchone():
+                raise HTTPException(422, "参考必须属于当前片段")
+            if (
+                db.execute(
+                    "SELECT 1 FROM comments WHERE sample_id=?", (sample_id,)
+                ).fetchone()
+                or db.execute(
+                    "SELECT 1 FROM ratings WHERE sample_id=?", (sample_id,)
+                ).fetchone()
+            ):
+                raise HTTPException(409, "已有贡献，不能更换参考")
+            db.execute(
+                "INSERT INTO timbre_references VALUES(?,?) ON CONFLICT(sample_id) DO UPDATE SET track_id=excluded.track_id",
+                (sample_id, body.track_id),
+            )
+        return {"ok": True}
+
     @app.post("/api/tasks/{task_id}/publish")
     def publish(task_id: str, body: PublishInput, request: Request):
         u = user(request)
@@ -2330,6 +2477,10 @@ def create_app(
             ).fetchall()
             if not rows or any(r["n"] < 2 for r in rows):
                 raise HTTPException(422, "每个样本至少需要两个版本")
+            if t["evaluation"] == "mos" and any(
+                not mos.reference(db, r["id"]) for r in rows
+            ):
+                raise HTTPException(422, "每个多维评分片段必须指定音色参考")
             # body.users 才是受邀评测者；owner 自动获得访问权限，但不构成评测义务。
             for member in set(body.users):
                 if not db.execute(
@@ -2810,15 +2961,19 @@ def create_app(
             rows = db.execute(
                 "SELECT * FROM tracks WHERE sample_id=? ORDER BY rowid", (sample_id,)
             ).fetchall()
-            proc_modes = (
-                {} if blind else _processing_modes(db, sample_id)
-            )
+            proc_modes = {} if blind else _processing_modes(db, sample_id)
+            s["evaluation"] = t["evaluation"]
+            s["dimensions"] = mos.DIMENSIONS if t["evaluation"] == "mos" else []
+            ref = mos.reference(db, sample_id)
             s["tracks"] = []
-            for row in sorted(rows, key=lambda x: mapping[x["id"]]):
+            for row in sorted(rows, key=lambda x: (x["id"] != ref, mapping[x["id"]])):
                 tr = {
                     "id": row["id"],
                     "label": chr(65 + mapping[row["id"]]),
-                    "name": "隐藏版本" if blind else row["name"],
+                    "is_reference": row["id"] == ref,
+                    "name": "参考音色"
+                    if row["id"] == ref
+                    else ("隐藏版本" if blind else row["name"]),
                     "version": "" if blind else row["version"],
                 }
                 if not blind:
@@ -2847,6 +3002,12 @@ def create_app(
                 (sample_id, u["id"]),
             ).fetchone()
             s["rating"] = dict(rating) if rating else None
+            if rating and t["evaluation"] == "mos":
+                row = db.execute(
+                    "SELECT scores FROM mos_submissions WHERE sample_id=? AND user_id=?",
+                    (sample_id, u["id"]),
+                ).fetchone()
+                s["rating"]["scores"] = json.loads(row[0]) if row else {}
             s["blind"] = blind
             return s
 
@@ -2950,8 +3111,16 @@ def create_app(
             _, t = sample_access(db, sample_id, u)
             if t["status"] != "active":
                 raise HTTPException(409, "当前任务不接受评分")
+            payload = None
+            if t["evaluation"] == "mos":
+                if body.choice != "mos":
+                    raise HTTPException(422, "多维评分任务不接受偏好票")
+                payload = mos.validate_scores(db, sample_id, body.scores)
+            elif body.scores is not None:
+                raise HTTPException(422, "偏好任务不接受多维分数")
             if (
-                body.choice != "tie"
+                t["evaluation"] != "mos"
+                and body.choice != "tie"
                 and not db.execute(
                     "SELECT 1 FROM tracks WHERE id=? AND sample_id=?",
                     (body.choice, sample_id),
@@ -2966,6 +3135,14 @@ def create_app(
                 if (
                     existing["choice"] == body.choice
                     and existing["reason"] == body.reason
+                    and (
+                        payload is None
+                        or db.execute(
+                            "SELECT scores FROM mos_submissions WHERE sample_id=? AND user_id=?",
+                            (sample_id, u["id"]),
+                        ).fetchone()[0]
+                        == payload
+                    )
                 ):
                     return {"ok": True}
                 raise HTTPException(409, "判断已提交并锁定；请在复盘评论中补充")
@@ -2983,6 +3160,11 @@ def create_app(
                 "INSERT INTO ratings VALUES(?,?,?,?,?)",
                 (sample_id, u["id"], body.choice, body.reason, now()),
             )
+            if payload is not None:
+                db.execute(
+                    "INSERT INTO mos_submissions VALUES(?,?,?)",
+                    (sample_id, u["id"], payload),
+                )
         return {"ok": True}
 
     def report(task_id, u):
@@ -2991,12 +3173,17 @@ def create_app(
             if t["status"] != "closed":
                 raise HTTPException(403, "任务关闭并揭晓后才能查看汇总")
             summary = task_summary(db, task_id)
+            mos_summary = mos.summary(db, task_id) if t["evaluation"] == "mos" else {}
             samples = []
             for row in db.execute(
                 "SELECT * FROM samples WHERE task_id=?", (task_id,)
             ).fetchall():
                 s = dict(row)
                 s.update(summary["逐片段"][s["id"]])
+                if mos_summary:
+                    s["MOS"] = mos_summary[s["id"]]
+                    s["票数"] = []
+                    s["分歧"] = False
                 proc_modes = _processing_modes(db, s["id"])
                 analyses = _analysis_rows(db, s["id"])
                 track_entries = []
@@ -3072,7 +3259,9 @@ def create_app(
                 "标签汇总": summary["标签汇总"],
                 "生成时间": now(),
                 "播放口径": "原始相对电平；公共监听增益；16 kHz；无延迟自动校正",
-                "解释边界": "探索性偏好统计，不是标准 MUSHRA，不以评分证明干净语音恢复",
+                "解释边界": mos.BOUNDARY
+                if mos_summary
+                else "探索性偏好统计，不是标准 MUSHRA，不以评分证明干净语音恢复",
             }
 
     @app.get("/api/tasks/{task_id}/report")

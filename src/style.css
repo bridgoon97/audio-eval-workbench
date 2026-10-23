@@ -2442,3 +2442,93 @@ kbd {
 .security-entry {
   margin-right: 8px;
 }
+
+/* 多维评分：一张候选卡配四行量表，未选择不预置分数。 */
+.mos-panel {
+  padding: 20px;
+}
+.mos-reference,
+.mos-reference-note {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px;
+  background: var(--surface);
+  margin-bottom: 16px;
+}
+.mos-reference-note p {
+  color: var(--muted);
+  font-size: 13px;
+}
+.mos-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px;
+  margin: 18px 0;
+}
+.mos-card legend {
+  font-weight: 650;
+  padding: 0 6px;
+}
+.mos-dimension {
+  margin: 18px 0;
+}
+.mos-dimension > small {
+  display: block;
+  margin: 4px 0 10px;
+}
+.mos-options {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 5px;
+}
+.mos-options label {
+  cursor: pointer;
+  text-align: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 2px;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 5px;
+}
+.mos-options label.chosen {
+  background: #23594f;
+  color: #fff;
+  border-color: #60dac4;
+}
+.mos-options input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+}
+.mos-result {
+  overflow-x: auto;
+  margin-top: 16px;
+}
+.mos-result table {
+  width: 100%;
+  font-size: 13px;
+  border-collapse: collapse;
+}
+.mos-result th,
+.mos-result td {
+  padding: 9px 5px;
+  text-align: left;
+  border-bottom: 1px solid #486c7140;
+}
+
+@media (min-width: 1200px) {
+  .workspace.mos-workspace {
+    grid-template-columns: 180px minmax(290px, 1fr) 380px;
+  }
+}
+.mos-panel > h3 {
+  margin: 8px 0;
+}
+.mos-panel > p {
+  line-height: 1.65;
+  font-size: 13px;
+}

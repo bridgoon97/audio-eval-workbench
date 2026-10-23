@@ -3,7 +3,26 @@
 import type { Sample } from './types';
 
 export type VoteRow = { ID: string; 名称: string; 票数: number };
-export type SampleSummary = { 分母: number; 票数: VoteRow[]; 分歧: boolean };
+export type SampleSummary = {
+  分母: number;
+  票数: VoteRow[];
+  分歧: boolean;
+  MOS?: {
+    参考ID: string;
+    候选: {
+      ID: string;
+      名称: string;
+      维度: {
+        key: string;
+        name: string;
+        人数: number;
+        均值: number | null;
+        中位数: number | null;
+        标准差: number | null;
+      }[];
+    }[];
+  };
+};
 export type ProgressSummary = {
   受邀评测者: number;
   已完成: number;
@@ -20,7 +39,14 @@ export type TagSummary = {
   片段: { ID: string; 名称: string; 根评论数: number }[];
 };
 export type ReportPayload = {
-  任务: { id: string; title: string; kind: string; mode: string; status: string };
+  任务: {
+    id: string;
+    title: string;
+    kind: string;
+    mode: string;
+    status: string;
+    evaluation?: string;
+  };
   样本: (Sample & SampleSummary)[];
   参与进度: ProgressSummary;
   标签汇总: TagSummary[];

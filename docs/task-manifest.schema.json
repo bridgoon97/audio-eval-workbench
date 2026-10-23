@@ -2,11 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "听鉴 Agent 评测任务清单",
   "type": "object",
-  "required": [
-    "schema_version",
-    "task",
-    "samples"
-  ],
+  "required": ["schema_version", "task", "samples"],
   "additionalProperties": false,
   "properties": {
     "schema_version": {
@@ -14,11 +10,7 @@
     },
     "task": {
       "type": "object",
-      "required": [
-        "title",
-        "kind",
-        "mode"
-      ],
+      "required": ["title", "kind", "mode"],
       "additionalProperties": false,
       "properties": {
         "title": {
@@ -27,19 +19,13 @@
           "maxLength": 150
         },
         "kind": {
-          "enum": [
-            "算法版本",
-            "VPU 支路",
-            "级联链路",
-            "竞品算法",
-            "竞品整机"
-          ]
+          "enum": ["算法版本", "VPU 支路", "级联链路", "竞品算法", "竞品整机"]
         },
         "mode": {
-          "enum": [
-            "development",
-            "blind"
-          ]
+          "enum": ["development", "blind"]
+        },
+        "evaluation": {
+          "enum": ["preference", "mos"]
         }
       }
     },
@@ -47,9 +33,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": [
-          "name"
-        ],
+        "required": ["name"],
         "additionalProperties": false,
         "properties": {
           "name": {
@@ -65,12 +49,7 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": [
-          "key",
-          "name",
-          "provenance",
-          "candidates"
-        ],
+        "required": ["key", "name", "provenance", "candidates"],
         "additionalProperties": false,
         "properties": {
           "key": {
@@ -95,10 +74,7 @@
           },
           "segment": {
             "type": "object",
-            "required": [
-              "start_seconds",
-              "end_seconds"
-            ],
+            "required": ["start_seconds", "end_seconds"],
             "additionalProperties": false,
             "properties": {
               "start_seconds": {
@@ -117,13 +93,7 @@
             "maxItems": 6,
             "items": {
               "type": "object",
-              "required": [
-                "key",
-                "name",
-                "version",
-                "source",
-                "channel"
-              ],
+              "required": ["key", "name", "version", "source", "channel"],
               "additionalProperties": false,
               "properties": {
                 "key": {
@@ -149,6 +119,10 @@
                   "minimum": 0
                 },
                 "reference": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "timbre_reference": {
                   "type": "boolean",
                   "default": false
                 },

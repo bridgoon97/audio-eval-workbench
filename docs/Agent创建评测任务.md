@@ -132,3 +132,24 @@ audio-eval agent apply manifest.json --server http://127.0.0.1:8765 \
 - `ApplyState.load(...).payload` → `manifest_status(state_path)`。
 
 CLI（`workbench/agent_cli.py`）只是这些函数的 argparse 包装；MCP 层不应复制任何编排逻辑。
+
+## 多维 MOS 任务（试用）
+
+在 `task` 内加 `"evaluation": "mos"`；不写时仍为偏好判断。工作模式 `mode` 仍独立选择 `development` 或 `blind`。
+
+每个片段的 `candidates` 中，必须恰有一条音色参考加 `"timbre_reference": true`。此字段与用于处理分析的 `reference` 含义不同，不能互相替代。音色参考身份始终明确，不参与打分；其余候选按任务工作模式显示或隐藏身份。所有音频仍须等长，音色参考计入每题最多六条音频的上限。首版不接受不同长度的说话人参考。
+
+```json
+{
+  "task": {
+    "title": "降噪模型多维主观评分",
+    "kind": "算法版本",
+    "mode": "blind",
+    "evaluation": "mos"
+  }
+}
+```
+
+上述只是需要新增的字段片段，完整清单仍须包含 `schema_version`、`samples` 等原有必填字段。对参考候选添加 `timbre_reference` 后，照原流程 validate → prepare → apply，CLI 自动设置该题参考。创建前必须与用户确认参考音色对应的素材，不能自行把第一个算法输出当作参考。
+
+首版四个必填维度固定：降噪、音色相似度、音质、可懂度，每项 1–5 整数。评分者必须完整填写所有待测候选的四项后一次提交；参考不评分。结果仅关闭后可读，逐片段、候选、维度统计均值、中位数、样本标准差、分布与人数；不合成综合分、不跨片段混算。自定义维度、不同长度参考、标准 MOS/MUSHRA 流程认证和置信区间不在本版范围。
