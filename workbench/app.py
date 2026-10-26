@@ -342,7 +342,7 @@ def results_csv(value) -> bytes:
     if task.get("evaluation") == "mos":
         for d in task.get("dimensions", []):
             rows.append(["评分量表", d["key"], "", "", d["name"], "", "", "", "", json.dumps({"问题": d["question"], "1–5分说明": d["anchors"]}, ensure_ascii=False)])
-        rows.append(["评分口径", "", "", "", "", "", "", "", "", mos.BOUNDARY])
+        rows.append(["评分口径", "", "", "", "", "", "", "", "", f"步进 {task.get('score_step', 1)} 分；{mos.BOUNDARY}"])
         rows.append(
             [
                 "MOS汇总列",
@@ -371,7 +371,7 @@ def results_csv(value) -> bytes:
                         d["均值"],
                         d["人数"],
                         d["中位数"],
-                        f"标准差：{d['标准差']}；分布1–5：{d['分布']}；参考：{sample['MOS']['参考ID']}",
+                        f"标准差：{d['标准差']}；分布分值：{d['分布分值']}；计数：{d['分布']}；参考：{sample['MOS']['参考ID']}",
                     ]
                 )
         if "MOS" in sample:
@@ -467,6 +467,7 @@ def results_markdown(value) -> str:
         lines += [
             "",
             "## 多维 MOS",
+            f"评分步进：{task.get('score_step', 1)} 分（按任务保存；旧评分不转换）",
             "",
             "| 片段 | 候选 | 维度 | 人数 | 均值 | 中位数 | 标准差 |",
             "| --- | --- | --- | --- | --- | --- | --- |",
@@ -847,7 +848,7 @@ def create_app(
             ).fetchone()
             if not member or t["status"] == "draft":
                 raise HTTPException(403, "没有此任务的访问权限")
-        return {**dict(t), "can_manage": owner, "evaluation": mos.method(db, task_id), "dimensions": mos.get_dimensions(db, task_id)}
+        return {**dict(t), "can_manage": owner, "evaluation": mos.method(db, task_id), "dimensions": mos.get_dimensions(db, task_id), "score_step": mos.score_step(db, task_id)}
 
     def sample_access(db, sample_id, u, manage=False):
         s = db.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
@@ -2121,6 +2122,8 @@ def create_app(
             db.execute(
                 "INSERT INTO evaluation_config VALUES(?,?,?)", (task_id, body.evaluation, json.dumps(dims, ensure_ascii=False))
             )
+            if body.evaluation == "mos":
+                db.execute("INSERT INTO mos_scales VALUES(?,?)", (task_id, 0.1))
         return {"id": task_id}
 
     @app.patch("/api/tasks/{task_id}")
@@ -2987,6 +2990,7 @@ def create_app(
             proc_modes = {} if blind else _processing_modes(db, sample_id)
             s["evaluation"] = t["evaluation"]
             s["dimensions"] = t["dimensions"]
+            s["score_step"] = t["score_step"]
             ref = mos.reference(db, sample_id)
             s["tracks"] = []
             for row in sorted(rows, key=lambda x: (x["id"] != ref, mapping[x["id"]])):

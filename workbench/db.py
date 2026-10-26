@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS aliases(user_id TEXT REFERENCES users(id), sample_id 
 CREATE TABLE IF NOT EXISTS comments(id TEXT PRIMARY KEY, sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), track_id TEXT REFERENCES tracks(id), start INTEGER NOT NULL, end INTEGER NOT NULL, body TEXT NOT NULL, tag TEXT NOT NULL, parent TEXT REFERENCES comments(id), created TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ratings(sample_id TEXT REFERENCES samples(id), user_id TEXT REFERENCES users(id), choice TEXT NOT NULL, reason TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY(sample_id,user_id));
 CREATE TABLE IF NOT EXISTS evaluation_config(task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, method TEXT NOT NULL, dimensions TEXT);
+CREATE TABLE IF NOT EXISTS mos_scales(task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE, step REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS timbre_references(sample_id TEXT PRIMARY KEY REFERENCES samples(id) ON DELETE CASCADE, track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS mos_submissions(sample_id TEXT NOT NULL, user_id TEXT NOT NULL, scores TEXT NOT NULL, PRIMARY KEY(sample_id,user_id), FOREIGN KEY(sample_id,user_id) REFERENCES ratings(sample_id,user_id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS review_assignments(task_id TEXT NOT NULL REFERENCES tasks(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(task_id,user_id));
@@ -63,6 +64,10 @@ def init(path):
 
         from .mos import DIMENSIONS
         db.execute("UPDATE evaluation_config SET dimensions=? WHERE method='mos' AND dimensions IS NULL", (json.dumps(DIMENSIONS, ensure_ascii=False),))
+        # 未结束的旧 MOS 任务开放小数精度；已关闭任务保留原整数口径。
+        # 只添加任务精度快照，不触碰任何已提交评分。
+        db.execute("INSERT OR IGNORE INTO mos_scales SELECT e.task_id,0.1 FROM evaluation_config e JOIN tasks t ON t.id=e.task_id WHERE e.method='mos' AND t.status!='closed'")
+        db.execute("UPDATE mos_scales SET step=0.1 WHERE step=0.2 AND task_id IN (SELECT id FROM tasks WHERE status!='closed')")
         # 无损迁移：v0.7.0 旧库 users 表没有 active 列，补齐后默认全部可用；
         # 重复执行与重复启动均无副作用。
         columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}

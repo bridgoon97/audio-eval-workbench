@@ -1,7 +1,9 @@
 """多维评分：固定锚点、完整提交校验与逐片段描述统计。"""
 
 import json
+import math
 import statistics
+from decimal import Decimal
 
 from fastapi import HTTPException
 
@@ -48,6 +50,16 @@ def get_dimensions(db, task_id):
     return json.loads(row[0]) if row and row[0] else []
 
 
+def score_step(db, task_id):
+    # 无记录代表旧版整数任务；绝不迁移或重写历史评分。
+    row = db.execute("SELECT step FROM mos_scales WHERE task_id=?", (task_id,)).fetchone()
+    return row[0] if row else 1
+
+
+def score_values(step):
+    return [round(1 + i * step, 1) for i in range(round(4 / step) + 1)]
+
+
 def normalize_dimensions(values):
     raw = [d.model_dump() for d in values] if values is not None else DIMENSIONS
     dims = [
@@ -91,16 +103,23 @@ def validate_scores(db, sample_id, scores):
         "SELECT task_id FROM samples WHERE id=?", (sample_id,)
     ).fetchone()[0]
     keys = {d["key"] for d in get_dimensions(db, task_id)}
+    step = score_step(db, task_id)
     for values in scores.values():
         if not isinstance(values, dict) or set(values) != keys:
             raise HTTPException(422, "每个候选须完整填写本任务的全部指标")
-        if any(type(v) is not int or not 1 <= v <= 5 for v in values.values()):
-            raise HTTPException(422, "分值须为 1–5 的整数")
-    return json.dumps(scores, sort_keys=True, ensure_ascii=False)
+        if any(
+            type(v) not in (int, float) or (step == 1 and type(v) is not int) or not math.isfinite(v) or not 1 <= v <= 5
+            or (Decimal(str(v)) - 1) % Decimal(str(step)) != 0
+            for v in values.values()
+        ):
+            raise HTTPException(422, f"分值须为 1–5，步进 {step} 分")
+    normalized = {track: {key: int(v) if v == int(v) else v for key, v in values.items()} for track, values in scores.items()}
+    return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
 
 
 def summary(db, task_id):
     result = {}
+    bins = score_values(score_step(db, task_id))
     for sample in db.execute("SELECT id FROM samples WHERE task_id=?", (task_id,)):
         sid = sample[0]
         ref = reference(db, sid)
@@ -130,7 +149,8 @@ def summary(db, task_id):
                         "均值": statistics.mean(values) if values else None,
                         "中位数": statistics.median(values) if values else None,
                         "标准差": statistics.stdev(values) if len(values) > 1 else None,
-                        "分布": [values.count(i) for i in range(1, 6)],
+                        "分布": [values.count(i) for i in bins],
+                        "分布分值": bins,
                     }
                 )
             tracks.append({"ID": tr["id"], "名称": tr["name"], "维度": dimensions})

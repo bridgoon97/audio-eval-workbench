@@ -2562,3 +2562,33 @@ kbd {
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 8px;
 }
+
+.mos-slider input[type='range'] {
+  width: 100%;
+  margin: 12px 0;
+  accent-color: var(--accent);
+}
+.mos-anchors {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.mos-score-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.mos-range-label {
+  flex: 1;
+  min-width: 0;
+}
+.mos-number-label {
+  width: 92px;
+  flex-shrink: 0;
+}
+.mos-number-label input {
+  width: 100%;
+}

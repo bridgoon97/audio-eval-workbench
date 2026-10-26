@@ -10,6 +10,7 @@ export function Waveform({
   contentGuide,
   onRegion,
   onSeek,
+  onActivate,
 }: {
   data?: Analysis;
   spectrum: boolean;
@@ -19,6 +20,7 @@ export function Waveform({
   contentGuide?: number[];
   onRegion: (r: [number, number]) => void;
   onSeek: (time: number) => void;
+  onActivate: () => void;
 }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const down = useRef<number | null>(null);
@@ -122,6 +124,7 @@ export function Waveform({
       ref={ref}
       className="waveform"
       onPointerDown={(e) => {
+        onActivate();
         down.current = timeAt(e);
         moved.current = false;
         e.currentTarget.setPointerCapture(e.pointerId);
