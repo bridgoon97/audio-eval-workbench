@@ -15,7 +15,7 @@ from workbench.mos import DIMENSIONS
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, request):
     app = create_app(tmp_path)
     admin = TestClient(app)
     assert (
@@ -50,6 +50,10 @@ def env(tmp_path):
     tid = admin.post(
         "/api/tasks", json={"title": "多维测试", "mode": "blind", "evaluation": "mos"}
     ).json()["id"]
+    if getattr(request, "param", 1) == 1:
+        # 模拟升级前创建、没有精度快照的整数任务，继续覆盖旧评分语义。
+        with sqlite3.connect(app.state.database) as db:
+            db.execute("DELETE FROM mos_scales WHERE task_id=?", (tid,))
     sid = admin.post(f"/api/tasks/{tid}/samples", json={"name": "语音片段"}).json()[
         "id"
     ]
@@ -521,3 +525,72 @@ def test_mos_optional_reference_full_flow(env):
         response = a.get(f"/api/tasks/{tid}/{suffix}")
         assert response.status_code == 200
         assert "秘密算法0" in response.text
+
+
+@pytest.mark.parametrize("env", [0.2], indirect=True)
+def test_slider_precision_stats_and_retry(env):
+    _, a, peers, tid, sid, tracks, _ = env
+    assert a.get(f"/api/tasks/{tid}").json()["score_step"] == 0.2
+    start(env)
+    client = peers[0][0]
+    assert client.get(f"/api/samples/{sid}").json()["score_step"] == 0.2
+    for value in [1.1, 0.8, 5.2, True, "3.2"]:
+        assert client.post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, value)}).status_code == 422
+    values = scores(tracks, 3.2)
+    assert client.post(f"/api/samples/{sid}/rating", json={"scores": values}).status_code == 200
+    assert client.post(f"/api/samples/{sid}/rating", json={"scores": values}).status_code == 200
+    assert peers[1][0].post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 4)}).status_code == 200
+    assert a.post(f"/api/tasks/{tid}/close").status_code == 200
+    report = a.get(f"/api/tasks/{tid}/report").json()
+    dimension = report["样本"][0]["MOS"]["候选"][0]["维度"][0]
+    assert dimension["均值"] == 3.6
+    assert dimension["中位数"] == 3.6
+    assert dimension["标准差"] == pytest.approx(0.8 / 2 ** 0.5)
+    assert len(dimension["分布"]) == 21
+    assert dimension["分布分值"][11] == 3.2
+    assert dimension["分布"][11] == 1 and sum(dimension["分布"]) == 2
+    _, _, _, _, _, _, root = env
+    restored_app = create_app(root)
+    restored_client = TestClient(restored_app)
+    restored_client.post("/api/login", json={"name": "管理员", "password": "test-admin-password"})
+    restored_report = restored_client.get(f"/api/tasks/{tid}/report").json()
+    assert restored_report["任务"]["score_step"] == 0.2
+    assert restored_report["样本"] == report["样本"]
+    for suffix in ["export", "export.csv", "export.md"]:
+        assert "3.2" in a.get(f"/api/tasks/{tid}/{suffix}").text
+
+
+def test_legacy_integer_scale_and_results_survive_restart(env):
+    app, a, peers, tid, sid, tracks, root = env
+    assert a.get(f"/api/tasks/{tid}").json()["score_step"] == 1
+    start(env)
+    assert peers[0][0].post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 3.2)}).status_code == 422
+    assert peers[0][0].post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 4)}).status_code == 200
+    assert a.post(f"/api/tasks/{tid}/close").status_code == 200
+    before = a.get(f"/api/tasks/{tid}/report").json()
+    with sqlite3.connect(app.state.database) as db:
+        raw_before = db.execute("SELECT scores FROM mos_submissions").fetchall()
+    upgraded = create_app(root)
+    c = TestClient(upgraded)
+    c.post("/api/login", json={"name": "管理员", "password": "test-admin-password"})
+    after = c.get(f"/api/tasks/{tid}/report").json()
+    assert after["样本"] == before["样本"]
+    assert after["任务"]["score_step"] == 1
+    assert len(after["样本"][0]["MOS"]["候选"][0]["维度"][0]["分布"]) == 5
+    with sqlite3.connect(upgraded.state.database) as db:
+        assert db.execute("SELECT scores FROM mos_submissions").fetchall() == raw_before
+
+
+def test_active_legacy_upgrade_keeps_votes_and_allows_fraction(env):
+    app, _, peers, _, sid, tracks, root = env
+    start(env)
+    assert peers[0][0].post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 4)}).status_code == 200
+    with sqlite3.connect(app.state.database) as db:
+        old_rows = db.execute("SELECT user_id,scores FROM mos_submissions").fetchall()
+    upgraded = create_app(root)
+    client = TestClient(upgraded)
+    client.post("/api/login", json={"name": "评测者1", "password": "test-review-password"})
+    assert client.get(f"/api/samples/{sid}").json()["score_step"] == 0.2
+    assert client.post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 3.2)}).status_code == 200
+    with sqlite3.connect(upgraded.state.database) as db:
+        assert db.execute("SELECT user_id,scores FROM mos_submissions WHERE user_id=?", (peers[0][1],)).fetchall() == old_rows

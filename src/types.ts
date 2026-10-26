@@ -6,6 +6,7 @@ export type Task = {
   mode: string;
   evaluation: 'preference' | 'mos';
   dimensions: Dimension[];
+  score_step?: number;
   status: string;
   owner: string;
   can_manage: boolean;
@@ -57,6 +58,7 @@ export type Sample = {
   blind?: boolean;
   evaluation?: 'preference' | 'mos';
   dimensions?: Dimension[];
+  score_step?: number;
   rating?: { choice: string; reason: string; scores?: MosScores } | null;
 };
 export type Analysis = { peaks: number[][]; spectrogram: number[][] };
