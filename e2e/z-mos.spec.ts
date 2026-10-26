@@ -73,7 +73,7 @@ for (const withReference of [true, false]) {
       await expect(page.getByLabel('指定参考音色')).toHaveValue('');
     }
     await page.getByRole('button', { name: '多维评分', exact: true }).click();
-    await expect(page.locator('.mos-slider input').first()).toBeDisabled();
+    await expect(page.locator('.mos-slider input[type=range]').first()).toBeDisabled();
     await page.getByRole('button', { name: '发布评测', exact: true }).click();
     await page.getByRole('checkbox', { name: '我也参与评测（提交偏好并计入进度）' }).check();
     await page.locator('input[name="alignment"]').check();
@@ -81,7 +81,7 @@ for (const withReference of [true, false]) {
     await page.getByRole('button', { name: '多维评分', exact: true }).click();
     await expect(page.locator('.mos-card')).toHaveCount(candidates);
     await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
-    const groups = page.locator('.mos-slider input');
+    const groups = page.locator('.mos-slider input[type=range]');
     await expect(groups).toHaveCount(fields);
     await expect(page.locator('.mos-panel')).toContainText('噪声明显干扰');
     await expect(page.locator('.mos-panel')).toContainText('综合表现');
@@ -91,6 +91,18 @@ for (const withReference of [true, false]) {
       await groups.nth(i).press('End');
       for (let j = 0; j < 4; j++) await groups.nth(i).press('ArrowLeft');
     }
+    const numeric = page.locator('.mos-slider input[type=number]').first();
+    await expect(numeric).toHaveValue('4.2');
+    await numeric.fill('3.2');
+    await expect(groups.first()).toHaveValue('3.2');
+    await numeric.fill('3.1');
+    await expect(numeric).toHaveAttribute('aria-invalid', 'true');
+    await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
+    await numeric.fill('6');
+    await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
+    await numeric.fill('');
+    await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
+    await numeric.fill('4.2');
     await expect(page.getByText(`已填 ${fields}/${fields} 项`, { exact: false })).toBeVisible();
     await page.locator('.notes-panel').evaluate((el) => {
       el.scrollTop = 0;
@@ -101,7 +113,7 @@ for (const withReference of [true, false]) {
     await page.locator('.task-card').filter({ hasText: title }).click();
     await page.getByRole('button', { name: '多维评分', exact: true }).click();
     for (let i = 0; i < fields; i++)
-      await expect(page.locator('.mos-slider input').nth(i)).toHaveValue('4.2');
+      await expect(page.locator('.mos-slider input[type=range]').nth(i)).toHaveValue('4.2');
     await page.getByRole('button', { name: '提交全部评分' }).click();
     await expect(
       page.locator('.mos-panel').getByRole('button', { name: '已提交', exact: true }),

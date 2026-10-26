@@ -31,25 +31,27 @@ export function MosPanel({
   const candidates = sample.tracks?.filter((t) => !t.is_reference) || [];
   const dimensions = sample.dimensions || [];
   const step = sample.score_step ?? 1;
-  const saveScore = (track: string, key: string, value: number) => {
+  const validScore = (value: number | undefined) =>
+    value !== undefined &&
+    Number.isFinite(value) &&
+    value >= 1 &&
+    value <= 5 &&
+    Math.abs((value - 1) / step - Math.round((value - 1) / step)) < 1e-8;
+  const saveScore = (track: string, key: string, value: number | undefined) => {
     if (!active || sample.rating || saving) return;
-    const next = { ...scores, [track]: { ...scores[track], [key]: value } };
+    const trackScores = { ...scores[track] };
+    if (value === undefined) delete trackScores[key];
+    else trackScores[key] = value;
+    const next = { ...scores, [track]: trackScores };
     setScores(next);
     localStorage.setItem(storageKey, JSON.stringify(next));
   };
   const complete =
     candidates.length > 0 &&
     dimensions.length > 0 &&
-    candidates.every((t) =>
-      dimensions.every(
-        (d) =>
-          Number.isFinite(scores[t.id]?.[d.key]) &&
-          scores[t.id][d.key] >= 1 &&
-          scores[t.id][d.key] <= 5,
-      ),
-    );
+    candidates.every((t) => dimensions.every((d) => validScore(scores[t.id]?.[d.key])));
   const count = candidates.reduce(
-    (n, t) => n + dimensions.filter((d) => scores[t.id]?.[d.key]).length,
+    (n, t) => n + dimensions.filter((d) => validScore(scores[t.id]?.[d.key])).length,
     0,
   );
   return (
@@ -83,27 +85,60 @@ export function MosPanel({
               <strong>{d.name}</strong>
               <small>{d.question}</small>
               <div className="mos-slider">
-                <label>
-                  当前分数：{scores[t.id]?.[d.key]?.toFixed(1) ?? '未评分'}
-                  <input
-                    type="range"
-                    aria-label={`${t.label} ${d.name}`}
-                    min="1"
-                    max="5"
-                    step={step}
-                    value={scores[t.id]?.[d.key] ?? 3}
-                    onChange={(e) => saveScore(t.id, d.key, Number(e.target.value))}
-                    onPointerUp={(e) => saveScore(t.id, d.key, Number(e.currentTarget.value))}
-                    onKeyUp={(e) => {
-                      if (
-                        ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(
-                          e.key,
+                <div className="mos-score-controls">
+                  <label className="mos-range-label">
+                    当前分数：{scores[t.id]?.[d.key]?.toFixed(1) ?? '未评分'}
+                    <input
+                      type="range"
+                      aria-label={`${t.label} ${d.name}`}
+                      min="1"
+                      max="5"
+                      step={step}
+                      value={validScore(scores[t.id]?.[d.key]) ? scores[t.id][d.key] : 3}
+                      onChange={(e) => saveScore(t.id, d.key, Number(e.target.value))}
+                      onPointerUp={(e) => saveScore(t.id, d.key, Number(e.currentTarget.value))}
+                      onKeyUp={(e) => {
+                        if (
+                          [
+                            'ArrowLeft',
+                            'ArrowRight',
+                            'ArrowUp',
+                            'ArrowDown',
+                            'Home',
+                            'End',
+                          ].includes(e.key)
                         )
-                      )
-                        saveScore(t.id, d.key, Number(e.currentTarget.value));
-                    }}
-                  />
-                </label>
+                          saveScore(t.id, d.key, Number(e.currentTarget.value));
+                      }}
+                    />
+                  </label>
+                  <label className="mos-number-label">
+                    输入分数
+                    <input
+                      type="number"
+                      aria-label={`${t.label} ${d.name} 输入分数`}
+                      min="1"
+                      max="5"
+                      step={step}
+                      inputMode="decimal"
+                      placeholder="未评分"
+                      value={scores[t.id]?.[d.key] ?? ''}
+                      aria-invalid={
+                        scores[t.id]?.[d.key] !== undefined && !validScore(scores[t.id]?.[d.key])
+                      }
+                      onChange={(e) =>
+                        saveScore(
+                          t.id,
+                          d.key,
+                          e.target.value === '' ? undefined : e.target.valueAsNumber,
+                        )
+                      }
+                    />
+                  </label>
+                </div>
+                {scores[t.id]?.[d.key] !== undefined && !validScore(scores[t.id]?.[d.key]) && (
+                  <small className="error">请输入 1–5 分，步进 {step} 分；不会自动取整。</small>
+                )}
                 <div className="mos-anchors">
                   {d.anchors.map((anchor, i) => (
                     <span key={i}>
