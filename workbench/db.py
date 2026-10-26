@@ -66,7 +66,8 @@ def init(path):
         db.execute("UPDATE evaluation_config SET dimensions=? WHERE method='mos' AND dimensions IS NULL", (json.dumps(DIMENSIONS, ensure_ascii=False),))
         # 未结束的旧 MOS 任务开放小数精度；已关闭任务保留原整数口径。
         # 只添加任务精度快照，不触碰任何已提交评分。
-        db.execute("INSERT OR IGNORE INTO mos_scales SELECT e.task_id,0.2 FROM evaluation_config e JOIN tasks t ON t.id=e.task_id WHERE e.method='mos' AND t.status!='closed'")
+        db.execute("INSERT OR IGNORE INTO mos_scales SELECT e.task_id,0.1 FROM evaluation_config e JOIN tasks t ON t.id=e.task_id WHERE e.method='mos' AND t.status!='closed'")
+        db.execute("UPDATE mos_scales SET step=0.1 WHERE step=0.2 AND task_id IN (SELECT id FROM tasks WHERE status!='closed')")
         # 无损迁移：v0.7.0 旧库 users 表没有 active 列，补齐后默认全部可用；
         # 重复执行与重复启动均无副作用。
         columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}

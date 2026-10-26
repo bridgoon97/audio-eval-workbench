@@ -89,20 +89,20 @@ for (const withReference of [true, false]) {
     for (let i = 0; i < fields; i++) {
       await groups.nth(i).focus();
       await groups.nth(i).press('End');
-      for (let j = 0; j < 4; j++) await groups.nth(i).press('ArrowLeft');
+      for (let j = 0; j < 7; j++) await groups.nth(i).press('ArrowLeft');
     }
     const numeric = page.locator('.mos-slider input[type=number]').first();
-    await expect(numeric).toHaveValue('4.2');
-    await numeric.fill('3.2');
-    await expect(groups.first()).toHaveValue('3.2');
-    await numeric.fill('3.1');
+    await expect(numeric).toHaveValue('4.3');
+    await numeric.fill('3.3');
+    await expect(groups.first()).toHaveValue('3.3');
+    await numeric.fill('3.15');
     await expect(numeric).toHaveAttribute('aria-invalid', 'true');
     await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
     await numeric.fill('6');
     await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
     await numeric.fill('');
     await expect(page.getByRole('button', { name: '提交全部评分' })).toBeDisabled();
-    await numeric.fill('4.2');
+    await numeric.fill('4.3');
     await expect(page.getByText(`已填 ${fields}/${fields} 项`, { exact: false })).toBeVisible();
     await page.locator('.notes-panel').evaluate((el) => {
       el.scrollTop = 0;
@@ -113,7 +113,7 @@ for (const withReference of [true, false]) {
     await page.locator('.task-card').filter({ hasText: title }).click();
     await page.getByRole('button', { name: '多维评分', exact: true }).click();
     for (let i = 0; i < fields; i++)
-      await expect(page.locator('.mos-slider input[type=range]').nth(i)).toHaveValue('4.2');
+      await expect(page.locator('.mos-slider input[type=range]').nth(i)).toHaveValue('4.3');
     await page.getByRole('button', { name: '提交全部评分' }).click();
     await expect(
       page.locator('.mos-panel').getByRole('button', { name: '已提交', exact: true }),
@@ -123,7 +123,7 @@ for (const withReference of [true, false]) {
     await page.getByRole('button', { name: '查看结果', exact: true }).click();
     await expect(page.getByRole('heading', { name: '逐片段多维 MOS' })).toBeVisible();
     await expect(page.locator('.review-sample .mos-result')).toHaveCount(candidates);
-    await expect(page.locator('.review-sample .mos-result').first()).toContainText('4.20');
+    await expect(page.locator('.review-sample .mos-result').first()).toContainText('4.30');
     await page.getByText('指标与档位说明（发布时量表）', { exact: true }).click();
     await expect(
       page.locator('.mos-scale-snapshot').getByText('噪声明显干扰', { exact: true }),

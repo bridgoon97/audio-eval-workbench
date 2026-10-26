@@ -2123,7 +2123,7 @@ def create_app(
                 "INSERT INTO evaluation_config VALUES(?,?,?)", (task_id, body.evaluation, json.dumps(dims, ensure_ascii=False))
             )
             if body.evaluation == "mos":
-                db.execute("INSERT INTO mos_scales VALUES(?,?)", (task_id, 0.2))
+                db.execute("INSERT INTO mos_scales VALUES(?,?)", (task_id, 0.1))
         return {"id": task_id}
 
     @app.patch("/api/tasks/{task_id}")
