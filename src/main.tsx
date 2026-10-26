@@ -1288,6 +1288,7 @@ function App() {
                               duration={duration}
                               region={region}
                               contentGuide={sample.blind ? contentGuide : undefined}
+                              onActivate={() => select(i)}
                               onRegion={selectRegion}
                               onSeek={(at) => {
                                 engine?.seek(at);
