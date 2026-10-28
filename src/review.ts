@@ -8,7 +8,8 @@ export type SampleSummary = {
   票数: VoteRow[];
   分歧: boolean;
   MOS?: {
-    参考ID: string;
+    参考ID: string | null;
+    原始评分: { user_id: string; author: string; scores: Record<string, Record<string, number>> }[];
     候选: {
       ID: string;
       名称: string;
@@ -39,6 +40,7 @@ export type TagSummary = {
   片段: { ID: string; 名称: string; 根评论数: number }[];
 };
 export type ReportPayload = {
+  阶段结果?: { 口径: string; 纳入人数: number; 未完成人数: number };
   任务: {
     id: string;
     title: string;
@@ -48,7 +50,10 @@ export type ReportPayload = {
     evaluation?: string;
     dimensions?: Dimension[];
   };
-  样本: (Sample & SampleSummary)[];
+  样本: (Sample &
+    SampleSummary & {
+      ratings: { user_id: string; author: string; choice: string; reason: string }[];
+    })[];
   参与进度: ProgressSummary;
   标签汇总: TagSummary[];
   生成时间: string;
