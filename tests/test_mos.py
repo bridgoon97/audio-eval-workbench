@@ -594,3 +594,108 @@ def test_active_legacy_upgrade_keeps_votes_and_allows_fraction(env):
     assert client.post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, 3.3)}).status_code == 200
     with sqlite3.connect(upgraded.state.database) as db:
         assert db.execute("SELECT user_id,scores FROM mos_submissions WHERE user_id=?", (peers[0][1],)).fetchall() == old_rows
+
+
+@pytest.mark.parametrize("env", [0.1], indirect=True)
+def test_interim_only_completed_users_and_live_refresh(env):
+    import csv
+
+    _, a, peers, tid, sid, tracks, _ = env
+    sid2 = a.post(f"/api/tasks/{tid}/samples", json={"name": "第二片段"}).json()["id"]
+    tracks2 = []
+    for i in range(3):
+        response = a.post(f"/api/samples/{sid2}/tracks", data={"name": f"第二秘密算法{i}"}, files={"file": ("audio.wav", demo_wav(i, 0), "audio/wav")})
+        assert response.status_code == 200
+        tracks2.append(response.json()["id"])
+    assert a.put(f"/api/samples/{sid2}/timbre-reference", json={"track_id": tracks2[0]}).status_code == 200
+    start(env)
+    empty = a.get(f"/api/tasks/{tid}/interim-report")
+    assert empty.status_code == 200 and empty.json()["阶段结果"]["纳入人数"] == 0
+    assert all(d["人数"] == 0 and d["均值"] is None for s in empty.json()["样本"] for t in s["MOS"]["候选"] for d in t["维度"])
+    for client, value, reason in [(peers[0][0], 4.3, "已完成者原因"), (peers[1][0], 1.1, "未完成者原因不得导出")]:
+        assert client.post(f"/api/samples/{sid}/rating", json={"scores": scores(tracks, value), "reason": reason}).status_code == 200
+    assert peers[1][0].post(f"/api/samples/{sid}/comments", json={"start":0, "end":1600, "body":"未完成者评论不得导出", "tag":"不纳入标签"}).status_code == 200
+    assert peers[0][0].post(f"/api/samples/{sid2}/rating", json={"scores": scores(tracks2, 4.3)}).status_code == 200
+    response = a.get(f"/api/tasks/{tid}/interim-report")
+    assert response.headers["cache-control"] == "no-store"
+    value = response.json()
+    assert value["任务"]["status"] == "active"
+    assert value["阶段结果"]["纳入人数"] == 1 and value["阶段结果"]["未完成人数"] == 1
+    assert "未完成者评论不得导出" not in json.dumps(value, ensure_ascii=False)
+    assert value["标签汇总"] == []
+    assert value["生成时间"]
+    assert [m["ID"] for m in value["阶段结果"]["纳入成员"]] == [peers[0][1]]
+    for sample in value["样本"]:
+        assert {r["user_id"] for r in sample["ratings"]} == {peers[0][1]}
+        assert {r["user_id"] for r in sample["MOS"]["原始评分"]} == {peers[0][1]}
+        assert all(d["人数"] == 1 and d["均值"] == 4.3 for t in sample["MOS"]["候选"] for d in t["维度"])
+    for suffix in ["interim-export", "interim-export.csv", "interim-export.md"]:
+        exported = a.get(f"/api/tasks/{tid}/{suffix}")
+        assert exported.status_code == 200 and "未完成者原因不得导出" not in exported.text
+        assert "阶段结果" in exported.text
+        if suffix.endswith("csv"):
+            assert exported.content.startswith(b"\xef\xbb\xbf")
+            rows = list(csv.reader(io.StringIO(exported.content.decode("utf-8-sig"))))
+            raw = [r for r in rows if r and r[0] == "MOS原始评分"]
+            assert len(raw) == 16 and {r[4] for r in raw} == {peers[0][1]}
+    # 查看和下载不会关闭收集；第二位同事仍可完成，新的快照纳入两人。
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finishing = pool.submit(peers[1][0].post, f"/api/samples/{sid2}/rating", json={"scores": scores(tracks2, 1.1)})
+        snapshots = [a.get(f"/api/tasks/{tid}/interim-report").json() for _ in range(3)]
+        assert finishing.result().status_code == 200
+    for snapshot in snapshots:
+        count = snapshot["阶段结果"]["纳入人数"]
+        assert count in (1, 2)
+        assert all(len(sample["MOS"]["原始评分"]) == count and len(sample["ratings"]) == count for sample in snapshot["样本"])
+    refreshed = a.get(f"/api/tasks/{tid}/interim-report").json()
+    assert refreshed["阶段结果"]["纳入人数"] == 2
+    assert refreshed["样本"][0]["MOS"]["候选"][0]["维度"][0]["均值"] == 2.7
+    assert a.post(f"/api/tasks/{tid}/close").status_code == 200
+    assert a.get(f"/api/tasks/{tid}/interim-report").status_code == 409
+    assert "阶段结果" not in a.get(f"/api/tasks/{tid}/report").json()
+
+
+def test_interim_permissions_and_existing_sealed_routes(env):
+    app, a, peers, tid, _, _, _ = env
+    paths = ["interim-report", "interim-export", "interim-export.csv", "interim-export.md"]
+    assert a.get(f"/api/tasks/{tid}/interim-report").status_code == 409
+    start(env)
+    outsider = TestClient(app)
+    # 已登录但未分配的其他组织者也不拥有管理此任务的权限。
+    csrf = a.get("/api/me").json()["csrf_token"]
+    assert a.post("/api/users", json={"name": "其他组织者", "password": "other-organizer-password", "role": "organizer"}, headers={"x-csrf-token": csrf}).status_code == 200
+    outsider.post("/api/login", json={"name": "其他组织者", "password": "other-organizer-password"})
+    for path in paths:
+        for client, code in [(TestClient(app), 401), (peers[0][0], 403), (outsider, 403)]:
+            response = client.get(f"/api/tasks/{tid}/{path}")
+            assert response.status_code == code and "秘密算法" not in response.text
+    for path in ["report", "export", "export.csv", "export.md"]:
+        assert a.get(f"/api/tasks/{tid}/{path}").status_code == 403
+    assert a.get(f"/api/tasks/{tid}/interim-report").status_code == 200
+
+
+def test_interim_preference_only_complete_reviewers(env):
+    _, a, peers, _, _, _, _ = env
+    tid = a.post("/api/tasks", json={"title": "阶段偏好测试"}).json()["id"]
+    sample_tracks = []
+    for name in ["甲片段", "乙片段"]:
+        sid = a.post(f"/api/tasks/{tid}/samples", json={"name": name}).json()["id"]
+        tracks = []
+        for i in range(2):
+            tracks.append(a.post(f"/api/samples/{sid}/tracks", data={"name": f"候选{i}"}, files={"file": ("audio.wav", demo_wav(i, 0), "audio/wav")}).json()["id"])
+        sample_tracks.append((sid, tracks))
+    assert a.post(f"/api/tasks/{tid}/publish", json={"users": [p[1] for p in peers], "alignment_confirmed": True}).status_code == 200
+    for sid, tracks in sample_tracks:
+        assert peers[0][0].post(f"/api/samples/{sid}/rating", json={"choice": tracks[0]}).status_code == 200
+    sid, tracks = sample_tracks[0]
+    assert peers[1][0].post(f"/api/samples/{sid}/rating", json={"choice": tracks[1], "reason": "部分完成原因"}).status_code == 200
+    value = a.get(f"/api/tasks/{tid}/interim-report").json()
+    assert value["阶段结果"]["纳入人数"] == 1
+    assert all(sample["分母"] == 1 and sample["票数"][0]["票数"] == 1 and sample["票数"][1]["票数"] == 0 and not sample["分歧"] for sample in value["样本"])
+    assert all(len(sample["ratings"]) == 1 for sample in value["样本"])
+    assert "部分完成原因" not in a.get(f"/api/tasks/{tid}/interim-export.csv").text
+    exported = a.get(f"/api/tasks/{tid}/interim-export.csv").text
+    assert exported.count("偏好原始判断") == 2
+    markdown = a.get(f"/api/tasks/{tid}/interim-export.md")
+    assert markdown.status_code == 200 and "已完成人员原始偏好判断" in markdown.text
+    assert "部分完成原因" not in markdown.text

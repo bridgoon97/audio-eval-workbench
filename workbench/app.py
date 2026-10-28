@@ -120,7 +120,7 @@ def csv_safe(value):
     return value
 
 
-def task_summary(db, task_id):
+def task_summary(db, task_id, eligible=None):
     """复盘汇总。口径固定：
     - 受邀评测者名单只来自 review_assignments；负责人自动拥有访问权限，
       但不因 owner 身份或自动成员行成为受邀评测者。
@@ -147,6 +147,8 @@ def task_summary(db, task_id):
         "(SELECT user_id FROM review_assignments WHERE task_id=?)",
         (task_id, task_id),
     ):
+        if eligible is not None and row["user_id"] not in eligible:
+            continue
         choices.setdefault(row["sample_id"], []).append(row["choice"])
         rated.setdefault(row["user_id"], set()).add(row["sample_id"])
 
@@ -199,10 +201,12 @@ def task_summary(db, task_id):
         }
     raw_tags: dict[str, dict[str, int]] = {}
     for row in db.execute(
-        "SELECT c.tag, c.sample_id FROM comments c JOIN samples s ON s.id=c.sample_id "
+        "SELECT c.tag, c.sample_id, c.user_id FROM comments c JOIN samples s ON s.id=c.sample_id "
         "WHERE s.task_id=? AND c.parent IS NULL ORDER BY c.created, c.id",
         (task_id,),
     ):
+        if eligible is not None and row["user_id"] not in eligible:
+            continue
         per_tag = raw_tags.setdefault(row["tag"], {})
         per_tag[row["sample_id"]] = per_tag.get(row["sample_id"], 0) + 1
     names = {sample["id"]: sample["name"] for sample in samples}
@@ -226,6 +230,10 @@ def results_csv(value) -> bytes:
     samples = value["样本"]
     progress = value["参与进度"]
     rows = [CSV_HEADER]
+    if value.get("阶段结果"):
+        stage = value["阶段结果"]
+        rows += [["阶段结果（非最终）", "", "", "", label, "", text, "", "", ""]
+                 for label, text in [("统计口径", stage["口径"]), ("纳入人数", stage["纳入人数"]), ("未完成人数", stage["未完成人数"])]]
     rows += [
         ["任务信息", "", "", "", label, "", text, "", "", ""]
         for label, text in (
@@ -283,6 +291,12 @@ def results_csv(value) -> bytes:
                     note,
                 ]
             )
+    if value.get("阶段结果") and task.get("evaluation") != "mos":
+        rows.append(["偏好原始列", "候选ID", "片段ID", "片段名称", "用户ID", "用户名称", "偏好", "", "", "原因"])
+        for sample in samples:
+            for rating in sample["ratings"]:
+                name = next((t["name"] for t in sample["tracks"] if t["id"] == rating["choice"]), "无明显差异")
+                rows.append(["偏好原始判断", rating["choice"], sample["id"], sample["name"], rating["user_id"], rating["author"], name, "", "", rating["reason"]])
     for sample in samples:
         summary = sample.get("处理摘要") or {}
         for track in sample["tracks"]:
@@ -565,6 +579,13 @@ def results_markdown(value) -> str:
         f"- {value['解释边界']}",
         "",
     ]
+    if value.get("阶段结果") and task.get("evaluation") != "mos":
+        lines += ["", "## 已完成人员原始偏好判断", "", "```json",
+                  json.dumps([{ "片段ID": s["id"], "判断": s["ratings"] } for s in value["样本"]], ensure_ascii=False, indent=2), "```", ""]
+    if value.get("阶段结果"):
+        stage = value["阶段结果"]
+        lines = ["# 阶段结果（非最终）", "", stage["口径"],
+                 f"纳入 {stage['纳入人数']} 人；未完成 {stage['未完成人数']} 人。", ""] + lines
     return "\n".join(lines)
 
 
@@ -3194,13 +3215,21 @@ def create_app(
                 )
         return {"ok": True}
 
-    def report(task_id, u):
-        with connect(database) as db:
-            t = task_access(db, task_id, u)
-            if t["status"] != "closed":
+    def report(task_id, u, interim=False):
+        with mutation_lock, connect(database) as db:
+            db.execute("BEGIN")
+            t = task_access(db, task_id, u, interim)
+            if interim and t["status"] != "active":
+                raise HTTPException(409, "阶段结果仅用于进行中的任务；已关闭任务请查看正式结果")
+            if not interim and t["status"] != "closed":
                 raise HTTPException(403, "任务关闭并揭晓后才能查看汇总")
             summary = task_summary(db, task_id)
-            mos_summary = mos.summary(db, task_id) if t["evaluation"] == "mos" else {}
+            progress = summary["参与进度"]
+            eligible = None
+            if interim:
+                eligible = {m["ID"] for m in progress["成员"] if m["状态"] == "已完成"}
+                summary = task_summary(db, task_id, eligible)
+            mos_summary = mos.summary(db, task_id, eligible) if t["evaluation"] == "mos" else {}
             samples = []
             for row in db.execute(
                 "SELECT * FROM samples WHERE task_id=?", (task_id,)
@@ -3277,11 +3306,21 @@ def create_app(
                         (s["id"],),
                     )
                 ]
+                if interim:
+                    s["ratings"] = [r for r in s["ratings"] if r["user_id"] in eligible]
+                    s["comments"] = [c for c in s["comments"] if c["user_id"] in eligible]
                 samples.append(s)
             return {
+                **({"阶段结果": {
+                    "临时结果": True,
+                    "口径": "仅纳入已提交本任务全部片段的受邀评测者；未完成人员的部分评分和评论不纳入。任务继续收集，结果仅供初步分析，不代表最终结果。",
+                    "纳入人数": len(eligible),
+                    "未完成人数": progress["受邀评测者"] - len(eligible),
+                    "纳入成员": [m for m in progress["成员"] if m["ID"] in eligible],
+                }} if interim else {}),
                 "任务": dict(t),
                 "样本": samples,
-                "参与进度": summary["参与进度"],
+                "参与进度": progress,
                 "处理口径": "派生试听资产按「先整数采样对齐，再固定增益」生成；原始 WAV 未修改。活动段 RMS 匹配不是 LUFS/ITU BS.1770 响度校准，也不是听感等响。",
                 "标签汇总": summary["标签汇总"],
                 "生成时间": now(),
@@ -3290,6 +3329,27 @@ def create_app(
                 if mos_summary
                 else "探索性偏好统计，不是标准 MUSHRA，不以评分证明干净语音恢复",
             }
+
+    @app.get("/api/tasks/{task_id}/interim-report")
+    def get_interim_report(task_id: str, request: Request):
+        return JSONResponse(report(task_id, user(request), interim=True), headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/tasks/{task_id}/interim-export")
+    @app.get("/api/tasks/{task_id}/interim-export.{format}")
+    def export_interim(task_id: str, request: Request, format: str = "json"):
+        if format not in ("json", "csv", "md"):
+            raise HTTPException(404, "不支持的导出格式")
+        value = report(task_id, user(request), interim=True)
+        if format == "csv":
+            content, media = results_csv(value), "text/csv; charset=utf-8"
+        elif format == "md":
+            content, media = results_markdown(value), "text/markdown; charset=utf-8"
+        else:
+            content, media = json.dumps(value, ensure_ascii=False, indent=2), "application/json"
+        return Response(content, media_type=media, headers={
+            "Content-Disposition": f'attachment; filename="evaluation-interim.{format}"',
+            "Cache-Control": "no-store",
+        })
 
     @app.get("/api/tasks/{task_id}/report")
     def get_report(task_id: str, request: Request):

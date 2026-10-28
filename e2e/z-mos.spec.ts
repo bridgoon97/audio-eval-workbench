@@ -118,6 +118,21 @@ for (const withReference of [true, false]) {
     await expect(
       page.locator('.mos-panel').getByRole('button', { name: '已提交', exact: true }),
     ).toBeDisabled();
+    await page.getByRole('button', { name: '阶段结果与导出', exact: true }).click();
+    await expect(
+      page.getByRole('heading', { name: '阶段结果（非最终）', exact: true }),
+    ).toBeVisible();
+    await page.getByText('已完成人员原始评分（1 人）', { exact: true }).click();
+    await expect(
+      page.locator('.report table').getByRole('cell', { name: '4.3', exact: true }).first(),
+    ).toBeVisible();
+    const downloadPromise = page.waitForEvent('download');
+    await page.getByRole('link', { name: '结果 CSV（Excel）', exact: true }).click();
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe('evaluation-interim.csv');
+    const taskStillActive = await (await page.request.get(`/api/tasks/${task.id}`)).json();
+    expect(taskStillActive.status).toBe('active');
+    await page.getByRole('button', { name: '关闭', exact: true }).click();
     await page.getByRole('button', { name: '关闭并揭晓', exact: true }).click();
     await page.getByRole('button', { name: '关闭收集并统一揭晓' }).click();
     await page.getByRole('button', { name: '查看结果', exact: true }).click();

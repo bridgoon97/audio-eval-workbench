@@ -21,7 +21,7 @@ Agent 附加禁止事项：
 - 不得自动选择通道、截取区间、归一化、对齐或增益；非 16 kHz 源必须由用户在 manifest 中显式许可重采样。
 - 不得覆盖源文件或在素材目录内写入输出。
 - 密码只允许经 stdin 或环境变量进入 CLI；manifest、mapping、state、日志与 shell history 不得出现凭据。
-- 盲评任务的候选匿名映射在任务关闭前不得提前揭晓。
+- 盲评任务的候选匿名映射不得向普通评测者提前揭晓。进行中的任务仅允许任务负责人/管理员通过 interim-report 与 interim-export 查看阶段结果（仅整份完成者），会揭示真实名称；不得向仍在评测的人转发。
 - CLI 只走公开 HTTP API；不得直接写服务端数据库或 assets，也不得绕过用户权限。
 - 发布需要双重确认（manifest.publish=true 且 CLI --publish）；处理被服务端拒绝时不得发布，拒绝证据持久化。owner 不因创建任务而自动成为受邀评测者。
 - 多维 MOS 任务需在 `task.evaluation` 写 `mos`，并可由用户明确指定每题至多一条 `timbre_reference=true` 音色参考，也可不设置（全部序列评分）。此标记与用于延迟/响度处理的 `reference` 独立；参考不评分，首版与候选等长且计入六条音频上限。不能自行把首个候选认作音色参考。

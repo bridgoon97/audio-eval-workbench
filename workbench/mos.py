@@ -117,7 +117,7 @@ def validate_scores(db, sample_id, scores):
     return json.dumps(normalized, sort_keys=True, ensure_ascii=False)
 
 
-def summary(db, task_id):
+def summary(db, task_id, eligible=None):
     result = {}
     bins = score_values(score_step(db, task_id))
     for sample in db.execute("SELECT id FROM samples WHERE task_id=?", (task_id,)):
@@ -131,6 +131,8 @@ def summary(db, task_id):
                 (task_id, sid),
             )
         ]
+        if eligible is not None:
+            raw = [row for row in raw if row["user_id"] in eligible]
         for row in raw:
             row["scores"] = json.loads(row["scores"])
         tracks = []

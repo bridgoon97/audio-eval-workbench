@@ -27,6 +27,7 @@ import {
 } from 'lucide-react';
 import { AudioEngine } from './audio';
 import { api, setCsrfToken, type Analysis, type Sample, type Task, type User } from './types';
+import { InterimScores } from './InterimScores';
 import { distinctChoices, formatShare, lagText, shareWidth, type ReportPayload } from './review';
 import packageInfo from '../package.json';
 import { TeamMembers } from './TeamMembers';
@@ -1076,6 +1077,16 @@ function App() {
                     >
                       <Activity size={17} />
                       评测进度
+                    </button>
+                    <button
+                      onClick={() =>
+                        void run(async () => {
+                          setReport(await api('/tasks/' + task.id + '/interim-report'));
+                          setModal('report');
+                        })
+                      }
+                    >
+                      阶段结果与导出
                     </button>
                     <button onClick={() => setModal('close')}>
                       <Check size={17} />
@@ -2286,22 +2297,65 @@ function App() {
           {modal === 'help' && <UserGuide role={user.role} />}
           {modal === 'report' && report && (
             <div className="report">
+              {report.阶段结果 && (
+                <section className="review-progress">
+                  <h3>阶段结果（非最终）</h3>
+                  <p>{report.阶段结果.口径}</p>
+                  <p>
+                    统计时间：{report.生成时间} · 纳入 {report.阶段结果.纳入人数} 人 · 未完成{' '}
+                    {report.阶段结果.未完成人数} 人
+                  </p>
+                  <p>
+                    仅组织者与管理员可见；盲评版本名称会在此视图揭示，请勿转发给正在评测的同事。
+                  </p>
+                  <button
+                    onClick={() =>
+                      void run(async () =>
+                        setReport(await api('/tasks/' + report.任务.id + '/interim-report')),
+                      )
+                    }
+                  >
+                    刷新阶段结果
+                  </button>
+                </section>
+              )}
+
               {task?.can_manage && (
                 <div className="report-exports">
-                  <a className="button" href={'/api/tasks/' + task?.id + '/export'}>
+                  <a
+                    className="button"
+                    href={
+                      '/api/tasks/' + task?.id + (report.阶段结果 ? '/interim-export' : '/export')
+                    }
+                  >
                     <Download size={16} />
                     证据 JSON
                   </a>
-                  <a className="button" href={'/api/tasks/' + task?.id + '/export.csv'}>
+                  <a
+                    className="button"
+                    href={
+                      '/api/tasks/' +
+                      task?.id +
+                      (report.阶段结果 ? '/interim-export.csv' : '/export.csv')
+                    }
+                  >
                     <Download size={16} />
                     结果 CSV（Excel）
                   </a>
-                  <a className="button" href={'/api/tasks/' + task?.id + '/export.md'}>
+                  <a
+                    className="button"
+                    href={
+                      '/api/tasks/' +
+                      task?.id +
+                      (report.阶段结果 ? '/interim-export.md' : '/export.md')
+                    }
+                  >
                     <Download size={16} />
                     复盘 Markdown
                   </a>
                 </div>
               )}
+              {report.阶段结果 && <InterimScores report={report} />}
               <section className="review-progress">
                 <h3>参与进度</h3>
                 <div className="progress-numbers">
